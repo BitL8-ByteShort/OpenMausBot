@@ -38,9 +38,9 @@ const enabled = process.env.OMB_UI_E2E === "1" || Boolean(resolveAgentBrowserBin
     // The browser harness does not assign refs to native <summary> nodes.
     const toggleTeams = () => ui("eval", "--js", "document.querySelector('[data-bot-settings-section=permissions] summary').click()");
     const snapshot = async () => (await ui("snapshot")).snapshot as string;
-    const clickRole = async (role: string, name: string) => {
+    const clickRole = async (role: string, name: string | RegExp) => {
       const refs = (await ui("snapshot")).refs as Record<string, { role: string; name: string }>;
-      const match = Object.entries(refs).find(([, entry]) => entry.role === role && entry.name === name);
+      const match = Object.entries(refs).find(([, entry]) => entry.role === role && (typeof name === "string" ? entry.name === name : name.test(entry.name)));
       expect(match).toBeDefined();
       return ui("click", "--ref", "@" + match![0]);
     };
@@ -49,16 +49,21 @@ const enabled = process.env.OMB_UI_E2E === "1" || Boolean(resolveAgentBrowserBin
     await api("/api/bots", { name: "Engineer", section: "Engineering" }, "POST");
     await api("/api/bots", { name: "Researcher", section: "Research" }, "POST");
     await api("/api/bots", { name: "Private accountant", section: "Finance" }, "POST");
-    await expect.poll(snapshot, { timeout: 15_000 }).toContain("Open Clive's profile");
+    await api("/api/sidebar-sections", { name: "Empty delivery" }, "POST");
+    await ui("eval", "--js", "location.reload(); true");
+    await expect.poll(snapshot, { timeout: 15_000 }).toContain("Actions for Clive");
+    await clickRole("button", /^Clive Rename Clive /);
+    await expect.poll(snapshot, { timeout: 10_000 }).toContain("Open Clive's profile");
     await clickRole("button", "Open Clive's profile");
     await click("Permissions");
     await expect.poll(snapshot, { timeout: 10_000 }).toContain("Additional teams");
     await toggleTeams();
     await clickRole("checkbox", "Engineering");
     await clickRole("checkbox", "Research");
+    await clickRole("checkbox", "Empty delivery");
     expect((await saved()).managedSections ?? []).toEqual([]);
     await click("Save team access");
-    await expect.poll(async () => (await saved()).managedSections?.toSorted(), { timeout: 10_000 }).toEqual(["Engineering", "Research"]);
+    await expect.poll(async () => (await saved()).managedSections?.toSorted(), { timeout: 10_000 }).toEqual(["Empty delivery", "Engineering", "Research"]);
     // The server update remounts the controlled list so another bot's old
     // selection can never be saved from a stale dialog.
     await toggleTeams();
@@ -66,12 +71,25 @@ const enabled = process.env.OMB_UI_E2E === "1" || Boolean(resolveAgentBrowserBin
     expect(granted).toContain('checkbox "Engineering" [checked=true');
     expect(granted).toContain('checkbox "Research" [checked=true');
     expect(granted).toContain('checkbox "Finance" [checked=false');
+    expect(granted).toContain('checkbox "Empty delivery" [checked=true');
+    expect(granted).toContain('checkbox "General" [checked=false');
     const screenshot = info.logPath + ".team-access.png";
     await ui("screenshot", "--out", screenshot);
     await clickRole("checkbox", "Engineering");
     await click("Save team access");
+    await expect.poll(async () => (await saved()).managedSections?.toSorted(), { timeout: 10_000 }).toEqual(["Empty delivery", "Research"]);
+    await api("/api/sidebar-sections?section=Empty%20delivery", { name: "Empty delivery" });
+    expect((await saved()).managedSections?.toSorted()).toEqual(["Empty delivery", "Research"]);
+    await api("/api/sidebar-sections?section=Empty%20delivery", { name: "Empty launch" });
     await expect.poll(async () => (await saved()).managedSections, { timeout: 10_000 }).toEqual(["Research"]);
-    const receipts = { granted, final: await saved(), screenshot, logPath: info.logPath };
+    await toggleTeams();
+    await expect.poll(snapshot, { timeout: 10_000 }).toContain('checkbox "Empty launch" [checked=false');
+    expect(await snapshot()).not.toContain('checkbox "Empty delivery"');
+    // A new empty team appears in an already-open selector through SSE.
+    await api("/api/sidebar-sections", { name: "Empty delivery" }, "POST");
+    await expect.poll(snapshot, { timeout: 10_000 }).toContain('checkbox "Empty delivery" [checked=false');
+    expect((await saved()).managedSections).toEqual(["Research"]);
+    const receipts = { granted, recreated: await snapshot(), final: await saved(), screenshot, logPath: info.logPath };
     writeFileSync(info.logPath + ".team-access.json", JSON.stringify(receipts, null, 2));
     console.log("Team access evidence:", info.logPath + ".team-access.json");
   } finally {

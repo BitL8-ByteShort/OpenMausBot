@@ -1108,6 +1108,17 @@ export class Store {
     if (nextName !== null && nextName !== name && this.sections.includes(nextName)) {
       return "A team with that name already exists";
     }
+    if (nextName === name) return undefined;
+    const revoked = this.bots.filter((bot) => bot.managedSections?.some((section) => sectionKey(section) === name));
+    if (revoked.length) {
+      const grants = new Map(revoked.map((bot) => [bot.id, bot.managedSections!.filter((section) => sectionKey(section) !== name)]));
+      // Revoke durably before freeing the name. If the registry write then
+      // fails, authority stays narrowed; recreating a name can never revive
+      // its old grants. Update existing objects so in-flight checks see it.
+      this.saveBots(this.bots.map((bot) => grants.has(bot.id) ? { ...bot, managedSections: grants.get(bot.id)! } : bot));
+      for (const bot of revoked) bot.managedSections = grants.get(bot.id)!;
+      for (const bot of revoked) this.emit({ type: "bot", botId: bot.id });
+    }
     changeEmptySection(name, nextName);
     this.emit({ type: "sections" });
     return undefined;

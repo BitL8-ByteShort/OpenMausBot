@@ -12305,10 +12305,14 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const parsed = z.array(z.string().trim().max(60)).max(100).safeParse(body.managedSections);
         if (!parsed.success) return json(res, 400, { error: "managedSections must be a list of up to 100 team names (60 characters each)" });
         const sections = [...new Set(parsed.data)];
+        const newSections = sections.filter(section => !(existingBot?.managedSections ?? []).includes(section));
+        if (newSections.some(section => section !== "" && !store.sections.includes(section))) {
+          return json(res, 400, { error: "Create the named team before giving a Chief access to it" });
+        }
         if (sections.length && !(body.chiefOfStaff === true || (existingBot?.chiefOfStaff && body.chiefOfStaff !== false))) {
           return json(res, 400, { error: "Only a Chief of Staff can be given access to additional teams" });
         }
-        if (sections.some(section => !(existingBot?.managedSections ?? []).includes(section)) && body.acknowledgePeerScope !== true) {
+        if (newSections.length && body.acknowledgePeerScope !== true) {
           return json(res, 400, { error: "Confirm which additional teams this Chief may work with (acknowledgePeerScope)" });
         }
         patch.managedSections = sections;
