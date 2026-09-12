@@ -40,6 +40,16 @@ set it to `local`) to restore local narrowing, including for saved sessions.
 Other mode values fail closed. This opt-in avoids rewriting tenant allow-lists
 or restarting a tenant for every accepted invitation.
 
+The public `GET /api/health/hosted` capability probe returns `200` only when
+complete hosted configuration, explicit portal membership, the loaded access
+hook, and a currently valid `admin` entitlement are all present. Its response
+is `{ok:true,service:"openmausbot",membershipAuthority:"portal",workspace:"<slug>"}`;
+otherwise it returns a generic `503`. It exposes no credentials or sessions
+and does not cache readiness. License expiry withdraws readiness without a
+restart. This is a runtime capability signal, not a portal reachability check.
+The existing `/api/health` remains an ordinary reachability probe and must not
+be used to infer hosted authentication support.
+
 Backchannel requests go only to the configured HTTPS origin, omit browser
 cookies, reject redirects, and have a five-second deadline. A ten-second
 revalidation cadence closes quiet event/browser streams after access ends;
@@ -71,6 +81,9 @@ reauthentication and quiet event-stream closure. The bridge tests use real
 HTTP, cookies and sessions to check PKCE mismatch, expiry, replay, host
 binding and live permission checks. Fleet fixtures use disposable sockets,
 recording executors and bounded child processes for hostile file cases.
+The capability probe is also exercised against missing or invalid hosted
+settings, local membership, absent hooks, invalid licenses, missing admin
+entitlement, valid portal mode, and entitlement expiry in the running process.
 
 These checks do not deploy a console, send real mail, issue TLS certificates,
 call a paid provider or prove Linux tenant isolation. Real root transitions,
@@ -81,9 +94,10 @@ still require a separately authorized disposable Linux deployment using the
 ## Observed local result — 2026-09-13
 
 The commands above passed after extracting the runtime changes onto public
-main `c610e6cd`: 218 targeted tests, typecheck, lint, all twelve packaged proxy
+main `c610e6cd`: 226 targeted tests, typecheck, lint, all twelve packaged proxy
 paths and the packaged MCP round trip. The production UI build also passed.
 The full-server fixture additionally proved explicit portal membership with
 an empty local allow-list, including outage, demotion and quiet-stream
-revocation. All identities, sessions, fleet actions and backchannels were
+revocation, plus live hosted-readiness attestation and entitlement expiry.
+All identities, sessions, fleet actions and backchannels were
 disposable or synthetic; no production deployment was exercised.

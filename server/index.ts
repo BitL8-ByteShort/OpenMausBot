@@ -8761,6 +8761,16 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
   let m: RegExpMatchArray | null = null;
   let releaseWorkspaceRequest: (() => void) | undefined;
   try {
+    // Unlike the legacy reachability probe, this attests the running
+    // server's portal-membership capability, including live entitlement.
+    if (method === "GET" && path === "/api/health/hosted") {
+      res.setHeader("cache-control", "no-store");
+      const hosted = hostedWorkspaceConfiguration();
+      if (!hosted?.portalMembership || !workspaceAccess || !entitled("admin")) {
+        return json(res, 503, { error: "Hosted workspace readiness is unavailable." });
+      }
+      return json(res, 200, { ok: true, service: "openmausbot", membershipAuthority: "portal", workspace: hosted.workspace });
+    }
     // Hosted workspaces have one sign-in authority. A missing optional layer
     // must not accidentally reactivate legacy email/QR credential minting.
     if (HOSTED_WORKSPACE) {

@@ -20,7 +20,7 @@ let child: ChildProcess;
 let log = "";
 let pairedToken: string;
 let fixtureEnv: NodeJS.ProcessEnv;
-const state = (role: string | null = "admin", outage = false) => writeFileSync(stateFile, JSON.stringify({ role, outage }));
+const state = (role: string | null = "admin", outage = false, license: { features?: string[]; expiresAt?: string; invalid?: boolean } = {}) => writeFileSync(stateFile, JSON.stringify({ role, outage, license }));
 
 function call(path: string, options: { method?: string; cookie?: string; token?: string; local?: boolean } = {}) {
   return new Promise<{ status: number; body: any; cookies: string[]; location?: string }>((resolve, reject) => {
@@ -43,6 +43,14 @@ async function login() {
   expect(callback.status).toBe(302);
   return callback.cookies.find((value) => !value.startsWith("__Host-"))!.split(";")[0];
 }
+async function restart(env: NodeJS.ProcessEnv = {}) {
+  await waitForExit(child, { signal: "SIGTERM" });
+  child = spawn(process.execPath, [join(ROOT, "server/index.ts")], { cwd: ROOT, env: { ...fixtureEnv, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout?.on("data", (chunk) => log += chunk); child.stderr?.on("data", (chunk) => log += chunk);
+  await expect.poll(async () => {
+    try { return (await call("/api/health", { local: true })).status; } catch { return 0; }
+  }, { timeout: 20_000 }).toBe(200);
+}
 
 beforeAll(async () => {
   home = mkdtempSync(join(tmpdir(), "omb-hosted-server-"));
@@ -58,7 +66,11 @@ beforeAll(async () => {
   writeFileSync(join(layer, "server", "index.ts"), `
     import { readFileSync } from 'node:fs';
     import { createWorkspaceAccess as create } from ${JSON.stringify(pathToFileURL(join(ROOT, "enterprise/server/workspace-access.ts")).href)};
-    export function register() { return { customer: 'Fixture', features: ['admin'], expiresAt: null }; }
+    export function register() {
+      const { license } = JSON.parse(readFileSync(${JSON.stringify(stateFile)}, 'utf8'));
+      if (license.invalid) throw new Error('invalid fixture license');
+      return { customer: 'Fixture', features: license.features ?? ['admin'], expiresAt: license.expiresAt ?? null };
+    }
     export function createWorkspaceAccess(options) {
       return create({ ...options, fetchImpl: async (url, init) => {
         if (new URL(url).origin !== 'https://admin.example.test') throw new Error('unexpected outbound origin');
@@ -100,6 +112,7 @@ describe("hosted bridge in the full server", () => {
     }
     expect((await call("/api/auth/session", { token: pairedToken })).status).toBe(401);
     expect((await call("/api/auth/session", { local: true })).body.kind).toBe("loopback");
+    expect((await call("/api/health/hosted")).status).toBe(503);
   });
   it("accepts a portal session, enforces outages/demotion, and issues only current permissions on reauthentication", async () => {
     const cookie = await login();
@@ -131,12 +144,8 @@ describe("hosted bridge in the full server", () => {
     expect((await call("/api/auth/session", { cookie })).status).toBe(401);
   }, 17_000);
   it("fails closed if a configured deployment loses its enterprise hook, with local owner access retained", async () => {
-    await waitForExit(child, { signal: "SIGTERM" });
-    child = spawn(process.execPath, [join(ROOT, "server/index.ts")], { cwd: ROOT, env: { ...fixtureEnv, OMB_ENTERPRISE_DIR: join(home, "absent-layer") }, stdio: ["ignore", "pipe", "pipe"] });
-    child.stderr?.on("data", (chunk) => log += chunk);
-    await expect.poll(async () => {
-      try { return (await call("/api/health", { local: true })).status; } catch { return 0; }
-    }, { timeout: 20_000 }).toBe(200);
+    await restart({ OMB_ENTERPRISE_DIR: join(home, "absent-layer"), OMB_ADMIN_MEMBERSHIP: "portal" });
+    expect((await call("/api/health/hosted")).status).toBe(503);
     expect((await call("/api/auth/hosted/start")).status).toBe(503);
     expect((await call("/")).status).toBe(503);
     expect((await call("/pair")).status).toBe(503);
@@ -153,6 +162,10 @@ describe("hosted bridge in the full server", () => {
     await expect.poll(async () => {
       try { return (await call("/api/health", { local: true })).status; } catch { return 0; }
     }, { timeout: 20_000 }).toBe(200);
+    const readiness = await call("/api/health/hosted");
+    expect(readiness.status).toBe(200);
+    expect(readiness.body).toEqual({ ok: true, service: "openmausbot", membershipAuthority: "portal", workspace: "acme" });
+    expect(readiness.cookies).toEqual([]);
     const cookie = await login();
     expect((await call("/api/auth/session", { cookie })).body.scopes).toEqual(["admin", "client"]);
     expect((await call("/api/auth/session", { token: pairedToken })).status).toBe(401);
@@ -171,5 +184,32 @@ describe("hosted bridge in the full server", () => {
     const revokedAt = Date.now(); state(null); await ended;
     expect(Date.now() - revokedAt).toBeLessThan(15_000);
     expect((await call("/api/auth/session", { cookie: memberCookie })).status).toBe(401);
+  }, 30_000);
+  it.each([
+    ["standalone", { OMB_ADMIN_URL: undefined, OMB_ADMIN_WORKSPACE: undefined, OMB_ADMIN_MEMBERSHIP: undefined }],
+    ["incomplete hosted configuration", { OMB_ADMIN_URL: undefined, OMB_ADMIN_MEMBERSHIP: "portal" }],
+    ["invalid workspace", { OMB_ADMIN_WORKSPACE: "../private", OMB_ADMIN_MEMBERSHIP: "portal" }],
+    ["invalid membership mode", { OMB_ADMIN_MEMBERSHIP: "invalid" }],
+    ["local membership mode", { OMB_ADMIN_MEMBERSHIP: "local" }],
+  ] satisfies [string, NodeJS.ProcessEnv][])("does not attest portal readiness for %s", async (_name, env) => {
+    state();
+    await restart(env);
+    const readiness = await call("/api/health/hosted");
+    expect(readiness.status).toBe(503);
+    expect(readiness.body).toEqual({ error: "Hosted workspace readiness is unavailable." });
+    expect((await call("/api/health")).status).toBe(200);
+  }, 25_000);
+  it.each([{ invalid: true }, { features: [] }])("does not attest portal readiness without valid admin entitlement (%j)", async (license) => {
+    state("admin", false, license);
+    await restart({ OMB_ADMIN_MEMBERSHIP: "portal" });
+    expect((await call("/api/health/hosted")).status).toBe(503);
+    expect((await call("/api/health")).status).toBe(200);
+  }, 25_000);
+  it("withdraws hosted readiness immediately when the running server's entitlement expires", async () => {
+    state("admin", false, { expiresAt: new Date(Date.now() + 8_000).toISOString() });
+    await restart({ OMB_ADMIN_MEMBERSHIP: "portal" });
+    expect((await call("/api/health/hosted")).status).toBe(200);
+    await expect.poll(async () => (await call("/api/health/hosted")).status, { timeout: 10_000, interval: 100 }).toBe(503);
+    expect((await call("/api/health")).status).toBe(200);
   }, 30_000);
 });
