@@ -11,6 +11,7 @@ import { hostedWorkspaceConfiguration } from "../../server/enterprise.ts";
 import { resolveRequestAuth } from "../../server/request-auth.ts";
 import { removeTempDir } from "../../server/testing/cleanup.ts";
 import { createWorkspaceAccess } from "./workspace-access.ts";
+import { HOSTED_CONTRACT_VERSION } from "../../server/hosted-contract.ts";
 
 const env = { OMB_ADMIN_URL: "https://admin.example.test", OMB_ADMIN_WORKSPACE: "acme", OMB_PUBLIC_URL: "https://acme.example.test" };
 const email = "member@example.test";
@@ -23,6 +24,7 @@ let clock: number;
 let licensed: boolean;
 let member: { email: string; role: "admin" | "member" } | null;
 let outage: boolean;
+let contractVersion: unknown;
 let codes: Map<string, { workspace: string; challenge: string }>;
 let grants: Set<string>;
 let server: ReturnType<typeof createServer>;
@@ -35,6 +37,7 @@ const remote = vi.fn<typeof fetch>();
 beforeEach(async () => {
   home = mkdtempSync(join(tmpdir(), "omb-hosted-access-"));
   clock = Date.now(); licensed = true; outage = false;
+  contractVersion = HOSTED_CONTRACT_VERSION;
   localScopes = ["admin", "client"]; member = { email, role: "admin" };
   codes = new Map(); grants = new Set(); streams = new Map();
   sessions = new SessionRegistry({ file: join(home, "sessions.json"), emailScopes: () => localScopes });
@@ -47,14 +50,15 @@ beforeEach(async () => {
     if (outage) throw new Error("PRIVATE upstream failure");
     const body = JSON.parse(String(init?.body));
     expect(body.workspace).toBe("acme");
+    expect(body.contractVersion).toBe(HOSTED_CONTRACT_VERSION);
     if (String(url).endsWith("/consume")) {
       const code = codes.get(body.code);
       if (!member || !code || code.workspace !== body.workspace || code.challenge !== digest(body.verifier)) return Response.json({}, { status: 401 });
       codes.delete(body.code);
       const grant = proof(); grants.add(grant);
-      return Response.json({ ...member, grant });
+      return Response.json({ ...member, grant, contractVersion });
     }
-    return member && grants.has(body.grant) ? Response.json(member) : Response.json({}, { status: 401 });
+    return member && grants.has(body.grant) ? Response.json({ ...member, contractVersion }) : Response.json({}, { status: 401 });
   });
   access = createWorkspaceAccess({ sessions, cookieName: "session", closeSessionStreams: closed, entitled: () => licensed, env, now: () => clock, fetchImpl: remote });
   server = createServer(async (req, res) => {
@@ -120,6 +124,43 @@ describe("hosted workspace handoff and continuous access", () => {
     const { cookie } = await login();
     expect((await call("/api/auth/session", cookie)).body).toBe('["admin","client"]');
     expect((await call("/", cookie)).status).toBe(200);
+  });
+  it("supports the legacy-v1 unversioned response without dropping its own explicit request version", async () => {
+    contractVersion = undefined;
+    const { cookie } = await login();
+    expect((await call("/api/auth/session", cookie)).status).toBe(200);
+    expect(remote).toHaveBeenCalledTimes(2);
+  });
+  it.each([2, 0, "1", null, [1]].map(version => ({ version })))("rejects incompatible consume version $version without issuing a session or downgrading", async ({ version }) => {
+    contractVersion = version;
+    const pending = await begin();
+    const response = await call(pending.callback, pending.cookie);
+    expect(response.status).toBe(503);
+    expect(response.body).toContain("versions are incompatible");
+    expect(response.cookies.some(cookie => cookie.startsWith("session="))).toBe(false);
+    expect(remote).toHaveBeenCalledTimes(1);
+  });
+  it("reports an explicit Admin version rejection without replaying a consumed callback", async () => {
+    const pending = await begin();
+    remote.mockResolvedValueOnce(Response.json({ error: "PRIVATE incompatible deployment details" }, { status: 409 }));
+    const response = await call(pending.callback, pending.cookie);
+    expect(response.status).toBe(503);
+    expect(response.body).toContain("versions are incompatible");
+    expect(response.body).not.toContain("PRIVATE");
+    expect((await call(pending.callback, pending.cookie)).status).toBe(400);
+    expect(remote).toHaveBeenCalledTimes(1);
+  });
+  it("closes an idle stream on a version mismatch, preserving the grant for compatible recovery", async () => {
+    const { cookie, session } = await login();
+    const response = await new Promise<IncomingMessage>(resolve => request({ hostname: "127.0.0.1", port, path: "/api/events", headers: { host: "acme.example.test", cookie, "x-forwarded-for": "203.0.113.7" } }, resolve).end());
+    expect(response.statusCode).toBe(200); response.resume();
+    const ended = new Promise<void>(resolve => response.on("end", resolve));
+    contractVersion = 2;
+    await access.revalidate(); await ended;
+    expect((await call("/api/auth/session", cookie)).status).toBe(503);
+    expect(sessions.isLive(session.id)).toBe(true);
+    contractVersion = HOSTED_CONTRACT_VERSION;
+    expect((await call("/api/auth/session", cookie)).status).toBe(200);
   });
   it("rejects state/cookie mismatch, expiry, duplicate params, replay and wrong-workspace codes", async () => {
     const pending = await begin();

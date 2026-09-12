@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { hostedWorkspaceConfiguration, type WorkspaceAccess, type WorkspaceAccessOptions } from "../../server/enterprise.ts";
 import { isAllowedOrigin, isLoopbackHost, isProxied, parseCookies, requestSource, serializeSessionCookie } from "../../server/request-auth.ts";
 import { cookieMaxAgeSeconds, type Scope, type SessionRecord } from "../../server/sessions.ts";
+import { HOSTED_CONTRACT_ERROR, HOSTED_CONTRACT_VERSION, hostedContractCompatible } from "../../server/hosted-contract.ts";
 
 const START = "/api/auth/hosted/start";
 const CALLBACK = "/api/auth/hosted/callback";
@@ -15,6 +16,7 @@ const STARTS_PER_SOURCE = 20;
 const PROOF = /^[A-Za-z0-9_-]{43}$/;
 const unavailable = { status: 503 as const, error: "Workspace sign-in is unavailable. Try again shortly." };
 const denied = { status: 401 as const, error: "Workspace access ended. Sign in again." };
+const incompatible = { status: 503 as const, error: HOSTED_CONTRACT_ERROR };
 
 function equal(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);
@@ -44,26 +46,31 @@ export function createWorkspaceAccess(options: WorkspaceAccessOptions): Workspac
   const tenantHost = (req: IncomingMessage) => config !== null && req.headers.host?.toLowerCase() === config.tenant.host;
   const localOwner = (req: IncomingMessage) => !isProxied(req) && isLoopbackHost(req.headers.host) && isAllowedOrigin(typeof req.headers.origin === "string" ? req.headers.origin : undefined);
   const redirect = (res: ServerResponse, to: string) => { res.writeHead(302, { location: to, "cache-control": "no-store", "referrer-policy": "no-referrer" }); res.end(); };
-  const failurePage = (res: ServerResponse, status: number) => {
+  const failurePage = (res: ServerResponse, status: number, message = "Workspace sign-in could not finish.") => {
     res.setHeader("set-cookie", clearCookie());
     res.writeHead(status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer" });
-    res.end(`<!doctype html><title>Workspace sign-in</title><p>Workspace sign-in could not finish.</p><a href="${START}">Try signing in again</a>`);
+    res.end(`<!doctype html><title>Workspace sign-in</title><p>${message}</p><a href="${START}">Try signing in again</a>`);
   };
   const post = async (path: string, body: object) => {
     if (!config || !options.entitled()) return { status: 503, body: null };
     try {
       const response = await fetchImpl(new URL(path, config.admin), {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ workspace: config.workspace, ...body }),
+        body: JSON.stringify({ workspace: config.workspace, ...body, contractVersion: HOSTED_CONTRACT_VERSION }),
         credentials: "omit", redirect: "error", signal: AbortSignal.timeout(5_000),
       });
       const responseBody = response.ok ? await response.json() as unknown : null;
+      // A protocol mismatch is recoverable deployment drift, not revocation.
+      // Never silently retry an unsupported peer as an unversioned client.
+      if (response.ok && responseBody && typeof responseBody === "object"
+        && !hostedContractCompatible(Reflect.get(responseBody, "contractVersion"))) return { status: 409, body: null };
       return options.entitled() ? { status: response.status, body: responseBody } : { status: 503, body: null };
     } catch { return { status: 503, body: null }; }
   };
   const check = async (session: SessionRecord) => {
     if (!options.sessions.isLive(session.id)) { observed.delete(session.id); return denied; }
     const result = await post("/api/handoff/check", { grant: session.userId!.slice("portal:".length) });
+    if (result.status === 409) { options.closeSessionStreams(session.id); return incompatible; }
     if (result.status !== 200 && result.status !== 401) {
       options.closeSessionStreams(session.id);
       return unavailable; // outage is not permanent membership removal
@@ -91,7 +98,7 @@ export function createWorkspaceAccess(options: WorkspaceAccessOptions): Workspac
         if (session) {
           const failure = await access.authorize(req, { kind: "session", session, scopes: session.scopes, via: "cookie" });
           if (!failure) return false;
-          if (failure.status === 503) { failurePage(res, 503); return true; }
+          if (failure.status === 503) { failurePage(res, 503, failure.error); return true; }
         }
         redirect(res, START); return true;
       }
@@ -127,6 +134,7 @@ export function createWorkspaceAccess(options: WorkspaceAccessOptions): Workspac
       pending.delete(state); // consume before the backchannel await, including failures
       res.setHeader("set-cookie", clearCookie());
       const result = await post("/api/handoff/consume", { code, verifier: saved.verifier });
+      if (result.status === 409) { failurePage(res, 503, incompatible.error); return true; }
       const user = identity(result.body);
       const grant = result.body && typeof result.body === "object" ? Reflect.get(result.body, "grant") : null;
       if (result.status !== 200 || !user || typeof grant !== "string" || !PROOF.test(grant)) {

@@ -22,9 +22,9 @@ endpoints; requests use the configured `OMB_ADMIN_URL`, not the tenant origin.
 2. The service returns a one-use code to `/api/auth/hosted/callback`.
    State and cookie must match. The workspace consumes local state before
    awaiting `POST https://identity.example.test/api/handoff/consume` with
-   workspace, code and verifier.
-3. A successful response contains email, role (`admin` or `member`) and a
-   high-entropy workspace-bound grant. The adapter issues a normal scoped
+   workspace, code, verifier and `contractVersion: 1`.
+3. A successful response contains `contractVersion: 1`, email, role (`admin`
+   or `member`) and a high-entropy workspace-bound grant. The adapter issues a normal scoped
    workspace session. By default the local email allow-list also narrows
    its access.
 4. Every authenticated remote request checks the grant at
@@ -33,6 +33,26 @@ endpoints; requests use the configured `OMB_ADMIN_URL`, not the tenant origin.
    revokes the session. Promotion does not widen an existing credential.
    An unavailable service denies access and closes streams without treating
    an outage as permanent membership removal.
+
+The wire contract is defined in `server/hosted-contract.ts`, independently of
+application release numbers. Both consume and check use `contractVersion: 1`
+in requests and successful replies. The **legacy-v1** transition supports
+omitted versions only as the existing v1 payload, so either side can be
+upgraded first. Explicit unsupported versions (including strings, null and
+future versions) are not legacy: the identity service rejects them with `409`
+and code `HOSTED_CONTRACT_MISMATCH` before spending a one-use code. The runtime
+fails closed with an actionable, generic `503`, closes active streams, and
+preserves established sessions for recovery after compatible deployment.
+It never retries without the version or copies remote error details.
+
+This compatibility window is release-bounded, not clock-dependent:
+unversioned support ends at the next breaking protocol version, v2. That
+rollout must first inventory and upgrade legacy peers; it must not silently
+reinterpret omitted versions as v2. Additive v1 fields do not require a bump;
+incompatible changes to identity, grant or revocation semantics do. Metadata
+advertises `contractVersion: 1`, `supportedContractVersions: [1]` and
+`legacyPolicy: "legacy-v1"`; supported versions are an explicit list, not an
+assumption that arbitrary older or newer versions work.
 
 An operator may explicitly set `OMB_ADMIN_MEMBERSHIP=portal` when the identity
 service is the sole membership authority. This requires the complete valid
@@ -46,9 +66,13 @@ or restarting a tenant for every accepted invitation.
 
 The public `GET /api/health/hosted` capability probe returns `200` only when
 complete hosted configuration, explicit portal membership, the loaded access
-hook, and a currently valid `admin` entitlement are all present. Its response
-is `{ok:true,service:"openmausbot",membershipAuthority:"portal",workspace:"<slug>"}`;
-otherwise it returns a generic `503`. It exposes no credentials or sessions
+hook, and a currently valid `admin` entitlement are all present; otherwise it
+returns a generic `503`. Its successful response
+includes `{ok:true,service:"openmausbot",membershipAuthority:"portal",workspace:"<slug>"}`
+plus the contract metadata above and the `X-OMB-Hosted-Contract-Version: 1`
+response header, emitted by the running runtime for an authenticated deployment
+probe to relay. A wrapper must not manufacture this version for an older runtime.
+It exposes no credentials or sessions
 and does not cache readiness. License expiry withdraws readiness without a
 restart. This is a runtime capability signal, not a portal reachability check.
 The existing `/api/health` remains an ordinary reachability probe and must not
@@ -97,6 +121,10 @@ recording executors and bounded child processes for hostile file cases.
 The capability probe is also exercised against missing or invalid hosted
 settings, local membership, absent hooks, invalid licenses, missing admin
 entitlement, valid portal mode, and entitlement expiry in the running process.
+The contract fixtures cover explicit v1 and legacy-v1 peers, malformed/future
+versions, no downgrade retry, safe mismatch errors, and idle-stream closure
+with session recovery after compatibility is restored. The real server emits
+version metadata only when hosted readiness succeeds.
 
 These checks do not deploy a console, send real mail, issue TLS certificates,
 call a paid provider or prove Linux tenant isolation. Real root transitions,

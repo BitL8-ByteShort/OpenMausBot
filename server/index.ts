@@ -136,6 +136,7 @@ import { checkProviderKey, PROVIDER_KEY_KINDS, type ProviderKeyKind } from "./pr
 import { assertWithinBudget, noteSpend, spendState } from "./spend.ts";
 import { fleetAvailable, fleetRequest, fleetSocketPath } from "./fleet-client.ts";
 import { entitled } from "./enterprise.ts";
+import { HOSTED_CONTRACT_HEADER, HOSTED_CONTRACT_METADATA, HOSTED_CONTRACT_VERSION } from "./hosted-contract.ts";
 import { describeSpawnFailure, execCli } from "./procs.ts";
 import { blockedTarget, buildNotification, type Notification } from "./notify.ts";
 import {
@@ -8772,7 +8773,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!hosted?.portalMembership || !workspaceAccess || !entitled("admin")) {
         return json(res, 503, { error: "Hosted workspace readiness is unavailable." });
       }
-      return json(res, 200, { ok: true, service: "openmausbot", membershipAuthority: "portal", workspace: hosted.workspace });
+      res.setHeader(HOSTED_CONTRACT_HEADER, String(HOSTED_CONTRACT_VERSION));
+      return json(res, 200, { ok: true, service: "openmausbot", membershipAuthority: "portal", workspace: hosted.workspace, ...HOSTED_CONTRACT_METADATA });
     }
     // Hosted workspaces have one sign-in authority. A missing optional layer
     // must not accidentally reactivate legacy email/QR credential minting.

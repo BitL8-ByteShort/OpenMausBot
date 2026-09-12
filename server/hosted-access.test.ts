@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 import { SessionRegistry } from "./sessions.ts";
+import { HOSTED_CONTRACT_HEADER, HOSTED_CONTRACT_METADATA } from "./hosted-contract.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 35000 + Math.floor(Math.random() * 5000);
@@ -23,14 +24,14 @@ let fixtureEnv: NodeJS.ProcessEnv;
 const state = (role: string | null = "admin", outage = false, license: { features?: string[]; expiresAt?: string; invalid?: boolean } = {}) => writeFileSync(stateFile, JSON.stringify({ role, outage, license }));
 
 function call(path: string, options: { method?: string; cookie?: string; token?: string; local?: boolean } = {}) {
-  return new Promise<{ status: number; body: any; cookies: string[]; location?: string }>((resolve, reject) => {
+  return new Promise<{ status: number; body: any; cookies: string[]; location?: string; contractVersion?: string | string[] }>((resolve, reject) => {
     const req = request({ hostname: "127.0.0.1", port: PORT, path, method: options.method ?? "GET", headers: {
       ...(options.local ? {} : { host: HOST, "x-forwarded-for": "203.0.113.8", "x-forwarded-proto": "https" }),
       ...(options.cookie ? { cookie: options.cookie } : {}), ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
     } }, (res) => {
       let raw = ""; res.on("data", (chunk) => raw += chunk);
       res.on("end", () => { let body: unknown = raw; try { body = JSON.parse(raw); } catch { /* static HTML */ }
-        resolve({ status: res.statusCode!, body, cookies: res.headers["set-cookie"] ?? [], location: res.headers.location }); });
+        resolve({ status: res.statusCode!, body, cookies: res.headers["set-cookie"] ?? [], location: res.headers.location, contractVersion: res.headers[HOSTED_CONTRACT_HEADER] }); });
     });
     req.on("error", reject); req.end();
   });
@@ -164,7 +165,8 @@ describe("hosted bridge in the full server", () => {
     }, { timeout: 20_000 }).toBe(200);
     const readiness = await call("/api/health/hosted");
     expect(readiness.status).toBe(200);
-    expect(readiness.body).toEqual({ ok: true, service: "openmausbot", membershipAuthority: "portal", workspace: "acme" });
+    expect(readiness.body).toEqual({ ok: true, service: "openmausbot", membershipAuthority: "portal", workspace: "acme", ...HOSTED_CONTRACT_METADATA });
+    expect(readiness.contractVersion).toBe("1");
     expect(readiness.cookies).toEqual([]);
     const cookie = await login();
     expect((await call("/api/auth/session", { cookie })).body.scopes).toEqual(["admin", "client"]);
@@ -196,6 +198,7 @@ describe("hosted bridge in the full server", () => {
     await restart(env);
     const readiness = await call("/api/health/hosted");
     expect(readiness.status).toBe(503);
+    expect(readiness.contractVersion).toBeUndefined();
     expect(readiness.body).toEqual({ error: "Hosted workspace readiness is unavailable." });
     expect((await call("/api/health")).status).toBe(200);
   }, 25_000);
