@@ -14,6 +14,9 @@ export interface RosterMember {
   busy?: boolean;
   hidden?: boolean;
   section?: string;
+  chiefOfStaff?: boolean;
+  /** Additional teams explicitly granted by the owner. Never inherited by peers. */
+  managedSections?: string[];
   /** Bot ids this bot is allowed to contact. Unset keeps the original
    * rule — every visible bot in the same section — while an explicit list
    * narrows this bot to exactly those ids, and an empty list cuts it off
@@ -25,6 +28,19 @@ export interface RosterMember {
 }
 
 const sectionKey = (section?: string): string => section?.trim() || "";
+
+/** Coordination is scoped to the bot's own team unless the owner explicitly
+ * allows its Chief to work with additional teams. A title, peer id, imported
+ * persona or a room membership is not a grant. Invalid saved grants fail closed. */
+export function canAccessTeam(
+  from: Pick<RosterMember, "section" | "chiefOfStaff" | "managedSections">,
+  section?: string,
+): boolean {
+  const target = sectionKey(section);
+  return target === sectionKey(from.section) || Boolean(from.chiefOfStaff &&
+    Array.isArray(from.managedSections) && from.managedSections.some(value =>
+      typeof value === "string" && sectionKey(value) === target));
+}
 
 export type PeerStatus = "available" | "working" | "waiting-on-user" | "not-responding" | "unavailable";
 
@@ -72,19 +88,16 @@ export function peerStatusWords(status: PeerStatus): string {
 export const peerAllowed = (from: { peers?: string[] }, targetId: string): boolean =>
   !Array.isArray(from.peers) || from.peers.includes(targetId);
 
+export function canReachPeer(from: RosterMember, target: RosterMember): boolean {
+  return from.id !== target.id && !target.hidden && canAccessTeam(from, target.section) && peerAllowed(from, target.id);
+}
+
 /** The peers a bot can both see and reach right now. The roster, list_bots
  * and @mention resolution all read this one list, so what a bot is TOLD
  * about its team can never be wider than what the comms endpoints will
  * actually let it do. */
 export function reachablePeers<T extends RosterMember>(bots: readonly T[], from: RosterMember): T[] {
-  const section = sectionKey(from.section);
-  return bots.filter(
-    (bot) =>
-      bot.id !== from.id &&
-      !bot.hidden &&
-      sectionKey(bot.section) === section &&
-      peerAllowed(from, bot.id),
-  );
+  return bots.filter(bot => canReachPeer(from, bot));
 }
 
 // The roster is interpolated into a TRUSTED bot's system prompt on every
