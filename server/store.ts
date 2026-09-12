@@ -665,6 +665,9 @@ export interface BotRecord {
   /** The coordinator for this bot's sidebar section. The store enforces
    * at most one Chief per section (including the unsectioned area). */
   chiefOfStaff?: boolean;
+  /** Owner-selected additional teams this Chief may coordinate and propose
+   * configuration for. Ordinary bots and imported personas gain no reach. */
+  managedSections?: string[];
   /** Pause for human approval before this bot talks to a peer (ask_bot,
    * delegate_bot). Off by default: a chief-of-staff-style bot is most
    * useful when it can coordinate without nagging. */
@@ -889,6 +892,11 @@ export class Store {
         delete b.autoStartVps;
         botsMigrated = true;
       }
+      if (b.managedSections !== undefined && (!b.chiefOfStaff || !Array.isArray(b.managedSections) ||
+          b.managedSections.length > 100 || b.managedSections.some(section => typeof section !== "string" || section.length > 60))) {
+        delete b.managedSections;
+        botsMigrated = true;
+      }
       if (b.approvalMode !== undefined && !isApprovalMode(b.approvalMode)) {
         delete b.approvalMode;
         botsMigrated = true;
@@ -932,6 +940,7 @@ export class Store {
         continue;
       }
       b.chiefOfStaff = false;
+      delete b.managedSections;
       botsMigrated = true;
     }
     // Peer grants originally used mutable display names (ask_bot:@Helper).
@@ -1822,6 +1831,7 @@ export class Store {
         bot.hidden = false;
       } else {
         bot.chiefOfStaff = false;
+        delete bot.managedSections;
       }
       changed.push(bot);
     }
