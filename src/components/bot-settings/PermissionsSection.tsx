@@ -80,19 +80,19 @@ export function PermissionsSection({
         </div>
         <div className="mt-3 text-[13px] leading-relaxed text-ink-secondary">
           {bot.chiefOfStaff && !canCoordinate
-            ? "This bot still holds the role, but its current engine cannot contact teammates. Choose a Claude or ACP engine to restore coordination."
+            ? "This bot still holds the role, but its current provider cannot contact teammates. Choose a provider that supports bot coordination."
             : bot.chiefOfStaff
-              ? `This is the primary contact for ${sectionName}. It can create and coordinate specialists in this section, then combine their work into one answer.`
+              ? `This is the primary contact for ${sectionName}. It can create and coordinate specialists in this team, then combine their work into one answer.`
               : !canCoordinate
-                ? "Choose a Claude or ACP engine to let this bot coordinate teammates."
+                ? "Choose a provider that supports bot coordination."
                 : currentChief
                   ? `Make this bot the ${sectionName} Chief and hand the role over from ${currentChief.name}.`
-                  : `Make this bot the primary contact for the ${sectionName} section.`}
+                  : `Make this bot the primary contact for the ${sectionName} team.`}
         </div>
         {bot.chiefOfStaff && <ManagedTeamsSettings
           key={bot.id + JSON.stringify(bot.managedSections ?? [])}
           name={bot.name} ownTeam={bot.section?.trim() || ""}
-          teams={[...state.bots, ...state.groups].map(member => member.section?.trim() || "")}
+          teams={["", ...(state.sections ?? []), ...[...state.bots, ...state.groups].map(member => member.section?.trim() || "")]}
           allowed={bot.managedSections ?? []}
           onSave={managedSections => patch({ managedSections, acknowledgePeerScope: true })}
         />}
