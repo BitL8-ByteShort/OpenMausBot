@@ -83,7 +83,7 @@ import {
 } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
-import { peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, roomPeerRosterSystemPrompt, roomRosterLine } from "./peer-roster.ts";
+import { canAccessTeam, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, roomPeerRosterSystemPrompt, roomRosterLine } from "./peer-roster.ts";
 import { openMausStatusSystemPrompt } from "./openmaus-status-capsule.ts";
 import {
   containerComputerAction,
@@ -335,6 +335,8 @@ import { screenFrameHash, screenSurfaceForTool, screenTouchingTool, settledFrame
 import { RoutineRequestService } from "./routine-requests.ts";
 import { buildBotOverview, type BotOverview, connectedAppsFacts } from "./bot-overview.ts";
 import { ProfileRequestService } from "./profile-requests.ts";
+import { TeamSetupError, TeamSetupRequestService } from "./team-setup-requests.ts";
+import type { TeamSetupRequest } from "../shared/team-setup.ts";
 import { profileRevision, profileSnapshot } from "./profile-revision.ts";
 import { flushAllProfileHistory, flushProfileHistory, readHistory, recordProfileChange } from "./profile-versions.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
@@ -3016,6 +3018,7 @@ const watchdog = new TurnWatchdog({
         drainQueuedSends();
         drainConnectorResumes();
         drainSecretResumes();
+        drainTeamSetupResumes();
       }
     };
     const release = setTimeout(releaseOwnership, 6_000);
@@ -3806,6 +3809,7 @@ bus.subscribe((event: RuntimeEvent) => {
             drainQueuedSends();
             drainConnectorResumes();
             drainSecretResumes();
+            drainTeamSetupResumes();
             drainDelegationWakes();
           }
         };
@@ -5373,6 +5377,7 @@ async function startTurn(
         drainQueuedSends();
         drainConnectorResumes();
         drainSecretResumes();
+        drainTeamSetupResumes();
         drainDelegationWakes();
       }
     } catch (e) {
@@ -5399,6 +5404,7 @@ async function startTurn(
           drainQueuedSends();
           drainConnectorResumes();
           drainSecretResumes();
+          drainTeamSetupResumes();
           drainDelegationWakes();
         }
         return;
@@ -5434,6 +5440,7 @@ async function startTurn(
       drainQueuedSends();
       drainConnectorResumes();
       drainSecretResumes();
+      drainTeamSetupResumes();
       drainDelegationWakes();
     }
   })();
@@ -6014,6 +6021,90 @@ const profileRequests = new ProfileRequestService({
     return null;
   },
 });
+const teamSetupTeams = () => [...new Set(["", ...store.bots.map((bot) => sectionKey(bot.section)), ...store.groups.map((group) => sectionKey(group.section))])];
+const teamSetupRequests = new TeamSetupRequestService({
+  store, teams: teamSetupTeams, canAccessTeam, canPersist: proposalPersistence, maxBots: MAX_WORKSPACE_BOTS,
+  targetBusy: (botId) => Boolean(store.bot(botId)?.busy || hasDirectDispatch(botId) || activeGroupTurnForBot(botId) || routines?.activeRunForBot(botId)),
+  validateModel: (selection, current) => {
+    const checked = checkedModelSelection(selection, undefined, true);
+    if (!checked.ok) return checked.error;
+    if (current?.approvalGrant) return "Wait for the approval-level confirmation before changing this bot's model";
+    if (current) {
+      const mode = approvalModeFor(current);
+      const driver = registry.cliTarget(selection.instanceId)?.driverKind;
+      if (!supportsApprovalMode(driver, mode) || ((mode === "full" || mode === "custom") && driver !== registry.cliTarget(current.modelSelection.instanceId)?.driverKind)) {
+        return `@${current.name}'s existing permissions are incompatible with that provider. Change its permissions in bot settings, then propose the model change again.`;
+      }
+    }
+    return null;
+  },
+  deleteBot: async (botId, revalidate) => {
+    const result = await deleteBotWithLifecycle(botId, revalidate);
+    if (result.status >= 400) throw new TeamSetupError(result.body.error ?? "The bot could not be deleted", result.status);
+  },
+});
+
+const pendingTeamSetupResumes = new Map<string, { request: TeamSetupRequest; messageId: string }>();
+function dispatchTeamSetupResume(entry: { request: TeamSetupRequest; messageId: string }): void {
+  const { request, messageId } = entry;
+  const owner = connectorThread(request.botId, request.threadId);
+  const message = store.messagesFor(request.threadId).find((item) => item.id === messageId);
+  if (!owner || !message?.card?.teamSetupRequest?.result) return;
+  if (owner.group ? owner.bot.busy : threadBusy(request.botId, request.threadId) || activeGroupTurnForBot(request.botId)) {
+    pendingTeamSetupResumes.set(request.requestId, entry);
+    return;
+  }
+  const prompt = `OpenMausBot team setup decision: ${JSON.stringify(request.result)}. Report this exact result and continue the user's already requested work. Do not ask for confirmation again or repeat this setup/deletion. A denied or cancelled operation did not authorize any substitute action. Existing thread models were not changed.`;
+  const failed = (error: string) => {
+    const current = store.messagesFor(request.threadId).find((item) => item.id === messageId);
+    if (current?.card) store.patchMessage(request.threadId, messageId, { card: { ...current.card, held: `The decision was recorded, but the Chief could not continue: ${redactSecretsInText(error).slice(0, 300)}` } });
+  };
+  if (owner.group) {
+    const groupId = owner.group.id;
+    const operation = beginGroupTurnOperation(groupId, request.threadId, [request.botId]);
+    const previous = groupQueues.get(groupId) ?? Promise.resolve();
+    const next = previous.then(async () => {
+      if (operation.cancelled) return;
+      const current = connectorThread(request.botId, request.threadId);
+      if (!current?.group) return;
+      if (current.bot.busy) { pendingTeamSetupResumes.set(request.requestId, entry); return; }
+      await runGroupMemberTurn(groupId, request.threadId, request.botId, 0, new Set(), prompt, failed,
+        () => operation.cancelled, () => groupProviderHandshakeStarted(operation), () => groupProviderHandshakeSettled(operation));
+    });
+    groupQueues.set(groupId, next.finally(() => finishGroupTurnOperation(groupId, operation)).catch((error) => failed(error instanceof Error ? error.message : String(error))));
+    return;
+  }
+  void startTurn(request.botId, prompt, { threadId: request.threadId, cardContinuation: true, onDispatchError: failed }).catch((error) => {
+    if (isTurnAdmissionBlocked(error)) pendingTeamSetupResumes.set(request.requestId, entry);
+    else failed(error instanceof Error ? error.message : String(error));
+  });
+}
+function drainTeamSetupResumes(): void {
+  for (const [key, entry] of pendingTeamSetupResumes) {
+    const owner = connectorThread(entry.request.botId, entry.request.threadId);
+    if (owner?.group ? owner.bot.busy : threadBusy(entry.request.botId, entry.request.threadId) || activeGroupTurnForBot(entry.request.botId)) continue;
+    pendingTeamSetupResumes.delete(key);
+    dispatchTeamSetupResume(entry);
+  }
+}
+async function resolveAndSendTeamSetup(res: ServerResponse, args: { botId: string; threadId: string; requestId: string; behavior: string }, ownerReview: boolean): Promise<boolean> {
+  const card = store.messagesFor(args.threadId).find((item) => item.card?.requestId === args.requestId && item.card.teamSetupRequest)?.card;
+  if (!card) return false;
+  if (args.behavior === "allow" && !ownerReview) { json(res, 403, { error: "Approve team setup or deletion from the app or an owner device" }); return true; }
+  const resolved = await teamSetupRequests.resolve(args);
+  if (!resolved) return false;
+  if (!resolved.duplicate) {
+    appendDecision(DATA_DIR, { threadId: args.threadId, requestId: args.requestId, botId: args.botId, tool: card.tool,
+      summary: card.subtitle, decision: resolved.result.state === "applied" ? "user-approved" : "user-denied", source: "user" });
+  }
+  const current = store.messagesFor(args.threadId).find((item) => item.id === resolved.messageId);
+  if (current?.card?.teamSetupRequest && !current.card.teamSetupRequest.resumed) {
+    store.patchMessage(args.threadId, current.id, { card: { ...current.card, teamSetupRequest: { ...current.card.teamSetupRequest, resumed: true } } });
+    dispatchTeamSetupResume({ request: resolved.request, messageId: resolved.messageId });
+  }
+  json(res, 200, { ok: true, outcome: resolved.result.state === "applied" ? "allowed-once" : "rejected", result: resolved.result, alreadySettled: resolved.duplicate });
+  return true;
+}
 const ROUTINE_WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
 const routineTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const routineTimestamp = (value: number | undefined) =>
@@ -6885,6 +6976,7 @@ async function runGroupMemberTurn(
     drainQueuedSends();
     drainConnectorResumes();
     drainSecretResumes();
+    drainTeamSetupResumes();
     return false;
   }
   if (outcome === "timed_out") {
@@ -6913,6 +7005,7 @@ async function runGroupMemberTurn(
         drainQueuedSends();
         drainConnectorResumes();
         drainSecretResumes();
+        drainTeamSetupResumes();
       }
     };
     const release = setTimeout(releaseOwnership, 6_000);
@@ -6938,6 +7031,7 @@ async function runGroupMemberTurn(
     drainQueuedSends();
     drainConnectorResumes();
     drainSecretResumes();
+    drainTeamSetupResumes();
   }
   if (outcome === "provider_failed") {
     if (skillAuthoring) skillAuthoringClaim.claimed = false;
@@ -7044,6 +7138,7 @@ async function runGroupMemberTurn(
       drainQueuedSends();
       drainConnectorResumes();
       drainSecretResumes();
+      drainTeamSetupResumes();
     }
   }
 }
@@ -7763,7 +7858,7 @@ function proposalPersistence(botId: string, threadId: string) {
   // one thread cannot pile up 8 of each.
   const openRequests = store.activePath(threadId).filter(
     (message) =>
-      (message.card?.routineRequest?.botId === botId || message.card?.profileRequest?.botId === botId) &&
+      (message.card?.routineRequest?.botId === botId || message.card?.profileRequest?.botId === botId || message.card?.teamSetupRequest?.botId === botId) &&
       !message.card.answered &&
       !message.card.dismissed,
   ).length;
@@ -8415,6 +8510,7 @@ bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "turn.completed") {
     drainConnectorResumes();
     drainSecretResumes();
+    drainTeamSetupResumes();
   }
 });
 
@@ -8765,6 +8861,7 @@ async function reloadProviders() {
   drainQueuedSends();
   drainConnectorResumes();
   drainSecretResumes();
+  drainTeamSetupResumes();
 }
 
 // Config writes rebuild the whole provider registry. Keep the read-modify-write
@@ -9532,6 +9629,44 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           threadId: body.fromThreadId, requestId: proposed.requestId, botId: from.id, botName: from.name,
           tool: "update_profile", summary: proposed.detail, decision: "card-shown", source: "profile",
         });
+        return json(res, 201, proposed);
+      }
+      if (method === "GET" && path === "/api/internal/team-setup-catalog") {
+        const chief = store.bot(internalCapability.botId)!;
+        if (!chief.chiefOfStaff || chief.hidden) return json(res, 403, { error: "Only an active Chief may plan team setup" });
+        const instances = await registry.describe();
+        requireActiveInternalCapability();
+        return json(res, 200, {
+          teams: teamSetupTeams().filter((name) => canAccessTeam(chief, name)),
+          bots: store.bots.filter((bot) => !bot.hidden && canAccessTeam(chief, bot.section) && (bot.id === chief.id || peerAllowed(chief, bot.id)))
+            .map((bot) => ({ id: bot.id, name: bot.name, title: bot.title, section: bot.section ?? "", modelSelection: bot.modelSelection })),
+          instances: instances.map((instance) => ({ instanceId: instance.instanceId, driverKind: instance.driverKind, displayName: instance.displayName,
+            state: instance.snapshot.state, models: instance.models, effortLevels: instance.capabilities?.effortLevels ?? [] })),
+          scope: "Bot model defaults apply to groups and new threads; existing threads retain their models. New teams require explicit approval of their names and this Chief's access.",
+        });
+      }
+      if (method === "POST" && path === "/api/internal/team-setup-requests") {
+        const parsed = z.object({ fromBotId: z.string().optional(), fromThreadId: z.string().optional(), plan: z.unknown() }).strict().safeParse(await readInternalBody());
+        if (!parsed.success) return json(res, 400, { error: "Invalid team setup request" });
+        const chief = store.bot(internalCapability.botId)!;
+        const owner = connectorThread(chief.id, internalCapability.threadId);
+        if (!owner) return json(res, 403, { error: "Source conversation no longer belongs to the Chief" });
+        const proposed = teamSetupRequests.propose({ botId: chief.id, threadId: internalCapability.threadId, plan: parsed.data.plan,
+          ...(owner.group ? { from: { botId: chief.id, name: chief.name, color: chief.color } } : {}) });
+        appendDecision(DATA_DIR, { threadId: internalCapability.threadId, requestId: proposed.requestId, botId: chief.id,
+          tool: "set_up_team", summary: proposed.detail, decision: "card-shown", source: "profile" });
+        return json(res, 201, proposed);
+      }
+      if (method === "POST" && path === "/api/internal/bot-deletion-requests") {
+        const parsed = z.object({ fromBotId: z.string().optional(), fromThreadId: z.string().optional(), targetBotId: z.string().min(1), reason: z.string().trim().min(1).max(500) }).strict().safeParse(await readInternalBody());
+        if (!parsed.success) return json(res, 400, { error: "An exact bot id and deletion reason are required" });
+        const chief = store.bot(internalCapability.botId)!;
+        const owner = connectorThread(chief.id, internalCapability.threadId);
+        if (!owner) return json(res, 403, { error: "Source conversation no longer belongs to the Chief" });
+        const proposed = teamSetupRequests.proposeDeletion({ botId: chief.id, threadId: internalCapability.threadId, targetBotId: parsed.data.targetBotId, reason: parsed.data.reason,
+          ...(owner.group ? { from: { botId: chief.id, name: chief.name, color: chief.color } } : {}) });
+        appendDecision(DATA_DIR, { threadId: internalCapability.threadId, requestId: proposed.requestId, botId: chief.id,
+          tool: "delete_bot", summary: proposed.detail, decision: "card-shown", source: "profile" });
         return json(res, 201, proposed);
       }
       // session_search: ranked recall over the calling bot's OWN threads,
@@ -13233,6 +13368,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const behavior = requestBehavior(body.behavior);
       const reviewedSha256 = typeof body.reviewedSha256 === "string" ? body.reviewedSha256 : undefined;
       if (!behavior) return json(res, 400, { error: "behavior must be allow, deny, or answer" });
+      if (await resolveAndSendTeamSetup(res, {
+        botId: bot.id, threadId: bot.threadId, requestId: String(body.requestId), behavior,
+      }, auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) : auth.scopes.includes("admin"))) return;
       if (resolveAndSendRoutine(res, {
         botId: bot.id,
         botName: bot.name,
@@ -13309,6 +13447,13 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           requestId,
           behavior,
         })) return;
+      }
+      const setupCard = store.messagesFor(threadId).find((message) => message.card?.requestId === requestId && message.card.teamSetupRequest);
+      if (setupCard) {
+        const setupBotId = setupCard.from?.botId ?? store.botByThread(threadId)?.id;
+        if (!setupBotId) return json(res, 400, { error: "This team setup has no valid owner" });
+        if (await resolveAndSendTeamSetup(res, { botId: setupBotId, threadId, requestId, behavior },
+          auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) : auth.scopes.includes("admin"))) return;
       }
       const profileCard = store.messagesFor(threadId).find(
         (message) => message.card?.requestId === requestId && message.card.profileRequest,
@@ -14687,6 +14832,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             drainDelegationWakes();
             drainConnectorResumes();
             drainSecretResumes();
+            drainTeamSetupResumes();
           }
           if (mandatoryError) throw mandatoryError;
           return status;
