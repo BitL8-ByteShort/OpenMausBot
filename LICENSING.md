@@ -16,8 +16,10 @@ Delete the folder and what remains is the open-source edition: the server
 reports `{"edition":"oss"}` and ordinary standalone operation is unchanged.
 A workspace explicitly configured for hosted sign-in refuses remote access
 without that optional adapter; removing the enterprise layer must not bypass
-its configured sign-in authority. CI proves the standalone boundary on every
-change (`open-source edition builds without enterprise/` in `ci.yml`). The list
+its configured sign-in authority. The `open-source edition builds without
+enterprise/` CI job proves the OSS build, boot response and absent adapter
+factory; it does not exercise every hosted HTTP route. The isolated hosted
+workspace tests verify those sign-in and revocation paths separately. The list
 of entitlement ids the server understands is in [`enterprise/FEATURES`](enterprise/FEATURES).
 
 The routing rule for new work: could any open-source user want it? Then it goes

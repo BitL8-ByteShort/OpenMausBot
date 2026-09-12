@@ -79,11 +79,11 @@ afterEach(async () => {
   await removeTempDir(home);
 });
 
-function call(path: string, cookie?: string, host = "acme.example.test") {
-  return new Promise<{ status: number; cookies: string[]; location: string; body: string }>((resolve, reject) => {
-    const req = request({ hostname: "127.0.0.1", port, path, headers: { host, "x-forwarded-for": "203.0.113.7", ...(cookie ? { cookie } : {}) } }, (res) => {
+function call(path: string, cookie?: string, host = "acme.example.test", forwardedFor = "203.0.113.7") {
+  return new Promise<{ status: number; cookies: string[]; location: string; body: string; retryAfter?: string }>((resolve, reject) => {
+    const req = request({ hostname: "127.0.0.1", port, path, headers: { host, "x-forwarded-for": forwardedFor, ...(cookie ? { cookie } : {}) } }, (res) => {
       let body = ""; res.on("data", (chunk) => body += chunk);
-      res.on("end", () => resolve({ status: res.statusCode!, cookies: res.headers["set-cookie"] ?? [], location: res.headers.location ?? "", body }));
+      res.on("end", () => resolve({ status: res.statusCode!, cookies: res.headers["set-cookie"] ?? [], location: res.headers.location ?? "", body, retryAfter: res.headers["retry-after"] }));
     });
     req.on("error", reject); req.end();
   });
@@ -152,6 +152,33 @@ describe("hosted workspace handoff and continuous access", () => {
     finish(Response.json({ ...member, grant: proof() }));
     expect((await first).status).toBe(302);
     expect(remote).toHaveBeenCalledTimes(1);
+  });
+  it("rate-limits starts by the trusted source without clearing a pending cookie or blocking its callback", async () => {
+    const pending = await begin();
+    for (let index = 1; index < 20; index++) expect((await call("/api/auth/hosted/start")).status).toBe(302);
+    const rejected = await call("/api/auth/hosted/start", pending.cookie, "acme.example.test", "198.51.100.80, 203.0.113.7");
+    expect(rejected).toMatchObject({ status: 429, cookies: [], location: "", retryAfter: "60" });
+    expect((await call("/api/auth/hosted/start", "different-cookie", "acme.example.test", "198.51.100.81, 203.0.113.7")).status).toBe(429);
+    expect((await call("/api/auth/hosted/start", undefined, "acme.example.test", "203.0.113.8")).status).toBe(302);
+    expect(remote).not.toHaveBeenCalled();
+    expect((await call(pending.callback, pending.cookie)).status).toBe(302);
+    clock += 60_000;
+    expect((await call("/api/auth/hosted/start")).status).toBe(302);
+  });
+  it("rejects global capacity without evicting the oldest handoff, and reclaims completed and expired slots", async () => {
+    const pending = await begin();
+    for (let index = 0; index < 999; index++) {
+      const source = `198.51.100.${Math.floor(index / 20) + 1}`;
+      expect((await call("/api/auth/hosted/start", undefined, "acme.example.test", source)).status).toBe(302);
+    }
+    const rejected = await call("/api/auth/hosted/start", pending.cookie, "acme.example.test", "192.0.2.1");
+    expect(rejected).toMatchObject({ status: 429, cookies: [], location: "", retryAfter: "60" });
+    expect(remote).not.toHaveBeenCalled();
+    expect((await call(pending.callback, pending.cookie)).status).toBe(302);
+    expect((await call("/api/auth/hosted/start", undefined, "acme.example.test", "192.0.2.1")).status).toBe(302);
+    expect((await call("/api/auth/hosted/start", undefined, "acme.example.test", "192.0.2.2")).status).toBe(429);
+    clock += 300_000;
+    expect((await call("/api/auth/hosted/start", undefined, "acme.example.test", "192.0.2.2")).status).toBe(302);
   });
   it("rejects nonportal remote sessions while preserving credential-free local owner access", async () => {
     const paired = sessions.issue({ label: "QR device", scopes: ["admin", "client"] });

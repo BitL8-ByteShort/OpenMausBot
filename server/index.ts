@@ -455,7 +455,10 @@ function signInAllowList() {
 }
 const sessions = new SessionRegistry({
   file: join(DATA_DIR, "sessions.json"),
-  emailScopes: (email) => allowedScopes(email, signInAllowList()),
+  emailScopesSnapshot: () => {
+    const membership = signInAllowList();
+    return (email) => allowedScopes(email, membership);
+  },
   portalMembership: hostedWorkspaceConfiguration()?.portalMembership === true,
 });
 const SESSION_COOKIE = sessionCookieName(PORT, ENVIRONMENT_ID);
@@ -10638,7 +10641,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // and closed this owner's streams. Do not open a late replacement on
       // the earlier authorization; once registered, exact-owner close covers it.
       if (HOSTED_WORKSPACE && auth.kind === "session") {
-        const failure = await workspaceAccess!.authorize(req, auth);
+        const failure = workspaceAccess
+          ? await workspaceAccess.authorize(req, auth)
+          : { status: 503, error: "Workspace sign-in is unavailable." };
         if (failure) return json(res, failure.status, { error: failure.error });
       }
       const owner = auth.kind === "session" ? auth.session.id : "local-owner";
@@ -15282,6 +15287,13 @@ const gracefulShutdown = createGracefulShutdown({
   // the shutdown deadline), immediately before the process exits, so no new
   // server can overlap with a still-mutating old one.
   exit: (code) => {
+    try { sessions.close(); }
+    catch {
+      // An uncleared marker makes saved account sessions require sign-in on
+      // the next boot; never label failed persistence a clean shutdown.
+      console.error("Session persistence failed during shutdown; account sign-in will be required again.");
+      code = 1;
+    }
     closeMessageDb();
     releaseDataDirLeaseAtExit();
     process.exit(code);

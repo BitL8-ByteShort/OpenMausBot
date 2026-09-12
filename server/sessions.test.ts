@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as atomic from "./atomic.ts";
 
 import {
   EXCHANGE_REPLAY_MS,
@@ -29,7 +30,7 @@ beforeEach(() => {
   clock = 1_700_000_000_000;
   registry = new SessionRegistry({ file: file(), now: () => clock });
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
 
 function pair(label = "MacBook", source = "10.0.0.2") {
   const { code } = registry.openPairing();
@@ -145,8 +146,10 @@ describe("sessions", () => {
     expect(registry.authenticate(ordinary.token)).toBeNull();
     expect(registry.authenticate(paired.token)?.membershipAuthority).toBeUndefined();
     expect(registry.authenticate(paired.token)?.id).toBe(paired.session.id);
+    registry.close();
     const reloaded = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => null, portalMembership: true });
     expect(reloaded.authenticate(portal.token)?.id).toBe(portal.session.id);
+    reloaded.close();
     const localAgain = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => null });
     expect(localAgain.authenticate(portal.token)).toBeNull();
     expect(localAgain.authenticate(paired.token)?.id).toBe(paired.session.id);
@@ -208,6 +211,122 @@ describe("sessions", () => {
     allowed = false;
     expect(registry.redeemStreamTicket(ticket)).toBeNull();
     expect(registry.isLive(email.session.id)).toBe(false);
+  });
+
+  it("builds one membership resolver per pass and skips snapshots with no eligible account sessions", () => {
+    const resolve = vi.fn((_email: string) => ["client" as const]);
+    const snapshot = vi.fn(() => resolve);
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopesSnapshot: snapshot, portalMembership: true });
+    pair();
+    const portal = registry.issuePortal({ email: "portal@example.test", grant: "g".repeat(43), scopes: ["client"] });
+    registry.revalidateEmailSessions();
+    expect(snapshot).not.toHaveBeenCalled();
+    registry.issue({ label: "first", email: "one@example.test", scopes: ["client"] });
+    registry.issue({ label: "second", email: "two@example.test", scopes: ["client"] });
+    snapshot.mockClear(); resolve.mockClear();
+    registry.revalidateEmailSessions();
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(resolve.mock.calls.map(([email]) => email)).toEqual(["one@example.test", "two@example.test"]);
+    expect(registry.authenticate(portal.token)?.membershipAuthority).toBe("portal");
+  });
+
+  it("fails closed for every eligible account when a snapshot fails, without using the fallback", () => {
+    let unavailable = false;
+    const fallback = vi.fn(() => ["admin" as const, "client" as const]);
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: fallback,
+      emailScopesSnapshot: () => { if (unavailable) throw new Error("private membership failure"); return () => ["client"]; },
+    });
+    const paired = pair();
+    const first = registry.issue({ label: "first", email: "one@example.test", scopes: ["client"] });
+    const second = registry.issue({ label: "second", email: "two@example.test", scopes: ["client"] });
+    unavailable = true;
+    registry.revalidateEmailSessions();
+    expect(registry.authenticate(first.token)).toBeNull();
+    expect(registry.authenticate(second.token)).toBeNull();
+    expect(registry.authenticate(paired.token)?.id).toBe(paired.session.id);
+    expect(fallback).not.toHaveBeenCalled();
+  });
+
+  it("restores valid email and paired sessions after clean shutdown, and rechecks one snapshot during load", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const paired = pair();
+    expect(existsSync(`${file()}.open`)).toBe(true);
+    if (process.platform !== "win32") expect(statSync(`${file()}.open`).mode & 0o777).toBe(0o600);
+    registry.close(); registry.close();
+    expect(existsSync(`${file()}.open`)).toBe(false);
+    expect(() => registry.authenticate(email.token)).toThrow("closed");
+    const snapshot = vi.fn(() => () => ["client" as const]);
+    const loaded = new SessionRegistry({ file: file(), now: () => clock, emailScopesSnapshot: snapshot });
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(loaded.authenticate(email.token)?.id).toBe(email.session.id);
+    expect(loaded.authenticate(paired.token)?.id).toBe(paired.session.id);
+    loaded.close();
+  });
+
+  it("revokes restored email sessions if the constructor membership snapshot fails", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const paired = pair(); registry.close();
+    const unavailable = new SessionRegistry({ file: file(), now: () => clock, emailScopesSnapshot: () => { throw new Error("unavailable"); } });
+    expect(unavailable.authenticate(email.token)).toBeNull();
+    unavailable.close();
+    const restored = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    expect(restored.authenticate(email.token)).toBeNull();
+    expect(restored.authenticate(paired.token)?.id).toBe(paired.session.id);
+    restored.close();
+  });
+
+  it("never revives revoked email bearers after persistence failure, unclean restart, and membership restoration", () => {
+    let allowed = true;
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => allowed ? ["client"] : null });
+    const paired = pair();
+    const email = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const { ticket } = registry.issueStreamTicket(email.session.id);
+    const saved = readFileSync(file(), "utf8");
+    const logger = vi.spyOn(console, "error").mockImplementation(() => {});
+    // The real pre-failure session file and boot marker remain on disk. Every
+    // attempted atomic write now fails, including any attempted clean close.
+    const writes = vi.spyOn(atomic, "writeFileAtomic").mockImplementation(() => { throw new Error("EIO: private-path-and-token"); });
+    allowed = false;
+    registry.revalidateEmailSessions();
+    expect(registry.authenticate(email.token)).toBeNull();
+    expect(registry.redeemStreamTicket(ticket)).toBeNull();
+    expect(readFileSync(file(), "utf8")).toBe(saved);
+    expect(existsSync(`${file()}.open`)).toBe(true);
+    expect(() => registry.close()).toThrow("Could not safely close session storage.");
+    expect(() => new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] })).toThrow("Could not establish safe session storage.");
+    expect(logger.mock.calls.flat().join(" ")).not.toContain("private-path-and-token");
+    writes.mockRestore(); allowed = true;
+    const restarted = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    expect(restarted.authenticate(email.token)).toBeNull();
+    expect(restarted.authenticate(paired.token)?.id).toBe(paired.session.id);
+    restarted.close();
+    const cleanRestart = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"] });
+    expect(cleanRestart.authenticate(email.token)).toBeNull();
+    expect(cleanRestart.authenticate(paired.token)?.id).toBe(paired.session.id);
+    cleanRestart.close();
+  });
+
+  it("drops account and portal sessions but preserves paired phones after any unclean restart", () => {
+    registry = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"], portalMembership: true });
+    const paired = pair();
+    const account = registry.issue({ label: "browser", email: "person@example.test", scopes: ["client"] });
+    const portal = registry.issuePortal({ email: "person@example.test", grant: "g".repeat(43), scopes: ["client"] });
+    const restarted = new SessionRegistry({ file: file(), now: () => clock, emailScopes: () => ["client"], portalMembership: true });
+    expect(restarted.authenticate(account.token)).toBeNull();
+    expect(restarted.authenticate(portal.token)).toBeNull();
+    expect(restarted.authenticate(paired.token)?.id).toBe(paired.session.id);
+    restarted.close();
+  });
+
+  it("refuses to load persisted sessions when the marker cannot be established on the real filesystem", () => {
+    const blocked = join(dir, "blocked.json");
+    const paired = pair();
+    writeFileSync(blocked, readFileSync(file(), "utf8"));
+    mkdirSync(`${blocked}.open`); // An atomic file replace cannot overwrite a directory, even as root.
+    expect(() => new SessionRegistry({ file: blocked, now: () => clock })).toThrow("Could not establish safe session storage.");
+    expect(readFileSync(blocked, "utf8")).toContain(paired.session.id);
   });
 
   it("stores only a hash, owner-only, and reloads from disk", () => {

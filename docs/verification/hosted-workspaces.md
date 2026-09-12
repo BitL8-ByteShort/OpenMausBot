@@ -61,6 +61,15 @@ Anthropic/OpenRouter credentials. Never seed a hosted workspace with a
 provider gateway's master key. These runtime seams do not require a particular
 console repository, orchestration platform, or cloud provider.
 
+Hosted sign-in starts have a bounded per-source allocation limit. A full
+handoff table returns 429 without evicting existing sign-ins or preventing
+their callbacks from completing. Email/account sessions survive a successful
+graceful shutdown. An unclean shutdown or failed session persistence requires
+account sign-in again; paired-device sessions are preserved. A durable boot
+marker prevents old, revoked account tokens from reappearing after a failed
+write and restart. Local allow-list membership is read once per revalidation
+pass, not once per session on each streamed event.
+
 ## Isolated verification
 
 Read [the verification entry point](README.md) first. Run only disposable
@@ -70,7 +79,7 @@ service.
 ```sh
 pnpm typecheck
 pnpm lint
-pnpm exec vitest run server/hosted-access.test.ts enterprise/server/workspace-access.test.ts server/email-signin.test.ts server/sessions.test.ts server/request-auth.test.ts server/enterprise.test.ts server/browser-live.test.ts server/fleet.test.ts server/fleet-cli.test.ts server/fleet-agent.test.ts server/fleet-cli-filesystem.test.ts
+pnpm exec vitest run server/hosted-access.test.ts enterprise/server/workspace-access.test.ts server/email-signin.test.ts server/sessions.test.ts server/request-auth.test.ts server/enterprise.test.ts server/browser-live.test.ts server/fleet.test.ts server/fleet-cli.test.ts server/fleet-agent.test.ts server/fleet-cli-filesystem.test.ts src/components/WorkspacesSection.test.ts
 pnpm test:packaged-server
 ```
 
@@ -91,10 +100,10 @@ service/fence ordering, proxy boundaries, reboot recovery and backup restore
 still require a separately authorized disposable Linux deployment using the
 [fleet recipe](fleet.md).
 
-## Observed local result — 2026-09-13
+## Observed local result — 2026-09-13 (Asia/Kolkata; September 12 UTC)
 
 The commands above passed after extracting the runtime changes onto public
-main `c610e6cd`: 226 targeted tests, typecheck, lint, all twelve packaged proxy
+main `c610e6cd`: 240 targeted tests, typecheck, lint, all twelve packaged proxy
 paths and the packaged MCP round trip. The production UI build also passed.
 The full-server fixture additionally proved explicit portal membership with
 an empty local allow-list, including outage, demotion and quiet-stream

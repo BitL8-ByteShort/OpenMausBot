@@ -9,9 +9,10 @@
 // endpoint, because EventSource cannot set headers. Failed exchanges are
 // counted per source: five in a minute lock that source out for ten.
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { z } from "zod";
+import { writeFileAtomic } from "./atomic.ts";
 
 export type Scope = "admin" | "client";
 export const SCOPES: readonly Scope[] = ["admin", "client"];
@@ -165,6 +166,16 @@ function publicSession(record: SessionRecord): PublicSession {
   return view;
 }
 
+export type EmailScopesResolver = (email: string) => readonly Scope[] | null;
+export interface SessionStoreOptions {
+  file: string;
+  now?: () => number;
+  emailScopes?: EmailScopesResolver;
+  /** One membership snapshot per revalidation pass, not per session. */
+  emailScopesSnapshot?: () => EmailScopesResolver;
+  portalMembership?: boolean;
+}
+
 export class SessionRegistry {
   private sessions: SessionRecord[] = [];
   private pairings: PairingCode[] = [];
@@ -174,22 +185,31 @@ export class SessionRegistry {
   private readonly onRevoked = new Set<(sessionId: string) => void>();
   private lastSeenWrites = new Map<string, number>();
   private readonly now: () => number;
-  private readonly options: {
-    file: string;
-    now?: () => number;
-    emailScopes?: (email: string) => readonly Scope[] | null;
-    portalMembership?: boolean;
-  };
+  private readonly options: SessionStoreOptions;
+  private readonly openMarker: string;
+  private closed = false;
 
   // No parameter properties: the server runs this file under Node's
   // strip-only TypeScript mode, which only erases types.
-  constructor(options: { file: string; now?: () => number; emailScopes?: (email: string) => readonly Scope[] | null; portalMembership?: boolean }) {
+  constructor(options: SessionStoreOptions) {
     this.options = options;
     this.now = options.now ?? Date.now;
-    this.load();
+    this.openMarker = `${options.file}.open`;
+    const unclean = existsSync(this.openMarker);
+    try {
+      mkdirSync(dirname(options.file), { recursive: true, mode: 0o700 });
+      // Establish the guard before accepting any persisted bearer. Even if
+      // every subsequent write fails, an unclean restart will see this marker.
+      writeFileAtomic(this.openMarker, "Session registry is open.\n", { mode: 0o600 });
+      this.syncDirectory();
+    } catch {
+      throw new Error("Could not establish safe session storage.");
+    }
+    this.load(!unclean);
+    this.revalidateEmailSessions();
   }
 
-  private load(): void {
+  private load(restoreAccounts: boolean): void {
     if (!existsSync(this.options.file)) return;
     let raw: unknown;
     try {
@@ -198,17 +218,41 @@ export class SessionRegistry {
       return; // unreadable: start empty rather than refuse to boot; pairing again is cheap
     }
     const parsed = fileSchema.safeParse(raw);
-    if (parsed.success) this.sessions = parsed.data.sessions;
+    if (parsed.success) this.sessions = parsed.data.sessions.filter(session => restoreAccounts || (session.email === undefined && session.userId === undefined));
+  }
+
+  private syncDirectory(): void {
+    // Windows does not expose directory fsync. The open marker still guards
+    // normal process crashes; no stronger power-loss guarantee is claimed.
+    if (process.platform === "win32") return;
+    const fd = openSync(dirname(this.options.file), "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
   }
 
   /** Atomic write, owner-only, directory owner-only. */
   private persist(): void {
+    if (this.closed) throw new Error("Session registry is closed.");
     const dir = dirname(this.options.file);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const tmp = `${this.options.file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ version: 1, sessions: this.sessions }, null, 2) + "\n", { mode: 0o600 });
-    chmodSync(tmp, 0o600);
-    renameSync(tmp, this.options.file);
+    writeFileAtomic(this.options.file, JSON.stringify({ version: 1, sessions: this.sessions }, null, 2) + "\n", { mode: 0o600 });
+    this.syncDirectory();
+  }
+
+  /** Call after HTTP/stream shutdown. A failed close leaves the open marker,
+   * so account sessions require fresh sign-in after restart. Paired devices
+   * remain durable. Never remove the marker before the reduced set is saved. */
+  close(): void {
+    if (this.closed) return;
+    try {
+      this.revalidateEmailSessions();
+      this.persist();
+      unlinkSync(this.openMarker);
+      this.closed = true;
+      // A marker deletion lost on power failure causes extra sign-in only;
+      // the session file and its rename were fsynced before removal.
+    } catch {
+      throw new Error("Could not safely close session storage.");
+    }
   }
 
   private prune(): void {
@@ -401,11 +445,18 @@ export class SessionRegistry {
    * new role. Promotions never widen existing credentials. Pairing sessions
    * have no email and remain independent of the hosted sign-in list. */
   revalidateEmailSessions(): void {
-    const revoked = this.sessions.filter((session) => {
-      if (session.email === undefined) return false;
-      if (this.options.portalMembership && session.membershipAuthority === "portal") return false;
+    if (this.closed) throw new Error("Session registry is closed.");
+    const eligible = this.sessions.filter(session => session.email !== undefined && !(this.options.portalMembership && session.membershipAuthority === "portal"));
+    if (!eligible.length) return;
+    let resolveScopes = this.options.emailScopes;
+    try {
+      if (this.options.emailScopesSnapshot) resolveScopes = this.options.emailScopesSnapshot();
+    } catch {
+      resolveScopes = undefined; // Never fall back to stale membership after a failed snapshot.
+    }
+    const revoked = eligible.filter((session) => {
       try {
-        const allowed = this.options.emailScopes?.(session.email);
+        const allowed = resolveScopes?.(session.email!);
         return !allowed || session.scopes.some((scope) => !allowed.includes(scope));
       } catch {
         return true; // missing or unreadable membership must fail closed
@@ -417,10 +468,11 @@ export class SessionRegistry {
     for (const session of revoked) this.forget(session.id);
     try {
       this.persist();
-    } catch (error) {
-      // Keep revocation effective in memory (and streams closed) even when
-      // storage is unavailable. Reloaded tokens face the same membership check.
-      console.error("Could not persist email session revocation:", error);
+    } catch {
+      // Revocation stays effective in memory and streams close. The boot
+      // marker prevents old account bearers from reviving after an unclean
+      // restart, even if membership is later restored and all writes failed.
+      console.error("Could not persist email session revocation.");
     }
   }
 

@@ -3,12 +3,15 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { hostedWorkspaceConfiguration, type WorkspaceAccess, type WorkspaceAccessOptions } from "../../server/enterprise.ts";
-import { isAllowedOrigin, isLoopbackHost, isProxied, parseCookies, serializeSessionCookie } from "../../server/request-auth.ts";
+import { isAllowedOrigin, isLoopbackHost, isProxied, parseCookies, requestSource, serializeSessionCookie } from "../../server/request-auth.ts";
 import { cookieMaxAgeSeconds, type Scope, type SessionRecord } from "../../server/sessions.ts";
 
 const START = "/api/auth/hosted/start";
 const CALLBACK = "/api/auth/hosted/callback";
 const TTL_MS = 300_000;
+const MAX_PENDING = 1_000;
+const START_WINDOW_MS = 60_000;
+const STARTS_PER_SOURCE = 20;
 const PROOF = /^[A-Za-z0-9_-]{43}$/;
 const unavailable = { status: 503 as const, error: "Workspace sign-in is unavailable. Try again shortly." };
 const denied = { status: 401 as const, error: "Workspace access ended. Sign in again." };
@@ -33,6 +36,7 @@ export function createWorkspaceAccess(options: WorkspaceAccessOptions): Workspac
   const config = hostedWorkspaceConfiguration(env);
   const cookieName = `__Host-${options.cookieName}_handoff`;
   const pending = new Map<string, { verifier: string; expiresAt: number }>();
+  const starts = new Map<string, { count: number; expiresAt: number }>();
   const observed = new Map<string, SessionRecord>();
   let checking = false;
 
@@ -92,12 +96,21 @@ export function createWorkspaceAccess(options: WorkspaceAccessOptions): Workspac
         redirect(res, START); return true;
       }
       if (path === START) {
-        for (const [state, value] of pending) if (value.expiresAt <= now()) pending.delete(state);
-        // Bounded anonymous handoffs; restarting the server cancels these too.
-        if (pending.size >= 1_000) pending.delete(pending.keys().next().value!);
+        const time = now();
+        for (const [state, value] of pending) if (value.expiresAt <= time) pending.delete(state);
+        for (const [source, value] of starts) if (value.expiresAt <= time) starts.delete(source);
+        const source = requestSource(req), recent = starts.get(source);
+        // Bound both anonymous allocations and source accounting. Reject new
+        // work instead of evicting another person's live sign-in or cookie.
+        if (pending.size >= MAX_PENDING || (recent?.count ?? 0) >= STARTS_PER_SOURCE || (!recent && starts.size >= MAX_PENDING)) {
+          res.writeHead(429, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "referrer-policy": "no-referrer", "retry-after": String(START_WINDOW_MS / 1_000) });
+          res.end("<!doctype html><title>Workspace sign-in</title><p>Too many sign-in attempts. Try again shortly.</p>");
+          return true;
+        }
+        starts.set(source, { count: (recent?.count ?? 0) + 1, expiresAt: recent?.expiresAt ?? time + START_WINDOW_MS });
         const state = randomBytes(32).toString("base64url");
         const verifier = randomBytes(32).toString("base64url");
-        pending.set(state, { verifier, expiresAt: now() + TTL_MS });
+        pending.set(state, { verifier, expiresAt: time + TTL_MS });
         res.setHeader("set-cookie", serializeSessionCookie(cookieName, `${state}.${verifier}`, { secure: true, maxAgeSeconds: TTL_MS / 1_000 }));
         const target = new URL("/connect", config.admin);
         target.search = new URLSearchParams({ workspace: config.workspace, state, challenge: createHash("sha256").update(verifier).digest("base64url") }).toString();
