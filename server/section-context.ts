@@ -48,12 +48,12 @@ export function sectionContextLabel(section?: string | null): string {
   return sectionContextKey(section) || "General";
 }
 
-function loadFile(): SectionContextFile {
+function loadFile(forWrite = false): SectionContextFile {
   if (!existsSync(SECTION_CONTEXTS_FILE)) return emptyFile();
   try {
     const input: unknown = JSON.parse(readFileSync(SECTION_CONTEXTS_FILE, "utf8"));
     const candidate = sectionContextFileSchema.safeParse(input);
-    if (!candidate.success) return emptyFile();
+    if (!candidate.success) throw new Error("Invalid team instructions file");
     const contexts: Record<string, SectionContextRecord> = Object.create(null);
     // Read own entries after validating the envelope: record parsers can omit
     // labels such as __proto__, which are ordinary team names here. Validate
@@ -70,6 +70,7 @@ function loadFile(): SectionContextFile {
       ...(candidate.data.sections ?? []), ...Object.keys(contexts),
     ].map(sectionContextKey).filter(Boolean))], contexts };
   } catch {
+    if (forWrite) throw new Error("Saved teams and shared instructions could not be read; the existing file was left unchanged");
     return emptyFile();
   }
 }
@@ -85,7 +86,7 @@ export function readSections(): string[] {
 
 /** Remember legacy labels and newly created teams without changing membership. */
 export function ensureSections(names: (string | undefined)[]): boolean {
-  const data = loadFile();
+  const data = loadFile(true);
   const sections = [...new Set([...data.sections, ...names.map(sectionContextKey).filter(Boolean)])];
   if (sections.length === data.sections.length) return false;
   saveFile({ ...data, sections });
@@ -94,7 +95,7 @@ export function ensureSections(names: (string | undefined)[]): boolean {
 
 /** The caller checks that no bots or group chats still use this identity. */
 export function changeEmptySection(name: string, nextName: string | null): void {
-  const data = loadFile();
+  const data = loadFile(true);
   const index = data.sections.indexOf(name);
   if (index < 0) throw new Error("No such team");
   if (nextName !== null && nextName !== name && data.sections.includes(nextName)) {
@@ -120,7 +121,7 @@ export function writeSectionContext(section: string | null | undefined, text: st
   if (Buffer.byteLength(text, "utf8") > SECTION_CONTEXT_MAX_BYTES) {
     throw new Error(`section context is capped at ${SECTION_CONTEXT_MAX_BYTES} bytes`);
   }
-  const data = loadFile();
+  const data = loadFile(true);
   const key = sectionContextKey(section);
   if (key && !data.sections.includes(key)) data.sections.push(key);
   if (!text.trim()) {

@@ -1,4 +1,4 @@
-import { existsSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -58,6 +58,8 @@ describe("section context", () => {
 
     writeFileSync(SECTION_CONTEXTS_FILE, "not json");
     expect(readSectionContext("Work")).toBeNull();
+    expect(() => ensureSections(["New"])).toThrow("left unchanged");
+    expect(readFileSync(SECTION_CONTEXTS_FILE, "utf8")).toBe("not json");
   });
 
   it("retains empty teams and migrates legacy shared instructions", () => {
