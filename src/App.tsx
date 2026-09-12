@@ -38,7 +38,14 @@ function Shell() {
   const remoteClient = window.ogb?.remoteClient?.active === true;
   useEffect(() => {
     if (!window.ogb?.environments) return;
-    const open = () => dispatch({ type: "toggleAppSettings", open: true, section: "desktopWorkspaces" });
+    const open = (computerId?: string | null) => {
+      if (computerId) {
+        const target = new URL(window.location.href);
+        target.searchParams.set("share-computer", computerId);
+        window.history.replaceState(null, "", `${target.pathname}${target.search}${target.hash}`);
+      }
+      dispatch({ type: "toggleAppSettings", open: true, section: "desktopWorkspaces" });
+    };
     const url = new URL(window.location.href);
     if (url.searchParams.get("desktop-settings") === "workspaces") {
       url.searchParams.delete("desktop-settings");

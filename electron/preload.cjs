@@ -208,10 +208,16 @@ const bridge = {
     addFromLink: (link, name) => ipcRenderer.invoke("environments:add-from-link", link, name),
     forget: (id) => ipcRenderer.invoke("environments:forget", id),
     onOpenSettings: (cb) => {
-      const handler = () => cb();
+      const handler = (_event, computerId) => cb(computerId);
       ipcRenderer.on("workspaces:open-settings", handler);
       return () => ipcRenderer.removeListener("workspaces:open-settings", handler);
     },
+  },
+  computerSharing: {
+    state: id => ipcRenderer.invoke("sharing:state", id),
+    chooseFolder: () => ipcRenderer.invoke("sharing:folder"),
+    save: (id, grant) => ipcRenderer.invoke("sharing:save", id, grant),
+    revoke: id => ipcRenderer.invoke("sharing:revoke", id),
   },
 };
 

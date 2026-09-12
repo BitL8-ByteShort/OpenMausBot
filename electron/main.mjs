@@ -70,6 +70,7 @@ import capabilitiesModule from "./capabilities.cjs";
 import environmentsModule from "./environments.cjs";
 import localOriginModule from "./local-origin.cjs";
 import { buildApplicationMenu } from "./menu.mjs";
+import { createComputerSharing, validateSharedFolders } from "./computer-sharing.mjs";
 import { acquireDataDirLease } from "./data-dir-lease.mjs";
 
 const { desktopCapabilities, nativeDesktopActions } = capabilitiesModule;
@@ -1354,6 +1355,49 @@ ipcMain.on("desktop:unread-count", (event, value) => {
 // HttpOnly cookie /pair set for that origin, kept by Chromium's cookie jar.
 const { LOCAL_ID, activeEnvironment, allowedOrigins, parseEnvironments, parseHostedWorkspaceLink, serializeEnvironments, withActive, withEnvironment, withoutEnvironment, workspaceMenuTemplate, workspaceNavigationAllowed, workspaceSenderAllowed, workspaceSummary } = environmentsModule;
 let environmentsState = { environments: [], activeId: LOCAL_ID };
+let computerSharing;
+const sharingPrompts = new Set();
+
+function sharingController() {
+  computerSharing ??= createComputerSharing({
+    file: path.join(app.getPath("userData"), "computer-sharing.json"),
+    fetch: (...args) => session.defaultSession.fetch(...args),
+    environments: () => environmentsState.environments,
+    cuaConnection: () => cuaReady,
+    hostControl: async (id, signal) => {
+      const lease = async action => {
+        const response = await fetch(`http://127.0.0.1:${SERVER_PORT}/api/desktop/shared-computer-control`, {
+          method: "POST",
+          headers: desktopServerHeaders({ "content-type": "application/json" }, { packaged: app.isPackaged, token: desktopMutationToken }),
+          body: JSON.stringify({ id, action }),
+          signal: action === "release" ? AbortSignal.timeout(3000) : AbortSignal.any([signal, AbortSignal.timeout(3000)]),
+        });
+        if (!response.ok) throw new Error("This computer is in use locally or held by a person. Wait, then observe it again before acting.");
+      };
+      await lease("acquire");
+      return { renew: () => lease("acquire"), release: () => lease("release") };
+    },
+  });
+  return computerSharing;
+}
+
+async function offerComputerSharing(win) {
+  const env = activeEnvironment(environmentsState);
+  if (!env || sharingPrompts.has(env.id) || win.isDestroyed()) return;
+  sharingPrompts.add(env.id);
+  try {
+    const info = await sharingController().observe(env);
+    if (!info || win.isDestroyed() || activeEnvironment(environmentsState)?.id !== env.id || new URL(win.webContents.getURL()).origin !== env.origin) return;
+    const choice = await dialog.showMessageBox(win, {
+      type: "question", message: `Share this computer with ${env.name}?`,
+      detail: "Let this workspace’s bots use folders and capabilities you choose while this desktop app is running. Nothing is shared unless you enable it. You can change this later in Settings → Connected workspaces.",
+      buttons: ["Choose access", "Not now"], defaultId: 1, cancelId: 1,
+    });
+    sharingController().decline(env, info);
+    if (choice.response === 0) openWorkspaceSettings(env.id);
+  } catch { /* Not paired yet, an older server, or offline: no grant, no prompt. */ }
+  finally { sharingPrompts.delete(env.id); }
+}
 
 function environmentsFile() {
   return path.join(app.getPath("userData"), "environments.json");
@@ -1426,13 +1470,13 @@ function switchEnvironment(id) {
   navigateMainWindow(activeOrigin());
 }
 
-function openWorkspaceSettings() {
+function openWorkspaceSettings(computerId) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   if (senderIsLocal({ sender: mainWindow.webContents })) {
-    mainWindow.webContents.send("workspaces:open-settings");
+    mainWindow.webContents.send("workspaces:open-settings", typeof computerId === "string" ? computerId : null);
   } else {
     persistEnvironments(withActive(environmentsState, LOCAL_ID));
-    navigateMainWindow(`${rendererOrigin()}/?desktop-settings=workspaces`);
+    navigateMainWindow(`${rendererOrigin()}/?desktop-settings=workspaces${typeof computerId === "string" ? `&share-computer=${encodeURIComponent(computerId)}` : ""}`);
   }
 }
 
@@ -1482,6 +1526,7 @@ async function forgetEnvironment(id) {
     detail: "This app signs out of that server. The server keeps its own session list; revoke it there too if the device is gone.",
   });
   if (response !== 0) return;
+  sharingController().forget(env);
   const wasActive = environmentsState.activeId === id;
   persistEnvironments(withoutEnvironment(environmentsState, id));
   // Leave a removed workspace immediately; forgetting an inactive connection
@@ -1655,6 +1700,7 @@ function createWindow() {
     void workspaceMenuAction(() => switchEnvironment(LOCAL_ID));
   });
   win.webContents.on("did-finish-load", () => deliverPackageInstall(win));
+  win.webContents.on("did-finish-load", () => void offerComputerSharing(win));
 
   // Native context menu for text inputs — without this, right-click does
   // nothing in the Electron window (no Cut/Copy/Paste/Select All).
@@ -2082,6 +2128,35 @@ const workspaceOnly = (handler) => (event, ...args) => {
 };
 const localWorkspaceOnly = (channel, handler) => localOnly(channel, workspaceOnly(handler));
 
+const savedWorkspace = id => {
+  const env = environmentsState.environments.find(entry => entry.id === id);
+  if (!env) throw new Error("This workspace is no longer connected");
+  return env;
+};
+ipcMain.handle("sharing:state", localWorkspaceOnly("sharing:state", (_event, id) => sharingController().state(savedWorkspace(id).id)));
+ipcMain.handle("sharing:folder", localWorkspaceOnly("sharing:folder", async () => {
+  const picked = await dialog.showOpenDialog(mainWindow, { title: "Choose a folder to share", properties: ["openDirectory"] });
+  if (picked.canceled || !picked.filePaths[0]) return null;
+  return (await validateSharedFolders([{ id: randomUUID(), path: picked.filePaths[0], write: false }]))[0];
+}));
+ipcMain.handle("sharing:revoke", localWorkspaceOnly("sharing:revoke", (_event, id) => sharingController().revoke(savedWorkspace(id))));
+ipcMain.handle("sharing:save", localWorkspaceOnly("sharing:save", async (_event, id, input) => {
+  const env = savedWorkspace(id);
+  const info = await sharingController().identity(env);
+  const folders = await validateSharedFolders(input?.folders);
+  const detail = [
+    `Workspace: ${env.origin}`,
+    ...folders.map(folder => `${folder.write ? "Read and write" : "Read only"}: ${folder.path}`),
+    input?.terminal === true ? "Terminal: UNRESTRICTED commands as your user. Can access files outside the folders above, including credentials." : "Terminal: off",
+    input?.computer === true ? "Computer control: can view your screen and operate logged-in apps. Can access information outside the folders above." : "Computer control: off",
+    "Shared content is sent to this hosted workspace and may reach its model provider. Bots from this workspace can use these permissions until you revoke them. Closing the desktop stops access.",
+  ].join("\n\n");
+  const confirmation = await dialog.showMessageBox(mainWindow, { type: "warning", message: `Allow computer access for ${env.name}?`, detail, buttons: ["Allow access", "Cancel"], defaultId: 1, cancelId: 1 });
+  if (confirmation.response !== 0) return null;
+  savedWorkspace(id);
+  return sharingController().save(env, { folders, terminal: input?.terminal === true, computer: input?.computer === true }, info);
+}));
+
 ipcMain.handle("environments:state", localWorkspaceOnly("environments:state", (event) => ({
   localOrigin: rendererOrigin(),
   remote: !senderIsLocal(event),
@@ -2368,6 +2443,7 @@ app.whenReady().then(async () => {
     return appPermissionAllowed(permission, requesting, rendererOrigin(), details);
   });
   environmentsState = readEnvironments();
+  sharingController().start();
   createWindow();
   // Reconcile incomplete setup and resume interrupted sign-out only after the
   // local app is usable. This background network work never gates LAN pairing
@@ -2431,6 +2507,7 @@ process.once("SIGTERM", requestSignalQuit);
 
 app.on("before-quit", (e) => {
   desktopShutdownStarted = true;
+  computerSharing?.close();
   if (cuaCleanedUp) return;
   e.preventDefault();
   // Cancel a scheduled recovery before yielding, and stop the owned child

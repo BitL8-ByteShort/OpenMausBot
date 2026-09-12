@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Cloud, Laptop, Loader2, Trash2 } from "lucide-react";
 import { Card } from "./SettingsPrimitives";
+import { ComputerSharingSettings } from "./ComputerSharingSettings";
 
 type SavedWorkspaces = Awaited<ReturnType<NonNullable<NonNullable<Window["ogb"]>["environments"]>["state"]>>;
 
@@ -12,6 +13,7 @@ export function ConnectedWorkspacesSettings() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [computerId, setComputerId] = useState<string | null>(() => new URL(window.location.href).searchParams.get("share-computer"));
   const pending = useRef(false);
   const generation = useRef(0);
   useEffect(() => {
@@ -19,6 +21,16 @@ export function ConnectedWorkspacesSettings() {
     void bridge?.state().then((state) => { if (generation.current === current) setSaved(state); })
       .catch(() => { if (generation.current === current) setError("Could not load saved workspaces. Please reopen this page."); });
     return () => { generation.current++; };
+  }, [bridge]);
+  useEffect(() => {
+    const consume = (id?: string | null) => {
+      if (id) setComputerId(id);
+      const url = new URL(window.location.href);
+      url.searchParams.delete("share-computer");
+      window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+    };
+    consume();
+    return bridge?.onOpenSettings?.(consume);
   }, [bridge]);
   const perform = async (action: () => Promise<unknown>) => {
     if (pending.current || !bridge) return;
@@ -39,6 +51,7 @@ export function ConnectedWorkspacesSettings() {
     }
   };
   if (!bridge) return <p className="text-[13px] text-ink-secondary">Manage workspace connections in the desktop app.</p>;
+  const computerWorkspace = saved?.environments.find(entry => entry.id === computerId);
   return <>
     <p className="text-[13px] leading-relaxed text-ink-secondary">One desktop app, wherever your bots live. Switching workspaces does not move or replace your bots, conversations, or provider accounts.</p>
     <Card title="Your workspaces" subtitle="Saved on this computer. Your hosted bots keep running when you switch away.">
@@ -54,12 +67,14 @@ export function ConnectedWorkspacesSettings() {
               {active ? <span className="flex shrink-0 items-center gap-1 text-[12px] text-ink-secondary"><Check size={13} />Current</span> :
                 <button type="button" disabled={busy} aria-label={`Switch to ${entry.name}`} onClick={() => void perform(async () => { await bridge.switch(entry.id); return true; })}
                   className="rounded-md px-2 py-1.5 text-[12px] text-ink hover:bg-control disabled:opacity-50">Switch</button>}
+              {entry.id !== "local" && window.ogb?.computerSharing && <button type="button" disabled={busy} aria-label={`Computer access for ${entry.name}`} onClick={() => setComputerId(entry.id)} className="rounded-md px-2 py-1.5 text-[12px] text-ink hover:bg-control">Computer access</button>}
               {entry.id !== "local" && <button type="button" disabled={busy} aria-label={`Forget ${entry.name}`} title={`Forget ${entry.name}`}
                 onClick={() => void perform(() => bridge.forget(entry.id))} className="rounded-md p-1.5 text-ink-secondary hover:bg-control hover:text-danger disabled:opacity-50"><Trash2 size={14} /></button>}
             </li>;
           })}
         </ul>}
     </Card>
+    {computerWorkspace && <ComputerSharingSettings key={computerWorkspace.id} workspace={computerWorkspace} onClose={() => setComputerId(null)} />}
     <Card title="Connect hosted workspace" subtitle="Already running OpenMausBot on a VPS, server, or another computer? Connect it here.">
       <form className="flex flex-col gap-3" onSubmit={(event) => {
         event.preventDefault();
