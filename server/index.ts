@@ -982,6 +982,7 @@ function clearDirectTurnDispatch(threadId: string, claimId: string): void {
 function cancelDirectTurnDispatch(botId: string, expectedThreadId?: string): DirectTurnDispatchClaim | null {
   const threadId = expectedThreadId ?? store.bot(botId)?.threadId;
   if (!threadId) return null;
+  cancelTeamSetupResumesForThread(threadId);
   const claim = directTurnDispatchClaims.get(threadId);
   if (!claim || claim.botId !== botId) return null;
   directTurnDispatchClaims.delete(threadId);
@@ -2527,6 +2528,7 @@ function cancelGroupTurnOperations(
     detail: "Stopped by you.",
   },
 ) {
+  cancelTeamSetupResumesForThread(threadId);
   roomHandoffs.cancelRoom(groupId, threadId);
   for (const operation of groupTurnOperations.get(groupId) ?? []) {
     if (operation.threadId !== threadId) continue;
@@ -5968,7 +5970,13 @@ async function deleteBotWithLifecycle(botId: string, revalidate: () => void = ()
           // Invalidate every bot-callable bearer before the first asynchronous
           // teardown step. A request that already passed its initial header
           // check is revalidated after its body arrives and must fail closed.
-          for (const task of store.tasks(bot.id)) revokeInternalCapabilitiesForThread(task.threadId);
+          for (const entry of pendingTeamSetupResumes.values()) {
+            if (entry.request.botId === bot.id) cancelTeamSetupResumesForThread(entry.request.threadId);
+          }
+          for (const task of store.tasks(bot.id)) {
+            cancelTeamSetupResumesForThread(task.threadId);
+            revokeInternalCapabilitiesForThread(task.threadId);
+          }
           await interruptAllDirectThreads(bot.id);
           revalidate();
           // Deletion removes the thread before a late turn.completed can fold
@@ -5981,9 +5989,6 @@ async function deleteBotWithLifecycle(botId: string, revalidate: () => void = ()
           }
           stopScreenPoller(bot.id);
           activeVpsThreads.delete(bot.id);
-          routines!.disableForBot(bot.id);
-          webhooks.disableForBot(bot.id);
-          calendarCalls!.removeBot(bot.id);
           lastReply.delete(bot.threadId);
           // a peer approval naming this bot can never be meaningfully answered
           // now, and its caller would otherwise wait out the 15-minute timeout
@@ -5995,10 +6000,21 @@ async function deleteBotWithLifecycle(botId: string, revalidate: () => void = ()
           localVmIdles.get(target.key)?.cancel();
           localVmIdles.delete(target.key);
           store.deleteBot(bot.id, setupRequest);
+          // Removing schedules is not a security revocation. Keep them intact
+          // if the bot/receipt write fails, so a failed deletion is retryable.
+          routines!.disableForBot(bot.id);
+          webhooks.disableForBot(bot.id);
+          calendarCalls!.removeBot(bot.id);
           browserLive.closeForBot(bot.id);
           await forgetTemporaryBrowser(bot.id);
         } catch (error) {
-          if (browserCleanupRequest) browserCleanup.abort(browserCleanupRequest);
+          if (browserCleanupRequest) {
+            // Store removal is already durable once the in-memory owner is
+            // gone. A later cleanup error must retain its browser erasure
+            // intent for retry instead of aborting a completed deletion.
+            if (store.bot(bot.id)) browserCleanup.abort(browserCleanupRequest);
+            else browserCleanup.commit(browserCleanupRequest);
+          }
           throw error;
         }
         if (browserCleanupRequest) {
@@ -6055,9 +6071,22 @@ const teamSetupRequests = new TeamSetupRequestService({
   },
 });
 
-const pendingTeamSetupResumes = new Map<string, { request: TeamSetupRequest; messageId: string }>();
-function dispatchTeamSetupResume(entry: { request: TeamSetupRequest; messageId: string }): void {
+type TeamSetupResumeEntry = { request: TeamSetupRequest; messageId: string; generation: number };
+const pendingTeamSetupResumes = new Map<string, TeamSetupResumeEntry>();
+const teamSetupResumeGenerations = new Map<string, number>();
+function cancelTeamSetupResumesForThread(threadId: string): void {
+  // Invalidate before provider teardown can synchronously drain the queue.
+  // The generation also prevents an in-flight dispatch failure requeueing
+  // its old entry after Stop or deletion has already cancelled it.
+  teamSetupResumeGenerations.set(threadId, (teamSetupResumeGenerations.get(threadId) ?? 0) + 1);
+  for (const [key, entry] of pendingTeamSetupResumes) {
+    if (entry.request.threadId === threadId) pendingTeamSetupResumes.delete(key);
+  }
+}
+function dispatchTeamSetupResume(entry: TeamSetupResumeEntry): void {
   const { request, messageId } = entry;
+  const cancelled = () => entry.generation !== (teamSetupResumeGenerations.get(request.threadId) ?? 0);
+  if (cancelled()) return;
   const owner = connectorThread(request.botId, request.threadId);
   const message = store.messagesFor(request.threadId).find((item) => item.id === messageId);
   if (!owner || !message?.card?.teamSetupRequest?.result) return;
@@ -6067,6 +6096,7 @@ function dispatchTeamSetupResume(entry: { request: TeamSetupRequest; messageId: 
   }
   const prompt = `OpenMausBot team setup decision ${request.requestId}: ${JSON.stringify(request.result)}. Report this exact result and continue the user's already requested work. Do not ask for confirmation again or repeat this setup/deletion. A denied or cancelled operation did not authorize any substitute action. Existing thread models were not changed.`;
   const failed = (error: string) => {
+    if (cancelled()) return;
     const current = store.messagesFor(request.threadId).find((item) => item.id === messageId);
     if (current?.card) store.patchMessage(request.threadId, messageId, { card: { ...current.card, held: `The decision was recorded, but the Chief could not continue: ${redactSecretsInText(error).slice(0, 300)}` } });
   };
@@ -6075,7 +6105,7 @@ function dispatchTeamSetupResume(entry: { request: TeamSetupRequest; messageId: 
     const operation = beginGroupTurnOperation(groupId, request.threadId, [request.botId]);
     const previous = groupQueues.get(groupId) ?? Promise.resolve();
     const next = previous.then(async () => {
-      if (operation.cancelled) return;
+      if (operation.cancelled || cancelled()) return;
       const current = connectorThread(request.botId, request.threadId);
       if (!current?.group) return;
       if (current.bot.busy) { pendingTeamSetupResumes.set(request.requestId, entry); return; }
@@ -6086,6 +6116,7 @@ function dispatchTeamSetupResume(entry: { request: TeamSetupRequest; messageId: 
     return;
   }
   void startTurn(request.botId, prompt, { threadId: request.threadId, cardContinuation: true, onDispatchError: failed }).catch((error) => {
+    if (cancelled()) return;
     if (isTurnAdmissionBlocked(error)) pendingTeamSetupResumes.set(request.requestId, entry);
     else failed(error instanceof Error ? error.message : String(error));
   });
@@ -6102,6 +6133,7 @@ async function resolveAndSendTeamSetup(res: ServerResponse, args: { botId: strin
   const card = store.messagesFor(args.threadId).find((item) => item.card?.requestId === args.requestId && item.card.teamSetupRequest)?.card;
   if (!card) return false;
   if (args.behavior === "allow" && !ownerReview) { json(res, 403, { error: "Approve team setup or deletion from the desktop app or a paired owner device. In a local browser, wait until every bot is idle." }); return true; }
+  const resumeGeneration = teamSetupResumeGenerations.get(args.threadId) ?? 0;
   const resolved = await teamSetupRequests.resolve(args);
   if (!resolved) return false;
   if (!resolved.duplicate) {
@@ -6111,7 +6143,7 @@ async function resolveAndSendTeamSetup(res: ServerResponse, args: { botId: strin
   const current = store.messagesFor(args.threadId).find((item) => item.id === resolved.messageId);
   if (current?.card?.teamSetupRequest?.result && !current.card.teamSetupRequest.resumed) {
     store.patchMessage(args.threadId, current.id, { card: { ...current.card, teamSetupRequest: { ...current.card.teamSetupRequest, resumed: true } } });
-    dispatchTeamSetupResume({ request: resolved.request, messageId: resolved.messageId });
+    dispatchTeamSetupResume({ request: resolved.request, messageId: resolved.messageId, generation: resumeGeneration });
   }
   json(res, 200, { ok: true, outcome: resolved.result.state === "applied" ? "allowed-once" : "rejected", result: resolved.result, alreadySettled: resolved.duplicate });
   return true;
@@ -11869,6 +11901,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!store.groupTaskByThread(group.id, m[2])) return json(res, 404, { error: "no such channel task" });
       const stagedSkillCleanups = stagedSkillCleanupsForThread(m[2]);
       lastReply.delete(m[2]);
+      cancelTeamSetupResumesForThread(m[2]);
       const updated = store.deleteGroupTask(group.id, m[2]);
       if (!updated) return json(res, 400, { error: "a channel keeps at least one task" });
       rejectDeletedThreadSkillStages(stagedSkillCleanups);
@@ -11906,7 +11939,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const threadIds = new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]);
       const stagedSkillCleanups = [...threadIds].flatMap(stagedSkillCleanupsForThread);
-      for (const threadId of threadIds) lastReply.delete(threadId);
+      for (const threadId of threadIds) {
+        cancelTeamSetupResumesForThread(threadId);
+        lastReply.delete(threadId);
+      }
       routines!.disableForGroup(group.id);
       store.deleteGroup(group.id);
       rejectDeletedThreadSkillStages(stagedSkillCleanups);
@@ -13802,6 +13838,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 409, { error: "this task is running — stop it first" });
       }
       const stagedSkillCleanups = stagedSkillCleanupsForThread(m[2]);
+      cancelTeamSetupResumesForThread(m[2]);
       const updated = store.deleteTask(m[1], m[2]);
       if (!updated) return json(res, 404, { error: "no such task" });
       settleDirectFollowup(directTurnGenerationByThread.get(m[2]));

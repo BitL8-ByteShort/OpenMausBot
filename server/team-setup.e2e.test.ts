@@ -55,6 +55,20 @@ it("Clive reviews multi-provider teams once, continues after each decision, and 
       const dump = JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")); previousPid = dump.pid;
       evidence.push({ continuation: { requestId, prompt: dump.prompt, provider: "fixture claude", exactlyOneReply: true } });
     };
+    const stopWithoutResume = async (requestId: string, threadId: string, target: "--bot" | "--channel", id: string) => {
+      const stoppedPid = previousPid;
+      await control("interrupt", target, id, "--task", threadId);
+      writeFileSync(gate, "finish");
+      await control("wait", target, id, "--task", threadId, "--timeout", "15");
+      // Allow an erroneously queued provider handshake/reply to become visible.
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      await api("POST", `/api/threads/${threadId}/respond`, { requestId, behavior: "deny" });
+      const messages = (await api("GET", `/api/threads/${threadId}/messages`)).messages;
+      expect(messages.some((message: any) => message.text?.includes(`team setup decision ${requestId}:`))).toBe(false);
+      expect(JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")).pid).toBe(stoppedPid);
+      expect((await state()).find((bot: any) => bot.id === chief.id).busy).toBe(false);
+      evidence.push({ cancellation: { requestId, threadId, noNewProviderGeneration: true, noContinuationReply: true } });
+    };
     const build = (name: string, team: string, modelSelection: unknown) => ({ action: "create", key: name, fields: {
       name, title: `${team} specialist`, soul: `Own ${team.toLowerCase()} work. Return evidence and state uncertainty.`, section: team, modelSelection,
     } });
@@ -62,7 +76,11 @@ it("Clive reviews multi-provider teams once, continues after each decision, and 
       build("Mira", "Research", selection(claude)), build("Patch", "Engineering", selection(codex)), build("Quill", "Growth", selection(claude)),
       { action: "create", key: "Patch", fields: { title: "Implementation and verification engineer" } },
     ] };
-    let token = await start("Clive, set up Research, Engineering and Growth specialists with suitable engines and models.");
+    let token = await start("Clive, review this setup while you are working.");
+    const stopped = await api("POST", "/api/internal/team-setup-requests", { plan }, 201, token);
+    await api("POST", `/api/threads/${chief.threadId}/respond`, { requestId: stopped.requestId, behavior: "deny" });
+    await stopWithoutResume(stopped.requestId, chief.threadId, "--bot", chief.id);
+    token = await start("Clive, set up Research, Engineering and Growth specialists with suitable engines and models.");
     const tools = await api("GET", "/api/internal/team-setup-catalog", undefined, 200, token);
     expect(tools.instances.map((item: any) => item.instanceId)).toEqual(expect.arrayContaining(["claude", "codex"]));
     await api("POST", "/api/internal/team-setup-requests", { plan: { ...plan, operations: [build("Bad", "Research", { instanceId: "codex", model: "invented-model" })] } }, 400, token);
@@ -124,6 +142,17 @@ it("Clive reviews multi-provider teams once, continues after each decision, and 
     await continueOnce(deletion.requestId);
     expect((await state()).some((bot: any) => bot.id === engineer.id)).toBe(false);
     await api("POST", `/api/threads/${chief.threadId}/respond`, { requestId: deletion.requestId, behavior: "allow" });
+    const room = (await control("new-channel", "--name", "Chief review", "--members", chief.id)).channel;
+    unlinkSync(gate);
+    await control("send-channel", "--channel", room.id, "--task", room.activeTaskId, "--text", "@Clive Review another setup, then wait.");
+    await expect.poll(() => JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")).pid, { timeout: 15_000 }).not.toBe(previousPid);
+    const groupDump = JSON.parse(readFileSync(fixture.fixtureDumpPath, "utf8")); previousPid = groupDump.pid;
+    const groupStopped = await api("POST", "/api/internal/team-setup-requests", { plan: { reason: "Check room Stop", operations: [
+      build("NoRestart", "Operations", selection(claude)),
+    ] } }, 201, groupDump.mcpConfig.mcpServers.agents.env.OMB_COMMS_TOKEN);
+    await api("POST", `/api/threads/${room.activeTaskId}/respond`, { requestId: groupStopped.requestId, behavior: "deny" });
+    await stopWithoutResume(groupStopped.requestId, room.activeTaskId, "--channel", room.id);
+    expect((await state()).some((bot: any) => bot.name === "NoRestart")).toBe(false);
     await control("messages", "--bot", chief.id, "--task", chief.threadId, "--limit", "30");
     await control("wait", "--bot", chief.id, "--task", chief.threadId, "--timeout", "15");
     expect(readFileSync(fixture.info.logPath, "utf8")).not.toMatch(/ReferenceError|change listener threw/);

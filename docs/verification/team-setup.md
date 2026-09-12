@@ -6,6 +6,7 @@ repository's fake Claude and fake Codex engines:
 
 ```sh
 pnpm exec vitest run server/team-setup.e2e.test.ts
+pnpm exec vitest run server/bot-deletion-write-failure.e2e.test.ts
 pnpm exec vitest run server/team-setup-requests.test.ts server/store.test.ts
 pnpm exec vitest run server/index.test.ts -t 'delet|Full and Custom bots'
 pnpm typecheck
@@ -61,7 +62,10 @@ generated project files remain. The Chief cannot delete itself.
 The deterministic scenario checks unknown models, spoofed caller identity,
 coalescing, denial, approval, duplicate decisions, scope grants, default-model
 changes, team moves, stale target edits, separate deletion and exactly one
-requester continuation per decision. It also verifies that forged Origin
+requester continuation per decision, unless the user stops the conversation.
+For both direct tasks and rooms it denies while Clive is still running, then
+presses Stop and checks that neither a fresh provider generation nor a reply
+appears, including after a duplicate decision. It also verifies that forged Origin
 headers from an active loopback bot cannot approve setup or deletion. A
 trusted desktop or paired owner can review; headless local-browser approval
 waits until every bot is idle. Denial is always safe to accept.
@@ -77,6 +81,11 @@ All bot changes, new-team grants and the result receipt use one atomic
 is saved first: if the bot write subsequently fails, an empty named team can
 remain, but no bot, model, membership or Chief-access changes are applied.
 Deletion similarly saves removal and its receipt before deleting bot data.
+The deletion write-failure fixture obstructs the exact temporary `bots.json`
+destination, exercises the real DELETE lifecycle, and checks that the complete
+bot, conversations, routines, webhooks and solo/shared calendar calls are
+unchanged in memory and on disk. It restores that fixture file and retries
+successfully; unrelated call guests remain. No production fault hook is used.
 Later cleanup failure is reported distinctly from a failed/unapplied setup.
 
 ## Recorded app and real-model checks — 2026-09-13
