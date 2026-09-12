@@ -360,14 +360,14 @@ const ROUTINE_FIELDS_SCHEMA = {
 const TOOLS = [
   {
     name: "list_room_targets",
-    description: "Discover actual OpenMausBot teammates in this room and other rooms within your allowed section. Returns exact bot and room IDs, their roles, and working folders, not other rooms' history. Use these bots, not native coding helpers with similar names, when the user asks their team to work together.",
+    description: "Discover actual OpenMausBot teammates and rooms in your allowed teams. Works in a normal bot conversation too; no room is required. Returns bot and room IDs, roles and working folders, never other conversations' history. Use these bots, not native coding helpers with similar names, when the user asks their team to work together.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "coordinate_bots",
-    description: "Ask existing OpenMausBot teammates for advice or assign concrete work. Defaults to the current room; use group_id from list_room_targets for another room. Name 1-4 bot_ids: they receive this brief, use their own model and permissions, and reply in that room. Busy bots wait until available. Results return here and resume you automatically. Include exact file paths, constraints and what must be verified. No discussion is required before assigning. After sending all assignments, END your turn; do not poll or wait. On return, resolve tradeoffs, check the requested outcome and request concrete corrections if necessary before giving the user your final answer. Do not send acknowledgements as new work.",
+    description: "Ask existing OpenMausBot teammates for advice or assign concrete work. From normal chat each assignment gets a separate recipient conversation; from a room it defaults to this room. Use group_id from list_room_targets for a specific room. Name 1-4 bot_ids: they receive only your brief and use their own model, tools and permissions. Busy bots queue. They can consult their specialists; all results return here and resume you automatically. Include exact file paths, constraints and what must be verified. After sending all assignments, END your turn; do not poll or wait. On return, resolve tradeoffs, verify the requested outcome and request concrete corrections if necessary before giving one final answer. Do not send acknowledgements as new work.",
     inputSchema: { type: "object", additionalProperties: false, properties: {
-      group_id: { type: "string", description: "Optional destination room; omit for this room." },
+      group_id: { type: "string", description: "Optional destination room. Omit for this room, or separate recipient tasks when chatting directly." },
       bot_ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 4, uniqueItems: true },
       message: { type: "string", minLength: 1, maxLength: 4000, description: "Self-contained question or task for these teammates. Send separate requests when responsibilities differ." },
       request_key: { type: "string", description: "A short unique assignment key. Reuse for an identical retry." },
@@ -377,13 +377,13 @@ const TOOLS = [
   {
     name: "list_bots",
     description:
-      "List the other bots (agents) you may contact in your own team and any additional teams the owner has explicitly allowed you to coordinate, with their team, model and current status. Call this before delegate_bot or ask_bot to discover who's available. Use delegate_bot for assignments; use ask_bot only for a short consultation needed inline.",
+      "List the other bots (agents) you may contact in your own team and any additional teams the owner has explicitly allowed you to coordinate, with their team, model and current status. Call this to discover exact teammate IDs before assigning work or requesting advice through your available coordination tools.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "list_rooms",
     description:
-      "List the shared rooms (team channels) you belong to, with the other members of each. Call this before post_to_room — it is the only place room ids come from. One-to-one bot channels are never listed (reach a single bot with ask_bot or delegate_bot). A room you are in but cannot post into — one containing someone outside your section — is named without an id, together with the reason, so you can tell the user why.",
+      "List the shared rooms (team channels) you belong to, with the other members of each. Call this before post_to_room. One-to-one bot channels are never listed; discover individual teammates with list_bots. A room you are in but cannot post into is named without an id, together with the reason, so you can tell the user why.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
@@ -796,10 +796,12 @@ const AUTHORING_TOOLS = SKILL_AUTHORING_ENABLED
   ? TOOLS
   : TOOLS.filter((tool) => !SKILL_TOOL_NAMES.has(tool.name));
 // One teamwork path in room turns; keep all unrelated integrations available.
-// Direct chats retain their existing peer/thread tools.
+// Ordinary direct chats use this same bounded coordinator. Goal-owned turns
+// retain their independent loop and cannot start a second coordinator.
 const ROOM_ONLY_TOOLS = new Set(["list_room_targets", "coordinate_bots"]);
 const ROOM_REPLACED_TOOLS = new Set(["ask_bot", "delegate_bot", "check_delegation", "wait_delegation", "start_thread", "send_to_thread", "wait_thread"]);
-const AVAILABLE_TOOLS = process.env.OMB_ROOM_TURN === "1"
+const COORDINATING = process.env.OMB_ROOM_TURN === "1";
+const AVAILABLE_TOOLS = COORDINATING
   ? AUTHORING_TOOLS.filter(tool => !ROOM_REPLACED_TOOLS.has(tool.name))
   : AUTHORING_TOOLS.filter(tool => !ROOM_ONLY_TOOLS.has(tool.name));
 
@@ -936,7 +938,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${team}${state ? `, ${state}` : ""}]`;
     });
     return {
-      text: `Reachable teammates:\n${lines.join("\n")}\n\nAssign work with delegate_bot. Use ask_bot only for a short answer you need inline.`,
+      text: `Reachable teammates:\n${lines.join("\n")}\n\n${COORDINATING ? "Use coordinate_bots for advice or concrete work, then end your turn. Busy teammates queue and results resume you automatically." : "Assign work with delegate_bot. Use ask_bot only for a short answer you need inline."}`,
     };
   }
   if (name === "list_rooms") {
@@ -1194,7 +1196,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     });
     createdThisTurn += 1;
     return {
-      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with delegate_bot.`,
+      text: `Created @${r.name ?? botName} in ${r.section ?? "General"} [id: ${r.id}]. Assign work with ${COORDINATING ? "coordinate_bots" : "delegate_bot"}.`,
     };
   }
   if (name === "create_room") {
