@@ -53,6 +53,7 @@ describe("reviewed Chief team setup", () => {
       { action: "update", botId: h.peer.id, fields: { soul: "Verify sources.", modelSelection: { instanceId: "codex", model: "gpt-fixture" } } },
     ]);
     expect(h.messages).toHaveLength(1);
+    expect(request.title).toBe("Apply setup for 1 bot?");
     expect(h.messages[0].card?.teamSetupRequest?.operations).toHaveLength(1);
     expect(request.detail).toContain("Every existing thread keeps its current model and permissions");
     expect(h.peer.title).toBe("");
