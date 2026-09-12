@@ -108,6 +108,16 @@ correctness or permission to bypass approvals.
 
 ## Live-model evidence — 2026-09-13
 
+The final main-based integration, including exact-turn correlation and Claude
+retry compatibility, repeated the nested trial with real Sol. Clive → Patch →
+Nora → Patch → Clive completed in approximately three minutes; all three durable
+nodes were completed and reported. Nora actually executed the tests. The exact
+CSV output, a rerun of the generated test, and two independent held-out cases
+all passed. The actual renderer also passed receipt navigation and Chief grant
+checks. Evidence (fixture and temporary auth copy removed):
+`/tmp/omb-live-team-0913.MwRY2k/nested-gpt-5.6-sol-1789255210986/result.json`
+and `independent-checks.json` beside it.
+
 Two isolated `gpt-5.6-sol` trials used temporary work folders and real tools:
 
 - Delivery: Clive consulted Mira, assigned Patch, requested Nora's independent
