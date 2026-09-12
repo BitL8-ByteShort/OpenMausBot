@@ -13,7 +13,10 @@ organisation. Hosting it for third parties or white-labelling the product needs
 a partner agreement.
 
 Delete the folder and what remains is the open-source edition: the server
-reports `{"edition":"oss"}` and nothing else changes. CI proves this on every
+reports `{"edition":"oss"}` and ordinary standalone operation is unchanged.
+A workspace explicitly configured for hosted sign-in refuses remote access
+without that optional adapter; removing the enterprise layer must not bypass
+its configured sign-in authority. CI proves the standalone boundary on every
 change (`open-source edition builds without enterprise/` in `ci.yml`). The list
 of entitlement ids the server understands is in [`enterprise/FEATURES`](enterprise/FEATURES).
 

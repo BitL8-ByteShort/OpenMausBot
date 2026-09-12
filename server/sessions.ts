@@ -75,6 +75,8 @@ const sessionSchema = z.object({
   /** Set when the session came from an account sign-in rather than a code. */
   userId: z.string().max(256).optional(),
   email: z.string().max(320).optional(),
+  /** Set only by the internal verified-portal issuance path, never by email or pairing input. */
+  membershipAuthority: z.literal("portal").optional(),
 });
 
 const fileSchema = z.object({ version: z.literal(1), sessions: z.array(sessionSchema) });
@@ -172,11 +174,16 @@ export class SessionRegistry {
   private readonly onRevoked = new Set<(sessionId: string) => void>();
   private lastSeenWrites = new Map<string, number>();
   private readonly now: () => number;
-  private readonly options: { file: string; now?: () => number };
+  private readonly options: {
+    file: string;
+    now?: () => number;
+    emailScopes?: (email: string) => readonly Scope[] | null;
+    portalMembership?: boolean;
+  };
 
   // No parameter properties: the server runs this file under Node's
   // strip-only TypeScript mode, which only erases types.
-  constructor(options: { file: string; now?: () => number }) {
+  constructor(options: { file: string; now?: () => number; emailScopes?: (email: string) => readonly Scope[] | null; portalMembership?: boolean }) {
     this.options = options;
     this.now = options.now ?? Date.now;
     this.load();
@@ -205,6 +212,7 @@ export class SessionRegistry {
   }
 
   private prune(): void {
+    this.revalidateEmailSessions();
     const now = this.now();
     this.pairings = this.pairings.filter((p) => p.expiresAt > now);
     this.replays = this.replays.filter((r) => r.expiresAt > now);
@@ -340,6 +348,17 @@ export class SessionRegistry {
   /** A session from a verified account sign-in (server/account-signin.ts)
    * rather than a pairing code: same token, same term, same gates. */
   issue(input: { label: string; scopes: Scope[]; userId?: string; email?: string }): { token: string; session: PublicSession } {
+    return this.issueAccount(input);
+  }
+
+  /** Internal hosted-bridge seam: call only after consuming a verified,
+   * workspace-bound PKCE grant. No HTTP route accepts this marker as input. */
+  issuePortal(input: { email: string; grant: string; scopes: Scope[] }): { token: string; session: PublicSession } {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(input.grant) || !input.email) throw new Error("A verified portal identity is required");
+    return this.issueAccount({ label: "Hosted workspace", email: input.email, userId: `portal:${input.grant}`, scopes: input.scopes }, "portal");
+  }
+
+  private issueAccount(input: { label: string; scopes: Scope[]; userId?: string; email?: string }, membershipAuthority?: "portal"): { token: string; session: PublicSession } {
     this.prune();
     const now = this.now();
     const token = `omb_sess_${randomBytes(32).toString("base64url")}`;
@@ -354,6 +373,7 @@ export class SessionRegistry {
     };
     if (input.userId) record.userId = input.userId;
     if (input.email) record.email = input.email;
+    if (membershipAuthority) record.membershipAuthority = membershipAuthority;
     this.sessions.push(record);
     this.lastSeenWrites.set(record.id, now);
     this.persist();
@@ -376,8 +396,37 @@ export class SessionRegistry {
 
   // ── sessions ───────────────────────────────────────────────────────────
 
+  /** Email membership is live, not a thirty-day grant. Losing any issued
+   * scope revokes the token and its streams; signing in again obtains the
+   * new role. Promotions never widen existing credentials. Pairing sessions
+   * have no email and remain independent of the hosted sign-in list. */
+  revalidateEmailSessions(): void {
+    const revoked = this.sessions.filter((session) => {
+      if (session.email === undefined) return false;
+      if (this.options.portalMembership && session.membershipAuthority === "portal") return false;
+      try {
+        const allowed = this.options.emailScopes?.(session.email);
+        return !allowed || session.scopes.some((scope) => !allowed.includes(scope));
+      } catch {
+        return true; // missing or unreadable membership must fail closed
+      }
+    });
+    if (!revoked.length) return;
+    const ids = new Set(revoked.map((session) => session.id));
+    this.sessions = this.sessions.filter((session) => !ids.has(session.id));
+    for (const session of revoked) this.forget(session.id);
+    try {
+      this.persist();
+    } catch (error) {
+      // Keep revocation effective in memory (and streams closed) even when
+      // storage is unavailable. Reloaded tokens face the same membership check.
+      console.error("Could not persist email session revocation:", error);
+    }
+  }
+
   authenticate(token: string | undefined): SessionRecord | null {
     if (!token) return null;
+    this.revalidateEmailSessions();
     const hash = sha256(token);
     const now = this.now();
     const record = this.sessions.find((s) => sameDigest(s.tokenHash, hash));
@@ -398,6 +447,7 @@ export class SessionRegistry {
    * Nothing expired is revived. Writes at most once per half-term, so it
    * adds nothing to the last-seen traffic. Returns whether it renewed. */
   renew(sessionId: string): boolean {
+    this.revalidateEmailSessions();
     const record = this.sessions.find((s) => s.id === sessionId);
     const now = this.now();
     if (!record || record.expiresAt <= now) return false;
