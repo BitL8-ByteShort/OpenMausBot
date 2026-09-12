@@ -11684,6 +11684,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const takenNames = new Set(store.bots.map((bot) => bot.name.trim().toLowerCase()));
       const memberIds = new Map<string, string>();
       let group: GroupRecord | undefined;
+      let importSection: string | undefined;
       try {
         const selection = await defaultSelection();
         const existingSections = new Set(
@@ -11694,7 +11695,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // Every template gets its own section, including legacy teams and
         // project imports. Never merge into an existing section (or replace
         // its Chief). Keep the name editable through the 60-character API.
-        const importSection = takeImportName(importName, existingSections, 60);
+        importSection = takeImportName(importName, existingSections, 60);
         const playbookByKey = new Map((pkg?.playbooks ?? []).map((playbook) => [playbook.key, playbook]));
         const packageSkillByName = new Map((pkg?.skills?.entries ?? []).map((skill) => [skill.name, skill]));
         for (const source of sourceMembers) {
@@ -11812,6 +11813,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         for (const routineId of createdRoutineIds) routines!.remove(routineId);
         for (const created of createdGroups) store.deleteGroup(created.id);
         for (const bot of importedBots) store.deleteBot(bot.id);
+        // Empty teams are now durable too. This import allocated a fresh
+        // identity, so its failed installation must retire that identity.
+        if (importSection && store.sections.includes(importSection)) store.changeEmptySection(importSection, null);
         throw error;
       }
     }

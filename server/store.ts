@@ -838,6 +838,8 @@ export class Store {
   private threads = new Map<string, ThreadState>();
   private defaultSelection: () => ModelSelection;
   private listeners = new Set<(change: StoreChange) => void>();
+  /** A broken team registry must not prevent loading independent chat data. */
+  private registeringInitialSections = true;
   /** Room turns and old callers have their own activity slot. Clearing
    * that slot must not clear a concurrently running independent task. */
   private legacyActivities = new Map<string, BotActivity>();
@@ -1082,6 +1084,7 @@ export class Store {
       const legacyFile = messagesFile(threadId);
       if (existsSync(legacyFile)) mdb.readThread(threadId, legacyFile);
     }
+    this.registeringInitialSections = false;
   }
 
   private saveBots(bots: BotRecord[] = this.bots) {
@@ -1100,7 +1103,12 @@ export class Store {
   get sections(): string[] { return readSections(); }
 
   private rememberSections(names: (string | undefined)[]) {
-    if (ensureSections(names)) this.emit({ type: "sections" });
+    try {
+      if (ensureSections(names)) this.emit({ type: "sections" });
+    } catch (error) {
+      if (!this.registeringInitialSections) throw error;
+      console.warn(`[teams] Startup could not register team names; saved teams and shared instructions were left unchanged: ${(error as Error).message}`);
+    }
   }
 
   /** Empty-only changes cannot merge teams or silently change anybody's access. */
@@ -1167,6 +1175,7 @@ export class Store {
       completed?: boolean;
     },
   ): GroupRecord {
+    this.rememberSections([section]);
     const threadId = newId();
     const createdAt = Date.now();
     const group: GroupRecord = {
@@ -1205,6 +1214,9 @@ export class Store {
   patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
+    if (Object.prototype.hasOwnProperty.call(patch, "section")) {
+      this.rememberSections([patch.section]);
+    }
     Object.assign(group, patch);
     if (!group.dm && Object.prototype.hasOwnProperty.call(patch, "pinnedMessageId")) {
       const active = this.activeGroupTask(group.id);
@@ -1641,6 +1653,7 @@ export class Store {
       seedMessages?: boolean;
     } = {},
   ): BotRecord {
+    this.rememberSections([profile.section]);
     const name = profile.name?.trim() || pickBotName(this.bots.map((b) => b.name));
     const section = sectionKey(profile.section);
     const bot: BotRecord = {

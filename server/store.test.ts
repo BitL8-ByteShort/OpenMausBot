@@ -15,6 +15,7 @@ import { peerAllowKey } from "./peer-approval-key.ts";
 import { canAccessTeam } from "./peer-roster.ts";
 import { Store, type BotRecord } from "./store.ts";
 import type { TeamSetupRequest } from "../shared/team-setup.ts";
+import { SECTION_CONTEXTS_FILE } from "./section-context.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-sonnet-5" });
 
@@ -62,6 +63,49 @@ describe("Store", () => {
       text: `Hi, I'm ${bot.name}. What would you like me to do?`,
     });
     expect(bot.modelSelection).toEqual(selection());
+  });
+
+  it("restarts with legacy bot and group migrations despite an unreadable team registry, without permitting later team writes", () => {
+    const original = new Store(selection);
+    const bot = original.createBot({ name: "Legacy bot", section: "Research" });
+    const group = original.createGroup("Legacy group", [bot.id], false, "Engineering");
+    original.appendMessage(group.threadId, { role: "user", kind: "text", text: "Keep the group conversation" });
+    const botMessages = original.messagesFor(bot.threadId);
+    const groupMessages = original.messagesFor(group.threadId);
+    const bots = JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"));
+    const groups = JSON.parse(readFileSync(join(DATA_DIR, "groups.json"), "utf8"));
+    delete bots[0].tasks; delete bots[0].soulHash;
+    delete groups[0].tasks; delete groups[0].defaultResponder;
+    writeFileSync(join(DATA_DIR, "bots.json"), JSON.stringify(bots));
+    writeFileSync(join(DATA_DIR, "groups.json"), JSON.stringify(groups));
+    const malformed = '{"version":1,"contexts":';
+    writeFileSync(SECTION_CONTEXTS_FILE, malformed);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const restored = new Store(selection);
+      expect(restored.bot(bot.id)?.tasks?.[0].threadId).toBe(bot.threadId);
+      expect(restored.group(group.id)?.tasks?.[0].threadId).toBe(group.threadId);
+      expect(restored.group(group.id)?.defaultResponder).toEqual({ kind: "member", botId: bot.id });
+      expect(restored.messagesFor(bot.threadId)).toEqual(botMessages);
+      expect(restored.messagesFor(group.threadId)).toEqual(groupMessages);
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "bots.json"), "utf8"))[0].tasks).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "groups.json"), "utf8"))[0].tasks).toHaveLength(1);
+      expect(warning.mock.calls.some(([message]) => String(message).includes("[teams] Startup could not register"))).toBe(true);
+      const beforeBots = structuredClone(restored.bots);
+      const beforeGroups = structuredClone(restored.groups);
+      const beforeBotsFile = readFileSync(join(DATA_DIR, "bots.json"), "utf8");
+      const beforeGroupsFile = readFileSync(join(DATA_DIR, "groups.json"), "utf8");
+      expect(() => restored.setBotsSection([bot.id], "Do not create")).toThrow(/left unchanged/);
+      expect(() => restored.createBot({ name: "Must not appear", section: "Do not create" })).toThrow(/left unchanged/);
+      expect(() => restored.createGroup("Must not appear", [bot.id], false, "Do not create")).toThrow(/left unchanged/);
+      expect(() => restored.patchGroup(group.id, { name: "Must not rename", section: "Do not create" })).toThrow(/left unchanged/);
+      expect(restored.bots).toEqual(beforeBots);
+      expect(restored.groups).toEqual(beforeGroups);
+      expect(readFileSync(join(DATA_DIR, "bots.json"), "utf8")).toBe(beforeBotsFile);
+      expect(readFileSync(join(DATA_DIR, "groups.json"), "utf8")).toBe(beforeGroupsFile);
+      expect(new Store(selection).messagesFor(group.threadId)).toEqual(groupMessages);
+      expect(readFileSync(SECTION_CONTEXTS_FILE, "utf8")).toBe(malformed);
+    } finally { warning.mockRestore(); }
   });
 
   it("messagesTail reads a bounded page via SQL on a fresh Store, and older messages still load in full", () => {
