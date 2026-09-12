@@ -21,6 +21,7 @@ import { ApprovalModeSelector } from "../ApprovalModeSelector";
 import { FullAccessWarning } from "../FullAccessWarning";
 import { LocalComputerAutoWarning } from "../LocalComputerAutoWarning";
 import { Switch } from "../SettingsPrimitives";
+import { ManagedTeamsSettings } from "./ManagedTeamsSettings";
 import type { useBotSettingsDerived } from "./useBotSettingsDerived";
 
 export function PermissionsSection({
@@ -31,7 +32,7 @@ export function PermissionsSection({
   derived: ReturnType<typeof useBotSettingsDerived>;
 }) {
   const { patch, engine, canCoordinate, approvalMode, trustedModesAvailable, sectionName, currentChief } = derived;
-  const { dispatch } = useStore();
+  const { state, dispatch } = useStore();
   const [localAutoWarning, setLocalAutoWarning] = useState<string | null>(null);
   const [fullAccessTarget, setFullAccessTarget] = useState<string | null>(null);
   const setApprovalMode = (mode: ApprovalMode) => {
@@ -88,6 +89,13 @@ export function PermissionsSection({
                   ? `Make this bot the ${sectionName} Chief and hand the role over from ${currentChief.name}.`
                   : `Make this bot the primary contact for the ${sectionName} section.`}
         </div>
+        {bot.chiefOfStaff && <ManagedTeamsSettings
+          key={bot.id + JSON.stringify(bot.managedSections ?? [])}
+          name={bot.name} ownTeam={bot.section?.trim() || ""}
+          teams={[...state.bots, ...state.groups].map(member => member.section?.trim() || "")}
+          allowed={bot.managedSections ?? []}
+          onSave={managedSections => patch({ managedSections, acknowledgePeerScope: true })}
+        />}
       </div>
 
       <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">

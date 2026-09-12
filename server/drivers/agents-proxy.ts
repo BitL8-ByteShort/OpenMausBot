@@ -38,6 +38,8 @@ import readline from "node:readline";
 import { CREDENTIAL_TARGETS, isCredentialTargetId } from "../../shared/credential-request.ts";
 import { agentToolAnnotations } from "../agent-tool-policy.ts";
 
+import { peerName } from "../peer-roster.ts";
+
 const HARNESS = process.env.OMB_HARNESS_URL ?? "http://127.0.0.1:8799";
 const BOT_ID = process.env.OMB_BOT_ID ?? "";
 const THREAD_ID = process.env.OMB_THREAD_ID ?? "";
@@ -375,7 +377,7 @@ const TOOLS = [
   {
     name: "list_bots",
     description:
-      "List the other bots (agents) in your OpenMausBot section, with their model and what each is doing right now (available, working, waiting on the user, not responding, or unavailable). Call this before delegate_bot or ask_bot to discover who's available. Use delegate_bot for assignments; use ask_bot only for a short consultation needed inline.",
+      "List the other bots (agents) you may contact in your own team and any additional teams the owner has explicitly allowed you to coordinate, with their team, model and current status. Call this before delegate_bot or ask_bot to discover who's available. Use delegate_bot for assignments; use ask_bot only for a short consultation needed inline.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -882,7 +884,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
   if (name === "list_bots") {
     const r = await api(`/api/internal/agents?self=${encodeURIComponent(BOT_ID)}`);
     const bots = (r.bots as Array<Json>) ?? [];
-    if (!bots.length) return { text: "No other bots in this section yet." };
+    if (!bots.length) return { text: "No other reachable bots yet." };
     const lines = bots.map((b) => {
       const role = b.title ? ` — ${b.title}` : "";
       const about = b.description ? ` (${String(b.description).slice(0, 120)})` : "";
@@ -891,10 +893,11 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       const state = typeof b.statusText === "string"
         ? (b.status === "available" ? "" : b.statusText)
         : (b.busy ? "busy" : "");
-      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${state ? `, ${state}` : ""}]`;
+      const team = typeof b.section === "string" ? `, team: ${peerName(b.section) || "General"}` : "";
+      return `- ${b.name}${role}${about} [id: ${b.id}, model: ${b.model}${team}${state ? `, ${state}` : ""}]`;
     });
     return {
-      text: `Other bots in your section:\n${lines.join("\n")}\n\nAssign work with delegate_bot. Use ask_bot only for a short answer you need inline.`,
+      text: `Reachable teammates:\n${lines.join("\n")}\n\nAssign work with delegate_bot. Use ask_bot only for a short answer you need inline.`,
     };
   }
   if (name === "list_rooms") {

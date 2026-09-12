@@ -41,6 +41,50 @@ it("refuses a disallowed peer without starting the recipient", () => withRooms(a
   expect(await f.messages(f.destination.activeTaskId)).toEqual([]);
 }), 45_000);
 
+it("lets an explicitly authorized Chief coordinate another team, which can consult its own specialist", () => withRooms(async f => {
+  await f.api(`/api/bots/${f.target.id}`, { section: "Engineering" }, "PATCH");
+  await f.api(`/api/bots/${f.sender.id}`, { chiefOfStaff: true, managedSections: ["Engineering"], acknowledgePeerScope: true }, "PATCH");
+  const reviewer = (await f.cli("new-bot", "--name", "Reviewer", "--section", "Engineering")).bot;
+  const reviewRoom = (await f.tool("create_channel", { name: "Quality", member_ids: [reviewer.id] })).channel;
+  f.plan[f.target.id] = {
+    steps: [{ arguments: { group_id: reviewRoom.id, bot_ids: [reviewer.id], request_key: "test", message: "Check the CSV output" } }],
+    reply: "Sent for verification", resumeReply: "CSV implemented and checked",
+  };
+  f.plan[reviewer.id] = { reply: "CSV checks passed" };
+  await f.start(); expect((await f.wait()).status).toBe("settled");
+  expect(f.provider().map((turn: any) => turn.botId)).toEqual([f.sender.id, f.target.id, reviewer.id, f.target.id, f.sender.id]);
+  expect(f.nodes().every((n: any) => n.status === "completed")).toBe(true);
+  expect((await f.messages(f.source.activeTaskId)).some((m: any) => m.text === "Reviewed downstream outcome")).toBe(true);
+  const bots = (await f.api("/api/bots")).bots;
+  expect(bots.find((b: any) => b.id === f.target.id).managedSections).toBeUndefined();
+  expect(bots.find((b: any) => b.id === reviewer.id).managedSections).toBeUndefined();
+}), 45_000);
+
+it("does not let a Chief's grant expose a foreign room transcript to its specialist", () => withRooms(async f => {
+  await f.api(`/api/bots/${f.target.id}`, { section: "Engineering" }, "PATCH");
+  const finance = (await f.cli("new-bot", "--name", "Finance", "--section", "Finance")).bot;
+  await f.api(`/api/bots/${f.sender.id}`, { chiefOfStaff: true, managedSections: ["Engineering", "Finance"], acknowledgePeerScope: true }, "PATCH");
+  await f.tool("update_channel", { channel_id: f.destination.id, member_ids: [f.target.id, finance.id] });
+  f.plan[f.sender.id].steps[0].expectError = true;
+  await f.start(); expect((await f.wait()).status).toBe("settled");
+  expect(f.nodes()).toEqual([]);
+  expect(await f.messages(f.destination.activeTaskId)).toEqual([]);
+}), 45_000);
+
+it("withholds a cross-team result if the owner revokes access while it runs", () => withRooms(async f => {
+  await f.api(`/api/bots/${f.target.id}`, { section: "Engineering" }, "PATCH");
+  await f.api(`/api/bots/${f.sender.id}`, { chiefOfStaff: true, managedSections: ["Engineering"], acknowledgePeerScope: true }, "PATCH");
+  f.plan[f.target.id] = { delayMs: 3000, reply: "PRIVATE_RESULT_AFTER_REVOCATION" };
+  await f.start();
+  await expect.poll(() => f.nodes().find((n: any) => n.parentId)?.status, { timeout: 15_000 }).toBe("running");
+  await f.api(`/api/bots/${f.sender.id}`, { managedSections: [] }, "PATCH");
+  expect((await f.wait()).status).toBe("settled");
+  expect(f.nodes().find((n: any) => n.parentId).status).toBe("failed");
+  const messages = await f.messages(f.source.activeTaskId);
+  expect(JSON.stringify(messages)).not.toContain("PRIVATE_RESULT_AFTER_REVOCATION");
+  expect(messages.some((m: any) => m.tool?.name.includes("Result withheld"))).toBe(true);
+}), 45_000);
+
 it.each(["recipient", "source-reader", "destination-reader"])("refuses cross-section work involving a %s without leaking room history", role => withRooms(async f => {
   if (role === "recipient") await f.api(`/api/bots/${f.target.id}`, { section: "Other company" }, "PATCH");
   else {
