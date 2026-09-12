@@ -12,6 +12,7 @@ import { DATA_DIR } from "./config.ts";
 import type { ModelSelection } from "./contracts.ts";
 import * as mdb from "./message-db.ts";
 import { peerAllowKey } from "./peer-approval-key.ts";
+import { canAccessTeam } from "./peer-roster.ts";
 import { Store, type BotRecord } from "./store.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-sonnet-5" });
@@ -528,6 +529,56 @@ describe("Store", () => {
     expect(reloaded.bot(teammate.id)?.section).toBe("Launch");
     expect(reloaded.bots.filter((bot) => bot.section === "Launch" && bot.chiefOfStaff).map((bot) => bot.id))
       .toEqual([incumbent.id]);
+  });
+
+  it.each([null, "Renamed"])("revokes exact old team grants before changing the empty team to %s", (nextName) => {
+    const store = new Store(selection);
+    const chief = store.createBot({ section: "Office" });
+    store.setChiefOfStaff(chief.id);
+    store.setBotsSection([], "Delivery");
+    store.setBotsSection([], "Delivery East");
+    store.patchBot(chief.id, { managedSections: ["Delivery", " Delivery ", "Delivery East", ""] });
+    const announcements: string[] = [];
+    store.onChange(change => { if (change.type === "bot") announcements.push(change.botId); });
+
+    expect(store.changeEmptySection("Delivery", nextName)).toBeUndefined();
+    expect(chief.managedSections).toEqual(["Delivery East", ""]);
+    expect(canAccessTeam(chief, "Delivery")).toBe(false);
+    expect(announcements).toEqual([chief.id]);
+    store.setBotsSection([], "Delivery");
+    const reloaded = new Store(selection);
+    expect(reloaded.sections).toContain("Delivery");
+    expect(canAccessTeam(reloaded.bot(chief.id)!, "Delivery")).toBe(false);
+    expect(canAccessTeam(reloaded.bot(chief.id)!, "Delivery East")).toBe(true);
+    expect(canAccessTeam(reloaded.bot(chief.id)!, "")).toBe(true);
+  });
+
+  it("keeps grants when an empty-team rename is a no-op or rejected", () => {
+    const store = new Store(selection);
+    const chief = store.createBot({ section: "Office" });
+    store.setChiefOfStaff(chief.id);
+    for (const name of ["Delivery", "Existing"]) store.setBotsSection([], name);
+    store.patchBot(chief.id, { managedSections: ["Delivery"] });
+    const changes: string[] = [];
+    store.onChange(change => { changes.push(change.type); });
+    expect(store.changeEmptySection("Delivery", "Delivery")).toBeUndefined();
+    expect(store.changeEmptySection("Delivery", "Existing")).toContain("already exists");
+    expect(changes).toEqual([]);
+    expect(chief.managedSections).toEqual(["Delivery"]);
+    expect(new Store(selection).bot(chief.id)?.managedSections).toEqual(["Delivery"]);
+  });
+
+  it("does not free a team name when its grant revocation cannot persist", () => {
+    const store = new Store(selection);
+    const chief = store.createBot({ section: "Office" });
+    store.setChiefOfStaff(chief.id);
+    store.setBotsSection([], "Delivery");
+    store.patchBot(chief.id, { managedSections: ["Delivery"] });
+    (store as unknown as { saveBots: () => void }).saveBots = () => { throw new Error("disk unavailable"); };
+    expect(() => store.changeEmptySection("Delivery", null)).toThrow("disk unavailable");
+    expect(store.sections).toContain("Delivery");
+    expect(chief.managedSections).toEqual(["Delivery"]);
+    expect(new Store(selection).sections).toContain("Delivery");
   });
 
   it("rejects unavailable or Chief-conflicting section assignments without changing bots", () => {

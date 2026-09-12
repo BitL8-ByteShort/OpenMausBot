@@ -357,6 +357,8 @@ export interface Bot {
   pinnedMessageId?: string;
   /** This sidebar section's primary coordinator. */
   chiefOfStaff?: boolean;
+  /** Additional teams the owner explicitly lets this Chief work with. */
+  managedSections?: string[];
   /** When this bot wants to talk to another bot (ask_bot/delegate_bot),
    * pause and ask the user first. Off by default. */
   approvePeerComms?: boolean;

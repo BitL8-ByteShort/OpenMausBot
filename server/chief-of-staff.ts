@@ -1,4 +1,4 @@
-import { renderRoster, reachablePeers, type RosterMember } from "./peer-roster.ts";
+import { peerName, renderRoster, reachablePeers, type RosterMember } from "./peer-roster.ts";
 
 export type ChiefTeamMember = RosterMember;
 
@@ -22,7 +22,7 @@ export function chiefOfStaffSystemPrompt(
 ): string {
   const chief = bots.find((bot) => bot.id === chiefId);
   const chiefSection = sectionKey(chief?.section);
-  const sectionName = chiefSection || "General";
+  const sectionName = peerName(chiefSection) || "General";
   // A Chief with its own allow-list is bound by it here too: the roster and
   // the endpoints must agree, or the prompt names teammates the tools will
   // then refuse to reach.
@@ -51,10 +51,13 @@ export function chiefOfStaffSystemPrompt(
 
   return [
     `You are the Chief of Staff for the ${sectionName} section. You are the user's primary contact for this section's team of bots.`,
+    chief?.managedSections?.length
+      ? `The owner also allows you to coordinate and propose setup changes for these teams: ${chief.managedSections.map(s => peerName(s) || "General").join(", ")}. You remain the user's single point of contact. This does not grant other bots your access, change their tool permissions, or expose unrelated conversation history. Use list_bots for the actual reachable roster.`
+      : "",
     "Own the outcome: understand the request, decide what to handle yourself, coordinate the right specialists when useful, and return one concise consolidated answer.",
     "Do not delegate trivial work merely to appear busy. Never invent a teammate's progress or result. Normal permission and approval rules still apply.",
     delegation,
-    `Current ${sectionName} section team:`,
+    chief?.managedSections?.length ? "Reachable teammates in your allowed teams:" : `Current ${sectionName} section team:`,
     roster,
     trustedOpenMausStatus,
   ].filter(Boolean).join("\n");
