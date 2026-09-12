@@ -13,21 +13,25 @@ its `OMB_ADMIN_WORKSPACE` slug, its exact HTTPS `OMB_PUBLIC_URL`, and an
 active `admin` entitlement. Partial or invalid hosted configuration denies
 remote access; it never enables legacy email or QR sign-in as a fallback.
 Credential-free, unproxied loopback owner access remains available for recovery.
+The `identity.example.test` URLs below illustrate external identity-service
+endpoints; requests use the configured `OMB_ADMIN_URL`, not the tenant origin.
 
 1. The workspace's `/api/auth/hosted/start` creates bounded, expiring state
    and a secure host-only handoff cookie. It redirects to the identity
    service's `/connect` with workspace, state and a SHA-256 PKCE challenge.
 2. The service returns a one-use code to `/api/auth/hosted/callback`.
    State and cookie must match. The workspace consumes local state before
-   awaiting `POST /api/handoff/consume` with workspace, code and verifier.
+   awaiting `POST https://identity.example.test/api/handoff/consume` with
+   workspace, code and verifier.
 3. A successful response contains email, role (`admin` or `member`) and a
    high-entropy workspace-bound grant. The adapter issues a normal scoped
    workspace session. By default the local email allow-list also narrows
    its access.
 4. Every authenticated remote request checks the grant at
-   `POST /api/handoff/check`. Membership removal or loss of an issued scope
+   `POST https://identity.example.test/api/handoff/check`.
+   Membership removal or loss of an issued scope
    revokes the session. Promotion does not widen an existing credential.
-An unavailable service denies access and closes streams without treating
+   An unavailable service denies access and closes streams without treating
    an outage as permanent membership removal.
 
 An operator may explicitly set `OMB_ADMIN_MEMBERSHIP=portal` when the identity
