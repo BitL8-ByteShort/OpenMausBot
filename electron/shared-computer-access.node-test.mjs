@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { executeSharedOperation, sharedCommand, createSharedCua } from "./shared-computer-access.mjs";
-import { validateSharedFolders } from "./computer-sharing.mjs";
+import { createComputerSharing, validateSharedFolders } from "./computer-sharing.mjs";
 
 async function fixture(t) {
   const dir = await realpath(await mkdtemp(path.join(tmpdir(), "omb-shared-access-")));
@@ -16,6 +16,15 @@ async function fixture(t) {
   return { dir, folder, grant, run };
 }
 const payload = result => JSON.parse(result.content[0].text);
+
+test("legacy insecure saved addresses never receive sharing credentials", async t => {
+  const { dir } = await fixture(t);
+  let calls = 0;
+  const sharing = createComputerSharing({ file: path.join(dir, "profile", "sharing.json"), environments: () => [], cuaConnection: async () => null, fetch: async () => { calls++; throw new Error("unexpected network"); } });
+  t.after(() => sharing.close());
+  await assert.rejects(sharing.observe({ id: "old", origin: "http://old-server.example", name: "Legacy" }), /HTTPS/);
+  assert.equal(calls, 0);
+});
 
 test("selected folders are read-only; writes require an explicit grant and fresh hash", async t => {
   const { dir, folder, run } = await fixture(t);
