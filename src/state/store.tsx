@@ -615,6 +615,7 @@ export interface InstanceInfo {
 
 export type AppSettingsSection =
   | "general"
+  | "desktopWorkspaces"
   | "appearance"
   | "experimental"
   | "connections"

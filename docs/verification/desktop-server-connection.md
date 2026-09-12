@@ -12,8 +12,10 @@ The script creates its own loopback Vite preview, temporary HOME and Electron
 profile. It accepts no server URL and blocks requests outside that preview.
 It never opens the operator's app, server list, credentials or browser profile.
 
-The smoke mounts `RemoteComputerSection` with the real styles and
-`electron/preload.cjs`. It checks:
+The smoke mounts `RemoteComputerSection`, `ConnectedWorkspacesSettings`, and
+`DesktopWorkspaceSwitcher` with the real styles and `electron/preload.cjs`.
+It also opens the real app shell against a disposable fake-engine server.
+It checks:
 
 - A full custom HTTPS pairing link, including its 12-character code, reaches
   `environments:add-from-link` unchanged and never calls companion pairing.
@@ -23,17 +25,51 @@ The smoke mounts `RemoteComputerSection` with the real styles and
 - Desktop companion mode still sends a normalized six-digit code through
   `desktop-remote:pair`.
 - The 390px layout has no horizontal document overflow.
-- A page outside the declared local origin receives neither connection bridge
-  nor Node access from the production preload.
+- The hosted-workspace form accepts a hostname/address or pairing link and an
+  optional name. Cancellation retains input; confirmed connections preserve
+  the existing list and exclude the pairing code from saved connection data.
+- The production native menu's Connect item requests Settings; its saved
+  workspace items dispatch fixed IDs. Settings can switch connections and
+  cancel or confirm forgetting just one saved connection.
+- The local app opens Connected workspaces as a top-level Settings page, even
+  before local provider onboarding. Native requests also clear stale Settings
+  searches, so the requested page actually becomes visible.
+- A page outside the declared local origin receives no saved-list/mutation
+  bridge or Node access. Its workspace bridge contains only `state` (current
+  name, not the list) and `menu` (the user selects in Electron's native menu).
 
 The printed evidence directory retains `receipt.json`, `electron.log`, and
-desktop/narrow screenshots. Successful cleanup removes only the temporary
-home and profile. Expected fake IPC rejection messages appear in the log.
+desktop/narrow/in-app screenshots. Successful cleanup removes only the
+temporary home, profile and server data. Expected fake IPC rejection messages
+appear in the log.
 
 This verifies actual renderer/preload dispatch, with fixture IPC handlers
 substituting native confirmation, server persistence and navigation. It does
 not prove a real pairing exchange, session persistence, or public DNS/TLS.
+Native menu items are selected programmatically; this is not a physical
+mouse/keyboard test of the operating system's popup.
 The existing production handler still performs native confirmation and opens
 the server's pairing page; its URL/state helpers are checked separately with
 `node --test electron/environments.node-test.mjs`. Do not report this offline
 smoke as an authenticated connection to a customer's server.
+
+## User flow
+
+In a desktop build with this feature, choose the workspace dropdown above the
+sidebar search → **Connect hosted workspace…**, or open **Settings → Connected
+workspaces**. Enter the server's HTTPS address or full pairing link and an
+optional name. Confirm the host in the native dialog, then complete pairing or
+email sign-in on that server. To generate an owner link without the CLI's
+phone wizard, run `npx openmausbot pair --label "My desktop"` on the server.
+Treat this link as a secret. Existing limited-access links retain their limits.
+
+Select **This computer** or a saved hosted workspace to switch. Each origin
+keeps its own session, bots, chats, provider credentials and settings. **Forget**
+signs this desktop out and removes its saved connection, not the server's bots
+or data. The server must remain running independently.
+
+The dropdown renders in the server's own UI, so both desktop and hosted UI
+need the update for the in-page control. When connecting to an older hosted
+version, the native **Server** menu remains available to switch back or open
+local connection Settings. Remote pages cannot enumerate the desktop's saved
+connections or directly invoke switching, forgetting, or host-only controls.

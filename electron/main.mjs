@@ -207,7 +207,7 @@ function deliverPackageInstall(win) {
     showingLocal = new URL(win.webContents.getURL()).origin === rendererOrigin();
   } catch {}
   if (!showingLocal) {
-    if (activeEnvironment(environmentsState)) switchEnvironment(LOCAL_ID);
+    if (activeEnvironment(environmentsState)) void workspaceMenuAction(() => switchEnvironment(LOCAL_ID));
     return;
   }
   win.webContents.send("package:install", pendingPackageInstallUrl);
@@ -1352,7 +1352,7 @@ ipcMain.on("desktop:unread-count", (event, value) => {
 // The app switches by loading the chosen server's own UI (electron/menu.mjs).
 // Only {id, name, origin} is stored here; the session credential is the
 // HttpOnly cookie /pair set for that origin, kept by Chromium's cookie jar.
-const { LOCAL_ID, activeEnvironment, allowedOrigins, parseEnvironments, parsePairingLink, serializeEnvironments, withActive, withEnvironment, withoutEnvironment } = environmentsModule;
+const { LOCAL_ID, activeEnvironment, allowedOrigins, parseEnvironments, parseHostedWorkspaceLink, serializeEnvironments, withActive, withEnvironment, withoutEnvironment, workspaceMenuTemplate, workspaceNavigationAllowed, workspaceSenderAllowed, workspaceSummary } = environmentsModule;
 let environmentsState = { environments: [], activeId: LOCAL_ID };
 
 function environmentsFile() {
@@ -1379,6 +1379,7 @@ function writeEnvironments(state) {
       fs.rmSync(temporary, { force: true });
     } catch {}
     slog(`environments save failed: ${error?.message ?? error}`);
+    throw new Error("Could not save workspace connections on this computer. Please try again.");
   }
 }
 
@@ -1393,39 +1394,61 @@ function refreshApplicationMenu() {
     buildApplicationMenu({
       environments: environmentsState.environments,
       activeId: environmentsState.activeId,
-      onSwitch: (id) => switchEnvironment(id),
+      onSwitch: (id) => void workspaceMenuAction(() => switchEnvironment(id)),
       onAddFromClipboard: () => void addServerFromClipboard(),
-      onForget: (id) => void forgetEnvironment(id),
+      onConnect: () => void workspaceMenuAction(openWorkspaceSettings),
+      onForget: (id) => void workspaceMenuAction(() => forgetEnvironment(id)),
     }),
   );
 }
 
 function persistEnvironments(next) {
+  writeEnvironments(next);
   environmentsState = next;
-  writeEnvironments(environmentsState);
   refreshApplicationMenu();
+}
+
+async function workspaceMenuAction(action) {
+  try { await action(); } catch (error) {
+    await dialog.showMessageBox({ type: "error", message: "Could not update workspaces", detail: error.message });
+  }
 }
 
 function navigateMainWindow(url) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  void mainWindow.loadURL(url);
+  // did-fail-load shows the connection error and returns to the local app.
+  void mainWindow.loadURL(url).catch(() => {});
 }
 
 function switchEnvironment(id) {
+  if (id === environmentsState.activeId || (id !== LOCAL_ID && !environmentsState.environments.some((entry) => entry.id === id))) return;
   persistEnvironments(withActive(environmentsState, id));
   navigateMainWindow(activeOrigin());
 }
 
+function openWorkspaceSettings() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (senderIsLocal({ sender: mainWindow.webContents })) {
+    mainWindow.webContents.send("workspaces:open-settings");
+  } else {
+    persistEnvironments(withActive(environmentsState, LOCAL_ID));
+    navigateMainWindow(`${rendererOrigin()}/?desktop-settings=workspaces`);
+  }
+}
+
 async function addServerFromClipboard() {
-  const link = parsePairingLink(clipboard.readText());
+  try {
+    return await connectHostedWorkspace(clipboard.readText());
+  } catch (error) {
+    await dialog.showMessageBox({ type: "info", message: "Could not connect workspace", detail: `${error.message}\nYou can also choose Connect hosted workspace to enter an address in Settings.` });
+    return false;
+  }
+}
+
+async function connectHostedWorkspace(input, name) {
+  const link = parseHostedWorkspaceLink(input);
   if (!link) {
-    await dialog.showMessageBox({
-      type: "info",
-      message: "Copy a pairing link first",
-      detail:
-        "On the server run `pnpm pair` (or `node dist-server/pair-cli.js` in Docker), copy the printed https://…/pair#code=… link, then choose this item again.",
-    });
-    return;
+    throw new Error("Enter an HTTPS workspace address or a full pairing link. Keep the pairing code after #, not in the URL query.");
   }
   const host = new URL(link.origin).host;
   const { response } = await dialog.showMessageBox({
@@ -1438,12 +1461,13 @@ async function addServerFromClipboard() {
       ? "The pairing code in the link is used once, then this app stays signed in to that server."
       : "The link has no pairing code; the server will ask for one.",
   });
-  if (response !== 0) return;
-  let next = withEnvironment(environmentsState, { origin: link.origin, name: host }, () => randomUUID());
+  if (response !== 0) return false;
+  let next = withEnvironment(environmentsState, { origin: link.origin, name }, () => randomUUID());
   const added = next.environments.find((e) => e.origin === link.origin);
   next = withActive(next, added.id);
   persistEnvironments(next);
   navigateMainWindow(link.url);
+  return true;
 }
 
 async function forgetEnvironment(id) {
@@ -1458,7 +1482,11 @@ async function forgetEnvironment(id) {
     detail: "This app signs out of that server. The server keeps its own session list; revoke it there too if the device is gone.",
   });
   if (response !== 0) return;
+  const wasActive = environmentsState.activeId === id;
   persistEnvironments(withoutEnvironment(environmentsState, id));
+  // Leave a removed workspace immediately; forgetting an inactive connection
+  // must not reload the local app or discard a Settings form/chat draft.
+  if (wasActive) navigateMainWindow(activeOrigin());
   try {
     // Revoke the session on the server while the cookie is still here.
     await session.defaultSession.fetch(`${env.origin}/api/auth/logout`, { method: "POST", signal: AbortSignal.timeout(5_000) });
@@ -1470,7 +1498,6 @@ async function forgetEnvironment(id) {
   } catch (error) {
     slog(`forget server: storage clear failed: ${error?.message ?? error}`);
   }
-  navigateMainWindow(activeOrigin());
 }
 
 /**
@@ -1581,16 +1608,16 @@ function createWindow() {
     }
     return { action: "deny" };
   });
-  // The window shows Local or a saved server, nothing else: a page cannot
-  // walk the preload-bearing window to a stranger's origin.
+  // Only the selected workspace may navigate this window. Switching is a
+  // native action, not a redirect/link from a remote page to the local bridge.
   const guardNavigation = (event, url) => {
     let origin = null;
     try {
       origin = new URL(url).origin;
     } catch {}
-    if (origin && allowedOrigins(environmentsState, rendererOrigin()).has(origin)) return;
+    if (workspaceNavigationAllowed(url, environmentsState, rendererOrigin())) return;
     event.preventDefault();
-    slog(`blocked navigation to ${url}`);
+    slog(`blocked navigation to ${origin ?? "an invalid address"}`);
   };
   win.webContents.on("will-navigate", guardNavigation);
   win.webContents.on("will-redirect", guardNavigation);
@@ -1625,7 +1652,7 @@ function createWindow() {
       message: `${remote.name} is not reachable`,
       detail: `${errorDescription}. Showing the local server instead; choose it again from the Server menu when it is back.`,
     });
-    switchEnvironment(LOCAL_ID);
+    void workspaceMenuAction(() => switchEnvironment(LOCAL_ID));
   });
   win.webContents.on("did-finish-load", () => deliverPackageInstall(win));
 
@@ -1749,7 +1776,7 @@ function createWindow() {
   if (desktopRemoteAccess) {
     win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
   } else if (remote) {
-    win.loadURL(remote.origin);
+    void win.loadURL(remote.origin).catch(() => {});
   } else if (app.isPackaged) {
     win.loadURL(serverReady ? `http://127.0.0.1:${SERVER_PORT}` : buildErrorPage({ allPortsOccupied: serverStartConflictOnly }));
   } else {
@@ -2049,20 +2076,42 @@ ipcMain.handle("companion-account:verify-code", localOnly("companion-account:ver
 ipcMain.handle("companion-account:retry", localOnly("companion-account:retry", () => ensureCompanionAccountService().retry()));
 ipcMain.handle("companion-account:sign-out", localOnly("companion-account:sign-out", () => ensureCompanionAccountService().signOut()));
 
-ipcMain.handle("environments:state", (event) => ({
+const workspaceOnly = (handler) => (event, ...args) => {
+  if (!workspaceSenderAllowed(event, mainWindow?.webContents, environmentsState, rendererOrigin())) throw new Error("Workspace controls are only available in the main desktop window");
+  return handler(event, ...args);
+};
+const localWorkspaceOnly = (channel, handler) => localOnly(channel, workspaceOnly(handler));
+
+ipcMain.handle("environments:state", localWorkspaceOnly("environments:state", (event) => ({
   localOrigin: rendererOrigin(),
   remote: !senderIsLocal(event),
   activeId: environmentsState.activeId,
   environments: environmentsState.environments,
+})));
+ipcMain.handle("environments:switch", localWorkspaceOnly("environments:switch", (_event, id) => switchEnvironment(typeof id === "string" ? id : LOCAL_ID)));
+ipcMain.handle("environments:add-from-link", localWorkspaceOnly("environments:add-from-link", (_event, link, name) => {
+  return connectHostedWorkspace(link, typeof name === "string" ? name : undefined);
 }));
-ipcMain.handle("environments:switch", localOnly("environments:switch", (_event, id) => switchEnvironment(typeof id === "string" ? id : LOCAL_ID)));
-ipcMain.handle("environments:add-from-link", localOnly("environments:add-from-link", async (_event, link) => {
-  const parsed = parsePairingLink(typeof link === "string" ? link : "");
-  if (!parsed) throw new Error("that is not a pairing link (expected https://host/pair#code=…)");
-  clipboard.writeText(parsed.url);
-  await addServerFromClipboard();
+ipcMain.handle("environments:forget", localWorkspaceOnly("environments:forget", (_event, id) => forgetEnvironment(typeof id === "string" ? id : "")));
+
+// A cloud page can ask for the native chooser, not choose a destination or
+// mutate the desktop's saved list. Only native menu clicks perform those acts.
+ipcMain.handle("workspaces:state", workspaceOnly(() => workspaceSummary(environmentsState)));
+let workspaceMenuOpen = false;
+ipcMain.handle("workspaces:menu", workspaceOnly(async () => {
+  if (workspaceMenuOpen) return;
+  workspaceMenuOpen = true;
+  try {
+    const menu = Menu.buildFromTemplate(workspaceMenuTemplate(environmentsState, {
+      onSwitch: (id) => void workspaceMenuAction(() => switchEnvironment(id)),
+      onConnect: () => void workspaceMenuAction(openWorkspaceSettings),
+      onForget: (id) => void workspaceMenuAction(() => forgetEnvironment(id)),
+    }));
+    await new Promise((resolve) => menu.popup({ window: mainWindow, callback: resolve }));
+  } finally {
+    workspaceMenuOpen = false;
+  }
 }));
-ipcMain.handle("environments:forget", localOnly("environments:forget", (_event, id) => forgetEnvironment(typeof id === "string" ? id : "")));
 
 ipcMain.handle("desktop:capabilities", async (event) =>
   desktopCapabilities({
