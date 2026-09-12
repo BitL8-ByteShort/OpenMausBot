@@ -19,6 +19,7 @@ export function chiefOfStaffSystemPrompt(
   bots: ChiefTeamMember[],
   canDelegate: boolean,
   trustedOpenMausStatus = "",
+  boundedCoordination = false,
 ): string {
   const chief = bots.find((bot) => bot.id === chiefId);
   const chiefSection = sectionKey(chief?.section);
@@ -39,11 +40,12 @@ export function chiefOfStaffSystemPrompt(
   });
 
   const delegation = canDelegate
-    ? [
+    ? boundedCoordination
+      ? "Use list_bots or list_room_targets for the live reachable roster. Use coordinate_bots to ask actual teammates for advice or assign concrete work. Outside a room, each assignment gets a separate conversation using the recipient's own model and permissions. Busy teammates queue. Give self-contained briefs, then end your turn; you resume automatically after their results return. Leads can coordinate their own specialists. Do not poll, send acknowledgements as new work, or substitute native helpers for named bots. On return, verify the requested outcome, resolve decisions within the user's scope, request concrete corrections with rework=true when necessary, and return one consolidated answer. Consultations are advice, not proof that work or tests ran."
+      : [
         "Use list_bots to confirm the live roster and IDs. When assigning work to a teammate, use delegate_bot: it returns immediately, keeps you available to the user, and delivers the teammate's outcome back into this conversation automatically — success or failure. When the result arrives you are woken with it: report it to the user and act. If the teammate fails or stalls, tell the user plainly and decide the next step yourself.",
         "After delegate_bot accepts the task, acknowledge the handoff and continue with any independent work or end your turn. Do not call wait_delegation or repeatedly poll check_delegation in the same turn.",
         "Use ask_bot only for a brief consultation whose answer you must have before writing your current response. Never use ask_bot for an assigned task, background work, or anything potentially long-running.",
-        "When the user asks you to assemble a team, use create_bot for each genuinely useful specialist. Give each one a clear role and instructions, then use delegate_bot to assign its work. Do not create duplicate or unnecessary bots.",
         "Delegate with a clear, self-contained brief. Say that the task is assigned, not completed; only claim completion after the teammate's result has actually arrived.",
         "You may assign work to more than one teammate when the request genuinely benefits. Stay responsive while they work, then combine their returned results when the user asks for a synthesis.",
       ].join(" ")
@@ -57,6 +59,7 @@ export function chiefOfStaffSystemPrompt(
     "Own the outcome: understand the request, decide what to handle yourself, coordinate the right specialists when useful, and return one concise consolidated answer.",
     "Do not delegate trivial work merely to appear busy. Never invent a teammate's progress or result. Normal permission and approval rules still apply.",
     delegation,
+    canDelegate ? "When the user asks you to assemble a team, use create_bot for each genuinely useful specialist. Give each one a clear role and instructions, then use the available coordination tools to assign its work. Do not create duplicate or unnecessary bots." : "",
     chief?.managedSections?.length ? "Reachable teammates in your allowed teams:" : `Current ${sectionName} section team:`,
     roster,
     trustedOpenMausStatus,
