@@ -99,6 +99,7 @@ export interface OptionCardData {
   skillRequest?: SkillRequestCardData;
   /** Persisted profile proposal used by the server when the user confirms it. */
   profileRequest?: ProfileRequestCardData;
+  teamSetupRequest?: import("../../shared/team-setup").TeamSetupRequest;
   /** The model's own questions and options (Claude's AskUserQuestion), so
    * the card offers choices instead of an unanswerable Allow/Deny. */
   questionRequest?: QuestionRequestCardData;

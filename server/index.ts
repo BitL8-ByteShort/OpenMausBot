@@ -5823,6 +5823,184 @@ const routineRequests = new RoutineRequestService({
     return null;
   },
 });
+async function deleteBotWithLifecycle(botId: string, revalidate: () => void = () => {}) {
+  const deletionResponse = (status: number, body: { error?: string; ok?: boolean }) => ({ status, body });
+      revalidate();
+      const bot = store.bot(botId);
+      if (!bot) return deletionResponse( 404, { error: "no such bot" });
+      if (computerProviderConfigTransitions.size > 0) {
+        return deletionResponse( 409, { error: "computer provider settings are being updated — wait before deleting this bot" });
+      }
+      if (boxLifecycleBusyBots.has(bot.id)) {
+        return deletionResponse( 409, { error: "wait for this bot's cloud computer action to finish before deleting the bot" });
+      }
+      const activeRoutine = routines!.activeRunForBot(bot.id);
+      if (activeRoutine) {
+        return deletionResponse( 409, {
+          error: "stop this bot's active routine before deleting the bot",
+        });
+      }
+      const activeGroup = activeGroupTurnForBot(bot.id);
+      if (activeGroup) {
+        return deletionResponse( 409, {
+          error: `stop this bot's work in channel ${activeGroup.group.name} before deleting the bot`,
+        });
+      }
+      // A direct turn that has already claimed the bot can provision a Box in
+      // its background setup. Do not let deletion race that work while a Box
+      // account is configured; the person can stop the turn and retry.
+      if ((box.boxConfigured(cfg) || vpsSshAlias(cfg)) && (bot.busy || hasDirectDispatch(bot.id))) {
+        return deletionResponse( 409, { error: "stop this bot's work before checking and deleting its cloud computer" });
+      }
+      const botBoxRecovery = boxCreateRecoverySnapshot().filter((entry) => entry.botId === bot.id);
+      if (botBoxRecovery.some((entry) => !entry.resolved)) {
+        return deletionResponse( 409, {
+          error: "finish reconciling this bot's pending cloud computer creation before deleting it — check ascii.dev, then retry Box setup",
+        });
+      }
+      // Bot deletion awaits VM/browser/provider cleanup. Claim the bot and
+      // every channel it belongs to before that first await so a phone save
+      // cannot begin halfway through teardown (or vice versa). The computer
+      // lifecycle claim is synchronous too, so either both claims are held or
+      // neither survives this request.
+      const releaseComputerLifecycle = claimBotComputerLifecycle(bot.id);
+      const releasePhoneSecretMutation = claimPhoneSecretBotDeletion(bot.id);
+      if (!releasePhoneSecretMutation) {
+        releaseComputerLifecycle();
+        return deletionResponse( 409, { error: "this bot or one of its channels is securely saving a credential" });
+      }
+      try {
+        if (localVmMode(cfg) === "per-bot") {
+          const target = perBotLocalVmTarget(bot.id);
+          if (localVmActiveThreads.has(target.key) || localVmLifecycleBusy.has(target.key)) {
+            return deletionResponse( 409, { error: "stop this bot's Local VM turn or setup action before deleting the bot" });
+          }
+          const vm = await containerComputerStatus(undefined, undefined, target);
+          if (!vm.daemonUp && existsSync(target.workspaceDir)) {
+            return deletionResponse( 409, {
+              error: "start the container runtime and delete this bot's Local VM before deleting the bot",
+            });
+          }
+          if (vm.container !== "missing") {
+            return deletionResponse( 409, { error: "delete this bot's Local VM from its Computer panel before deleting the bot" });
+          }
+        }
+        // VPS containers are also durable and may outlive a destination or
+        // backend switch. Keep the bot as the discoverable owner until the
+        // person explicitly removes that container from Settings.
+        const vpsInventory = await vps.listManagedVpsComputers(cfg, managedBoxOwners());
+        if (vpsInventory.configured && !vpsInventory.available) {
+          return deletionResponse( 503, {
+            error: `${vpsInventory.problem ?? "VPS computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
+          });
+        }
+        if (vpsInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
+          return deletionResponse( 409, {
+            error: "remove this bot's VPS computer from Settings → Computers before deleting the bot",
+          });
+        }
+        // LIST is eventually consistent, and a remembered Box may also have
+        // been renamed outside OpenMausBot. The create journal is stronger
+        // ownership evidence: inspect every durable id directly before the bot
+        // record that makes it discoverable can be removed. Missing credentials
+        // or an unavailable provider must fail closed.
+        for (const recovery of botBoxRecovery) {
+          if (!recovery.boxId) {
+            return deletionResponse( 409, {
+              error: "finish reconciling this bot's pending cloud computer creation before deleting it",
+            });
+          }
+          const inspected = await box.inspectBoxIdentity(cfg, recovery.boxId);
+          if (!inspected.available) {
+            return deletionResponse( 503, {
+              error: `${inspected.problem ?? "a remembered cloud computer could not be verified"}. Restore its Box account before deleting this bot`,
+            });
+          }
+          if (inspected.identity) {
+            return deletionResponse( 409, {
+              error: "delete this bot's remembered cloud computer from Settings → Computers before deleting the bot",
+            });
+          }
+          // A direct 404/410 is authoritative even while account LIST catches
+          // up. Retire only this exact provider identity, then continue looking
+          // for any older name-based resource the journal never recorded.
+          retireDeletedBoxCreate(recovery.boxId);
+        }
+        // A Box survives destination/backend changes and contains browser
+        // sessions and files. Resolve ownership from a fresh provider listing;
+        // deleting the bot first would make that durable machine look orphaned.
+        const cloudInventory = await box.listManagedBoxes(cfg, managedBoxOwners());
+        if (cloudInventory.configured && !cloudInventory.available) {
+          return deletionResponse( 503, {
+            error: `${cloudInventory.problem ?? "cloud computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
+          });
+        }
+        if (cloudInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
+          return deletionResponse( 409, {
+            error: "delete this bot's cloud computer from Settings → Computers before deleting the bot",
+          });
+        }
+        // Establish a durable cleanup intent before any teardown. A malformed
+        // or unreadable journal therefore rejects the delete with the bot and
+        // all of its live work untouched. The intent is aborted if a later
+        // pre-delete side effect fails, and committed only after Store deletion.
+        revalidate();
+        const browserCleanupRequest = browserCleanup.prepare("bot", bot.id);
+        try {
+          // a running turn dies with its bot
+          // Invalidate every bot-callable bearer before the first asynchronous
+          // teardown step. A request that already passed its initial header
+          // check is revalidated after its body arrives and must fail closed.
+          for (const task of store.tasks(bot.id)) revokeInternalCapabilitiesForThread(task.threadId);
+          await interruptAllDirectThreads(bot.id);
+          revalidate();
+          // Deletion removes the thread before a late turn.completed can fold
+          // staged provider images into a message, so dispose them here.
+          for (const task of store.tasks(bot.id)) {
+            purgeGeneratedImagesForThread(task.threadId);
+            settleDirectFollowup(directTurnGenerationByThread.get(task.threadId));
+            directTurnGenerationByThread.delete(task.threadId);
+            directTurnBots.delete(task.threadId);
+          }
+          stopScreenPoller(bot.id);
+          activeVpsThreads.delete(bot.id);
+          routines!.disableForBot(bot.id);
+          webhooks.disableForBot(bot.id);
+          calendarCalls!.removeBot(bot.id);
+          lastReply.delete(bot.threadId);
+          // a peer approval naming this bot can never be meaningfully answered
+          // now, and its caller would otherwise wait out the 15-minute timeout
+          cancelPeerApprovalsFor(bot.id);
+          discardDelegations(commsBus, bot.threadId);
+          computerControl.forget(bot.id);
+          computerControlRevision.delete(bot.id);
+          const target = perBotLocalVmTarget(bot.id);
+          localVmIdles.get(target.key)?.cancel();
+          localVmIdles.delete(target.key);
+          store.deleteBot(bot.id);
+          browserLive.closeForBot(bot.id);
+          await forgetTemporaryBrowser(bot.id);
+        } catch (error) {
+          if (browserCleanupRequest) browserCleanup.abort(browserCleanupRequest);
+          throw error;
+        }
+        if (browserCleanupRequest) {
+          const committedCleanup = browserCleanup.commit(browserCleanupRequest);
+          const acknowledged = await browserCleanup.ensure(committedCleanup);
+          requireBrowserCleanupAcknowledged(acknowledged, `Browser data for ${bot.name}`);
+        }
+        for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
+          try {
+            unlinkSync(join(dir, `${bot.threadId}.ndjson`));
+          } catch {}
+        }
+        return deletionResponse( 200, { ok: true });
+      } finally {
+        releaseComputerLifecycle();
+        releasePhoneSecretMutation();
+      }
+}
+
 const profileRequests = new ProfileRequestService({
   store,
   canPersist: proposalPersistence,
@@ -12430,177 +12608,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "DELETE") {
-      const bot = store.bot(m[1]);
-      if (!bot) return json(res, 404, { error: "no such bot" });
-      if (computerProviderConfigTransitions.size > 0) {
-        return json(res, 409, { error: "computer provider settings are being updated — wait before deleting this bot" });
-      }
-      if (boxLifecycleBusyBots.has(bot.id)) {
-        return json(res, 409, { error: "wait for this bot's cloud computer action to finish before deleting the bot" });
-      }
-      const activeRoutine = routines!.activeRunForBot(bot.id);
-      if (activeRoutine) {
-        return json(res, 409, {
-          error: "stop this bot's active routine before deleting the bot",
-        });
-      }
-      const activeGroup = activeGroupTurnForBot(bot.id);
-      if (activeGroup) {
-        return json(res, 409, {
-          error: `stop this bot's work in channel ${activeGroup.group.name} before deleting the bot`,
-        });
-      }
-      // A direct turn that has already claimed the bot can provision a Box in
-      // its background setup. Do not let deletion race that work while a Box
-      // account is configured; the person can stop the turn and retry.
-      if ((box.boxConfigured(cfg) || vpsSshAlias(cfg)) && (bot.busy || hasDirectDispatch(bot.id))) {
-        return json(res, 409, { error: "stop this bot's work before checking and deleting its cloud computer" });
-      }
-      const botBoxRecovery = boxCreateRecoverySnapshot().filter((entry) => entry.botId === bot.id);
-      if (botBoxRecovery.some((entry) => !entry.resolved)) {
-        return json(res, 409, {
-          error: "finish reconciling this bot's pending cloud computer creation before deleting it — check ascii.dev, then retry Box setup",
-        });
-      }
-      // Bot deletion awaits VM/browser/provider cleanup. Claim the bot and
-      // every channel it belongs to before that first await so a phone save
-      // cannot begin halfway through teardown (or vice versa). The computer
-      // lifecycle claim is synchronous too, so either both claims are held or
-      // neither survives this request.
-      const releaseComputerLifecycle = claimBotComputerLifecycle(bot.id);
-      const releasePhoneSecretMutation = claimPhoneSecretBotDeletion(bot.id);
-      if (!releasePhoneSecretMutation) {
-        releaseComputerLifecycle();
-        return json(res, 409, { error: "this bot or one of its channels is securely saving a credential" });
-      }
-      try {
-        if (localVmMode(cfg) === "per-bot") {
-          const target = perBotLocalVmTarget(bot.id);
-          if (localVmActiveThreads.has(target.key) || localVmLifecycleBusy.has(target.key)) {
-            return json(res, 409, { error: "stop this bot's Local VM turn or setup action before deleting the bot" });
-          }
-          const vm = await containerComputerStatus(undefined, undefined, target);
-          if (!vm.daemonUp && existsSync(target.workspaceDir)) {
-            return json(res, 409, {
-              error: "start the container runtime and delete this bot's Local VM before deleting the bot",
-            });
-          }
-          if (vm.container !== "missing") {
-            return json(res, 409, { error: "delete this bot's Local VM from its Computer panel before deleting the bot" });
-          }
-        }
-        // VPS containers are also durable and may outlive a destination or
-        // backend switch. Keep the bot as the discoverable owner until the
-        // person explicitly removes that container from Settings.
-        const vpsInventory = await vps.listManagedVpsComputers(cfg, managedBoxOwners());
-        if (vpsInventory.configured && !vpsInventory.available) {
-          return json(res, 503, {
-            error: `${vpsInventory.problem ?? "VPS computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
-          });
-        }
-        if (vpsInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
-          return json(res, 409, {
-            error: "remove this bot's VPS computer from Settings → Computers before deleting the bot",
-          });
-        }
-        // LIST is eventually consistent, and a remembered Box may also have
-        // been renamed outside OpenMausBot. The create journal is stronger
-        // ownership evidence: inspect every durable id directly before the bot
-        // record that makes it discoverable can be removed. Missing credentials
-        // or an unavailable provider must fail closed.
-        for (const recovery of botBoxRecovery) {
-          if (!recovery.boxId) {
-            return json(res, 409, {
-              error: "finish reconciling this bot's pending cloud computer creation before deleting it",
-            });
-          }
-          const inspected = await box.inspectBoxIdentity(cfg, recovery.boxId);
-          if (!inspected.available) {
-            return json(res, 503, {
-              error: `${inspected.problem ?? "a remembered cloud computer could not be verified"}. Restore its Box account before deleting this bot`,
-            });
-          }
-          if (inspected.identity) {
-            return json(res, 409, {
-              error: "delete this bot's remembered cloud computer from Settings → Computers before deleting the bot",
-            });
-          }
-          // A direct 404/410 is authoritative even while account LIST catches
-          // up. Retire only this exact provider identity, then continue looking
-          // for any older name-based resource the journal never recorded.
-          retireDeletedBoxCreate(recovery.boxId);
-        }
-        // A Box survives destination/backend changes and contains browser
-        // sessions and files. Resolve ownership from a fresh provider listing;
-        // deleting the bot first would make that durable machine look orphaned.
-        const cloudInventory = await box.listManagedBoxes(cfg, managedBoxOwners());
-        if (cloudInventory.configured && !cloudInventory.available) {
-          return json(res, 503, {
-            error: `${cloudInventory.problem ?? "cloud computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
-          });
-        }
-        if (cloudInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
-          return json(res, 409, {
-            error: "delete this bot's cloud computer from Settings → Computers before deleting the bot",
-          });
-        }
-        // Establish a durable cleanup intent before any teardown. A malformed
-        // or unreadable journal therefore rejects the delete with the bot and
-        // all of its live work untouched. The intent is aborted if a later
-        // pre-delete side effect fails, and committed only after Store deletion.
-        const browserCleanupRequest = browserCleanup.prepare("bot", bot.id);
-        try {
-          // a running turn dies with its bot
-          // Invalidate every bot-callable bearer before the first asynchronous
-          // teardown step. A request that already passed its initial header
-          // check is revalidated after its body arrives and must fail closed.
-          for (const task of store.tasks(bot.id)) revokeInternalCapabilitiesForThread(task.threadId);
-          await interruptAllDirectThreads(bot.id);
-          // Deletion removes the thread before a late turn.completed can fold
-          // staged provider images into a message, so dispose them here.
-          for (const task of store.tasks(bot.id)) {
-            purgeGeneratedImagesForThread(task.threadId);
-            settleDirectFollowup(directTurnGenerationByThread.get(task.threadId));
-            directTurnGenerationByThread.delete(task.threadId);
-            directTurnBots.delete(task.threadId);
-          }
-          stopScreenPoller(bot.id);
-          activeVpsThreads.delete(bot.id);
-          routines!.disableForBot(bot.id);
-          webhooks.disableForBot(bot.id);
-          calendarCalls!.removeBot(bot.id);
-          lastReply.delete(bot.threadId);
-          // a peer approval naming this bot can never be meaningfully answered
-          // now, and its caller would otherwise wait out the 15-minute timeout
-          cancelPeerApprovalsFor(bot.id);
-          discardDelegations(commsBus, bot.threadId);
-          computerControl.forget(bot.id);
-          computerControlRevision.delete(bot.id);
-          const target = perBotLocalVmTarget(bot.id);
-          localVmIdles.get(target.key)?.cancel();
-          localVmIdles.delete(target.key);
-          store.deleteBot(bot.id);
-          browserLive.closeForBot(bot.id);
-          await forgetTemporaryBrowser(bot.id);
-        } catch (error) {
-          if (browserCleanupRequest) browserCleanup.abort(browserCleanupRequest);
-          throw error;
-        }
-        if (browserCleanupRequest) {
-          const committedCleanup = browserCleanup.commit(browserCleanupRequest);
-          const acknowledged = await browserCleanup.ensure(committedCleanup);
-          requireBrowserCleanupAcknowledged(acknowledged, `Browser data for ${bot.name}`);
-        }
-        for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
-          try {
-            unlinkSync(join(dir, `${bot.threadId}.ndjson`));
-          } catch {}
-        }
-        return json(res, 200, { ok: true });
-      } finally {
-        releaseComputerLifecycle();
-        releasePhoneSecretMutation();
-      }
+      const result = await deleteBotWithLifecycle(m[1]);
+      return json(res, result.status, result.body);
     }
 
     // ── bot skills: imported Agent Skills (SKILL.md) ────────────────────
