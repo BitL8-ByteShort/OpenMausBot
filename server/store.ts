@@ -22,6 +22,7 @@ import { approvalModeFor, isApprovalMode, type ApprovalMode } from "../shared/ap
 import type { MascotBodyId } from "../shared/mascot-bodies.ts";
 import type { QuestionRequestCardData } from "../shared/ask-question.ts";
 import type { ProfileRequestCardData, ProfileRequestChanges } from "../shared/profile-request.ts";
+import type { TeamSetupRequest, TeamSetupResult } from "../shared/team-setup.ts";
 import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { RoutineRunCardData } from "../shared/routine-run.ts";
 import type { SkillRequestCardData } from "../shared/skill-request.ts";
@@ -84,6 +85,7 @@ export interface OptionCardData {
   /** A durable profile-change proposal (propose_profile). The change lands
    * only after this card is explicitly confirmed by the user. */
   profileRequest?: ProfileRequestCardData;
+  teamSetupRequest?: TeamSetupRequest;
   /** A durable learned-skill proposal. The skill stays staged until the
    * user confirms this card — it never rides the prompt before that. */
   skillRequest?: SkillRequestCardData;
@@ -599,6 +601,8 @@ export interface BotRecord {
   soulDrift?: boolean;
   /** Receipt committed with a confirmed profile, for retrying card settlement. */
   lastProfileRequestId?: string;
+  /** Receipt committed with a reviewed team batch; prevents replay after a lost response. */
+  lastTeamSetupReceipt?: { requestId: string; result: TeamSetupResult };
   notifications: boolean;
   color: MausColor;
   mascotExpression?: MausExpression | null;
@@ -1691,10 +1695,89 @@ export class Store {
     return bot;
   }
 
-  deleteBot(id: string): boolean {
+  /** All setup fields and the Chief's receipt commit before publishing any
+   * mutation. Model defaults never rewrite saved thread selections. */
+  applyTeamSetup(request: TeamSetupRequest): TeamSetupResult {
+    const chief = this.bot(request.botId);
+    if (!chief) throw new Error("The requesting Chief no longer exists");
+    if (chief.lastTeamSetupReceipt?.requestId === request.requestId) return chief.lastTeamSetupReceipt.result;
+    const managedSections = [...new Set([...(chief.managedSections ?? []), ...request.newTeams])];
+    if (managedSections.length > 100 || managedSections.some((name) => name.trim() !== name || name.length > 60) ||
+        request.newTeams.some((name) => !name) || (request.newTeams.length && !chief.chiefOfStaff)) throw new Error("Invalid reviewed Chief team scope");
+    const nextBots = [...this.bots];
+    const changed: BotRecord[] = [];
+    for (const operation of request.operations) {
+      const at = nextBots.findIndex((bot) => bot.id === operation.botId);
+      let next: BotRecord;
+      if (operation.action === "create") {
+        if (at >= 0 || !operation.threadId || !operation.fields.name || !operation.fields.modelSelection) throw new Error("Invalid new bot in team setup");
+        const createdAt = Date.now();
+        next = { id: operation.botId, threadId: operation.threadId, name: operation.fields.name,
+          title: "", description: "", soul: "", notifications: true, color: COLORS[nextBots.length % COLORS.length], unread: false,
+          modelSelection: operation.fields.modelSelection, resumeCursors: {}, createdAt, ...operation.fields,
+          approvalMode: "ask", autoApprove: false, composio: false, approvePeerComms: false,
+          tasks: [{ threadId: operation.threadId, title: UNTITLED_THREAD, createdAt, resumeCursors: {},
+            modelSelection: structuredClone(operation.fields.modelSelection), approvalMode: "ask", autoApprove: false,
+            unread: false, activity: "idle", busy: false }],
+        };
+        nextBots.unshift(next);
+      } else {
+        if (at < 0) throw new Error("A setup target no longer exists");
+        const previous = nextBots[at];
+        next = { ...previous, ...operation.fields };
+        if (operation.fields.modelSelection) next.tasks = previous.tasks?.map((task) => ({
+          ...task,
+          modelSelection: structuredClone(task.modelSelection ?? previous.modelSelection),
+          approvalMode: approvalModeFor(this.projectBotForTask(previous.id, task.threadId)!),
+          autoApprove: task.autoApprove ?? previous.autoApprove,
+          alwaysAllow: structuredClone(task.alwaysAllow ?? previous.alwaysAllow ?? []),
+        }));
+        nextBots[at] = next;
+      }
+      next.section = sectionKey(next.section) || undefined;
+      if (operation.fields.soul !== undefined) { next.soulHash = soulHash(operation.fields.soul); next.soulDrift = false; }
+      changed.push(next);
+    }
+    const result: TeamSetupResult = { state: "applied", newTeams: request.newTeams, bots: changed.map((bot, index) => ({
+      id: bot.id, name: bot.name, section: bot.section, modelSelection: structuredClone(bot.modelSelection),
+      action: request.operations[index].action === "create" ? "created" : "updated",
+    })) };
+    const chiefAt = nextBots.findIndex((bot) => bot.id === chief.id);
+    const nextChief = { ...nextBots[chiefAt], lastTeamSetupReceipt: { requestId: request.requestId, result } };
+    // Only the newly-created teams explicitly named in the human review may
+    // extend this Chief's reach. Existing teams require owner settings.
+    if (request.newTeams.length) {
+      nextChief.managedSections = managedSections;
+    }
+    nextBots[chiefAt] = nextChief;
+    this.saveBots(nextBots);
+    this.bots = nextBots;
+    for (const bot of changed) {
+      try { writeSoulMirror(bot.id, bot.soul ?? ""); } catch (error) {
+        console.warn(`[bot-folder] could not refresh reviewed setup mirror for ${bot.id}: ${(error as Error).message}`);
+      }
+      this.emit({ type: "bot", botId: bot.id });
+    }
+    this.emit({ type: "bot", botId: chief.id });
+    return result;
+  }
+
+  deleteBot(id: string, setupRequest?: TeamSetupRequest): boolean {
     const bot = this.bot(id);
     if (!bot) return false;
-    this.bots = this.bots.filter((b) => b.id !== id);
+    let nextBots = this.bots.filter((b) => b.id !== id);
+    if (setupRequest) {
+      const chief = this.bot(setupRequest.botId);
+      if (!chief || chief.id === id || setupRequest.deletion?.botId !== id) throw new Error("The reviewed deletion no longer has a valid owner");
+      const lastTeamSetupReceipt: NonNullable<BotRecord["lastTeamSetupReceipt"]> = { requestId: setupRequest.requestId, result: { state: "applied", newTeams: [], bots: [
+        { id: bot.id, name: bot.name, action: "deleted" },
+      ] } };
+      nextBots = nextBots.map((candidate) => candidate.id === chief.id ? { ...candidate, lastTeamSetupReceipt } : candidate);
+    }
+    // Persist removal and the review receipt before deleting conversation or
+    // workspace data. A failed save must leave the bot recoverable in place.
+    this.saveBots(nextBots);
+    this.bots = nextBots;
     this.legacyActivities.delete(id);
     // every task's transcript goes with the bot, not just the open one
     for (const threadId of new Set([bot.threadId, ...(bot.tasks ?? []).map((t) => t.threadId)])) {
@@ -1715,7 +1798,6 @@ export class Store {
     } catch {}
     // The bot folder (SOUL.md mirror) is the bot's too.
     removeBotFolder(id);
-    this.saveBots();
     this.emit({ type: "bot.deleted", botId: id });
     return true;
   }

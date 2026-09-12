@@ -261,6 +261,7 @@ import {
 } from "./memory-journal.ts";
 import {
   readSectionContext,
+  readSections,
   sectionContextKey,
   sectionContextLabel,
   sectionContextSystemPrompt,
@@ -335,6 +336,8 @@ import { screenFrameHash, screenSurfaceForTool, screenTouchingTool, settledFrame
 import { RoutineRequestService } from "./routine-requests.ts";
 import { buildBotOverview, type BotOverview, connectedAppsFacts } from "./bot-overview.ts";
 import { ProfileRequestService } from "./profile-requests.ts";
+import { TeamSetupError, TeamSetupRequestService } from "./team-setup-requests.ts";
+import type { TeamSetupRequest } from "../shared/team-setup.ts";
 import { profileRevision, profileSnapshot } from "./profile-revision.ts";
 import { flushAllProfileHistory, flushProfileHistory, readHistory, recordProfileChange } from "./profile-versions.ts";
 import { fetchBotDirectory, matchDirectoryBots, type MatchedDirectoryBot } from "./bot-directory.ts";
@@ -989,6 +992,7 @@ function clearDirectTurnDispatch(threadId: string, claimId: string): void {
 function cancelDirectTurnDispatch(botId: string, expectedThreadId?: string): DirectTurnDispatchClaim | null {
   const threadId = expectedThreadId ?? store.bot(botId)?.threadId;
   if (!threadId) return null;
+  cancelTeamSetupResumesForThread(threadId);
   const claim = directTurnDispatchClaims.get(threadId);
   if (!claim || claim.botId !== botId) return null;
   directTurnDispatchClaims.delete(threadId);
@@ -1419,7 +1423,7 @@ const wireTask = ({ resumeCursors: _resumeCursors, lastInstanceId: _lastInstance
   activeCoordinationForThread(task.threadId) && !task.busy ? { ...task, busy: true, activity: "working" as const } : task;
 
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
-  const { resumeCursors: _resumeCursors, tasks, approvalGrant, lastProfileRequestId: _lastProfileRequestId, ...rest } = bot;
+  const { resumeCursors: _resumeCursors, tasks, approvalGrant, lastProfileRequestId: _lastProfileRequestId, lastTeamSetupReceipt: _lastTeamSetupReceipt, ...rest } = bot;
   // An elevated selection is inert until the desktop confirms its exact
   // private reply. Every ordinary client sees the effective Ask state during
   // that two-phase window, never a grant that may still roll back.
@@ -1433,7 +1437,7 @@ const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
 /** The correlated private response carries the requested value so Electron
  * can validate it before sending the confirmation that makes it effective. */
 const wireTrustedApprovalBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
-  const { resumeCursors: _resumeCursors, tasks, approvalGrant: _approvalGrant, lastProfileRequestId: _lastProfileRequestId, ...rest } = bot;
+  const { resumeCursors: _resumeCursors, tasks, approvalGrant: _approvalGrant, lastProfileRequestId: _lastProfileRequestId, lastTeamSetupReceipt: _lastTeamSetupReceipt, ...rest } = bot;
   return { ...rest, avatarUrl: rest.avatarUrl ?? null, ...(tasks ? { tasks: tasks.map(wireTask) } : {}) };
 };
 
@@ -2572,6 +2576,7 @@ function cancelGroupTurnOperations(
     detail: "Stopped by you.",
   },
 ) {
+  cancelTeamSetupResumesForThread(threadId);
   roomHandoffs.cancelRoom(groupId, threadId);
   for (const operation of groupTurnOperations.get(groupId) ?? []) {
     if (operation.threadId !== threadId) continue;
@@ -3069,6 +3074,7 @@ const watchdog = new TurnWatchdog({
         drainQueuedSends();
         drainConnectorResumes();
         drainSecretResumes();
+        drainTeamSetupResumes();
       }
     };
     const release = setTimeout(releaseOwnership, 6_000);
@@ -3862,6 +3868,7 @@ bus.subscribe((event: RuntimeEvent) => {
             drainQueuedSends();
             drainConnectorResumes();
             drainSecretResumes();
+            drainTeamSetupResumes();
             drainDelegationWakes();
           }
         };
@@ -5448,6 +5455,7 @@ async function startTurn(
         drainQueuedSends();
         drainConnectorResumes();
         drainSecretResumes();
+        drainTeamSetupResumes();
         drainDelegationWakes();
       }
     } catch (e) {
@@ -5474,6 +5482,7 @@ async function startTurn(
           drainQueuedSends();
           drainConnectorResumes();
           drainSecretResumes();
+          drainTeamSetupResumes();
           drainDelegationWakes();
         }
         return;
@@ -5509,6 +5518,7 @@ async function startTurn(
       drainQueuedSends();
       drainConnectorResumes();
       drainSecretResumes();
+      drainTeamSetupResumes();
       drainDelegationWakes();
     }
   })();
@@ -5898,6 +5908,198 @@ const routineRequests = new RoutineRequestService({
     return null;
   },
 });
+async function deleteBotWithLifecycle(botId: string, revalidate: () => void = () => {}, setupRequest?: TeamSetupRequest) {
+  const deletionResponse = (status: number, body: { error?: string; ok?: boolean }) => ({ status, body });
+      revalidate();
+      const bot = store.bot(botId);
+      if (!bot) return deletionResponse( 404, { error: "no such bot" });
+      if (computerProviderConfigTransitions.size > 0) {
+        return deletionResponse( 409, { error: "computer provider settings are being updated — wait before deleting this bot" });
+      }
+      if (boxLifecycleBusyBots.has(bot.id)) {
+        return deletionResponse( 409, { error: "wait for this bot's cloud computer action to finish before deleting the bot" });
+      }
+      const activeRoutine = routines!.activeRunForBot(bot.id);
+      if (activeRoutine) {
+        return deletionResponse( 409, {
+          error: "stop this bot's active routine before deleting the bot",
+        });
+      }
+      const activeGroup = activeGroupTurnForBot(bot.id);
+      if (activeGroup) {
+        return deletionResponse( 409, {
+          error: `stop this bot's work in channel ${activeGroup.group.name} before deleting the bot`,
+        });
+      }
+      // A direct turn that has already claimed the bot can provision a Box in
+      // its background setup. Do not let deletion race that work while a Box
+      // account is configured; the person can stop the turn and retry.
+      if ((box.boxConfigured(cfg) || vpsSshAlias(cfg)) && (bot.busy || hasDirectDispatch(bot.id))) {
+        return deletionResponse( 409, { error: "stop this bot's work before checking and deleting its cloud computer" });
+      }
+      const botBoxRecovery = boxCreateRecoverySnapshot().filter((entry) => entry.botId === bot.id);
+      if (botBoxRecovery.some((entry) => !entry.resolved)) {
+        return deletionResponse( 409, {
+          error: "finish reconciling this bot's pending cloud computer creation before deleting it — check ascii.dev, then retry Box setup",
+        });
+      }
+      // Bot deletion awaits VM/browser/provider cleanup. Claim the bot and
+      // every channel it belongs to before that first await so a phone save
+      // cannot begin halfway through teardown (or vice versa). The computer
+      // lifecycle claim is synchronous too, so either both claims are held or
+      // neither survives this request.
+      const releaseComputerLifecycle = claimBotComputerLifecycle(bot.id);
+      const releasePhoneSecretMutation = claimPhoneSecretBotDeletion(bot.id);
+      if (!releasePhoneSecretMutation) {
+        releaseComputerLifecycle();
+        return deletionResponse( 409, { error: "this bot or one of its channels is securely saving a credential" });
+      }
+      try {
+        if (localVmMode(cfg) === "per-bot") {
+          const target = perBotLocalVmTarget(bot.id);
+          if (localVmActiveThreads.has(target.key) || localVmLifecycleBusy.has(target.key)) {
+            return deletionResponse( 409, { error: "stop this bot's Local VM turn or setup action before deleting the bot" });
+          }
+          const vm = await containerComputerStatus(undefined, undefined, target);
+          if (!vm.daemonUp && existsSync(target.workspaceDir)) {
+            return deletionResponse( 409, {
+              error: "start the container runtime and delete this bot's Local VM before deleting the bot",
+            });
+          }
+          if (vm.container !== "missing") {
+            return deletionResponse( 409, { error: "delete this bot's Local VM from its Computer panel before deleting the bot" });
+          }
+        }
+        // VPS containers are also durable and may outlive a destination or
+        // backend switch. Keep the bot as the discoverable owner until the
+        // person explicitly removes that container from Settings.
+        const vpsInventory = await vps.listManagedVpsComputers(cfg, managedBoxOwners());
+        if (vpsInventory.configured && !vpsInventory.available) {
+          return deletionResponse( 503, {
+            error: `${vpsInventory.problem ?? "VPS computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
+          });
+        }
+        if (vpsInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
+          return deletionResponse( 409, {
+            error: "remove this bot's VPS computer from Settings → Computers before deleting the bot",
+          });
+        }
+        // LIST is eventually consistent, and a remembered Box may also have
+        // been renamed outside OpenMausBot. The create journal is stronger
+        // ownership evidence: inspect every durable id directly before the bot
+        // record that makes it discoverable can be removed. Missing credentials
+        // or an unavailable provider must fail closed.
+        for (const recovery of botBoxRecovery) {
+          if (!recovery.boxId) {
+            return deletionResponse( 409, {
+              error: "finish reconciling this bot's pending cloud computer creation before deleting it",
+            });
+          }
+          const inspected = await box.inspectBoxIdentity(cfg, recovery.boxId);
+          if (!inspected.available) {
+            return deletionResponse( 503, {
+              error: `${inspected.problem ?? "a remembered cloud computer could not be verified"}. Restore its Box account before deleting this bot`,
+            });
+          }
+          if (inspected.identity) {
+            return deletionResponse( 409, {
+              error: "delete this bot's remembered cloud computer from Settings → Computers before deleting the bot",
+            });
+          }
+          // A direct 404/410 is authoritative even while account LIST catches
+          // up. Retire only this exact provider identity, then continue looking
+          // for any older name-based resource the journal never recorded.
+          retireDeletedBoxCreate(recovery.boxId);
+        }
+        // A Box survives destination/backend changes and contains browser
+        // sessions and files. Resolve ownership from a fresh provider listing;
+        // deleting the bot first would make that durable machine look orphaned.
+        const cloudInventory = await box.listManagedBoxes(cfg, managedBoxOwners());
+        if (cloudInventory.configured && !cloudInventory.available) {
+          return deletionResponse( 503, {
+            error: `${cloudInventory.problem ?? "cloud computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
+          });
+        }
+        if (cloudInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
+          return deletionResponse( 409, {
+            error: "delete this bot's cloud computer from Settings → Computers before deleting the bot",
+          });
+        }
+        // Establish a durable cleanup intent before any teardown. A malformed
+        // or unreadable journal therefore rejects the delete with the bot and
+        // all of its live work untouched. The intent is aborted if a later
+        // pre-delete side effect fails, and committed only after Store deletion.
+        revalidate();
+        const browserCleanupRequest = browserCleanup.prepare("bot", bot.id);
+        try {
+          // a running turn dies with its bot
+          // Invalidate every bot-callable bearer before the first asynchronous
+          // teardown step. A request that already passed its initial header
+          // check is revalidated after its body arrives and must fail closed.
+          for (const entry of pendingTeamSetupResumes.values()) {
+            if (entry.request.botId === bot.id) cancelTeamSetupResumesForThread(entry.request.threadId);
+          }
+          for (const task of store.tasks(bot.id)) {
+            cancelTeamSetupResumesForThread(task.threadId);
+            revokeInternalCapabilitiesForThread(task.threadId);
+          }
+          await interruptAllDirectThreads(bot.id);
+          revalidate();
+          // Deletion removes the thread before a late turn.completed can fold
+          // staged provider images into a message, so dispose them here.
+          for (const task of store.tasks(bot.id)) {
+            purgeGeneratedImagesForThread(task.threadId);
+            settleDirectFollowup(directTurnGenerationByThread.get(task.threadId));
+            directTurnGenerationByThread.delete(task.threadId);
+            directTurnBots.delete(task.threadId);
+          }
+          stopScreenPoller(bot.id);
+          activeVpsThreads.delete(bot.id);
+          lastReply.delete(bot.threadId);
+          // a peer approval naming this bot can never be meaningfully answered
+          // now, and its caller would otherwise wait out the 15-minute timeout
+          cancelPeerApprovalsFor(bot.id);
+          discardDelegations(commsBus, bot.threadId);
+          computerControl.forget(bot.id);
+          computerControlRevision.delete(bot.id);
+          const target = perBotLocalVmTarget(bot.id);
+          localVmIdles.get(target.key)?.cancel();
+          localVmIdles.delete(target.key);
+          store.deleteBot(bot.id, setupRequest);
+          // Removing schedules is not a security revocation. Keep them intact
+          // if the bot/receipt write fails, so a failed deletion is retryable.
+          routines!.disableForBot(bot.id);
+          webhooks.disableForBot(bot.id);
+          calendarCalls!.removeBot(bot.id);
+          browserLive.closeForBot(bot.id);
+          await forgetTemporaryBrowser(bot.id);
+        } catch (error) {
+          if (browserCleanupRequest) {
+            // Store removal is already durable once the in-memory owner is
+            // gone. A later cleanup error must retain its browser erasure
+            // intent for retry instead of aborting a completed deletion.
+            if (store.bot(bot.id)) browserCleanup.abort(browserCleanupRequest);
+            else browserCleanup.commit(browserCleanupRequest);
+          }
+          throw error;
+        }
+        if (browserCleanupRequest) {
+          const committedCleanup = browserCleanup.commit(browserCleanupRequest);
+          const acknowledged = await browserCleanup.ensure(committedCleanup);
+          requireBrowserCleanupAcknowledged(acknowledged, `Browser data for ${bot.name}`);
+        }
+        for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
+          try {
+            unlinkSync(join(dir, `${bot.threadId}.ndjson`));
+          } catch {}
+        }
+        return deletionResponse( 200, { ok: true });
+      } finally {
+        releaseComputerLifecycle();
+        releasePhoneSecretMutation();
+      }
+}
+
 const profileRequests = new ProfileRequestService({
   store,
   canPersist: proposalPersistence,
@@ -5911,6 +6113,107 @@ const profileRequests = new ProfileRequestService({
     return null;
   },
 });
+const teamSetupTeams = () => [...new Set(["", ...readSections(), ...store.bots.map((bot) => sectionKey(bot.section)), ...store.groups.map((group) => sectionKey(group.section))])];
+const teamSetupRequests = new TeamSetupRequestService({
+  store, teams: teamSetupTeams, canAccessTeam, canPersist: proposalPersistence, maxBots: MAX_WORKSPACE_BOTS,
+  ownsThread: (botId, threadId) => Boolean(connectorThread(botId, threadId)),
+  targetBusy: (botId) => Boolean(store.bot(botId)?.busy || hasDirectDispatch(botId) || activeGroupTurnForBot(botId) || routines?.activeRunForBot(botId)),
+  validateModel: (selection, current) => {
+    const checked = checkedModelSelection(selection, undefined, true);
+    if (!checked.ok) return checked.error;
+    if (current?.approvalGrant) return "Wait for the approval-level confirmation before changing this bot's model";
+    if (current) {
+      const mode = approvalModeFor(current);
+      const driver = registry.cliTarget(selection.instanceId)?.driverKind;
+      if (!supportsApprovalMode(driver, mode) || ((mode === "full" || mode === "custom") && driver !== registry.cliTarget(current.modelSelection.instanceId)?.driverKind)) {
+        return `@${current.name}'s existing permissions are incompatible with that provider. Change its permissions in bot settings, then propose the model change again.`;
+      }
+    }
+    return null;
+  },
+  deleteBot: async (botId, revalidate, request) => {
+    const result = await deleteBotWithLifecycle(botId, revalidate, request);
+    if (result.status >= 400) throw new TeamSetupError(result.body.error ?? "The bot could not be deleted", result.status);
+  },
+});
+
+type TeamSetupResumeEntry = { request: TeamSetupRequest; messageId: string; generation: number };
+const pendingTeamSetupResumes = new Map<string, TeamSetupResumeEntry>();
+const teamSetupResumeGenerations = new Map<string, number>();
+function cancelTeamSetupResumesForThread(threadId: string): void {
+  // Invalidate before provider teardown can synchronously drain the queue.
+  // The generation also prevents an in-flight dispatch failure requeueing
+  // its old entry after Stop or deletion has already cancelled it.
+  teamSetupResumeGenerations.set(threadId, (teamSetupResumeGenerations.get(threadId) ?? 0) + 1);
+  for (const [key, entry] of pendingTeamSetupResumes) {
+    if (entry.request.threadId === threadId) pendingTeamSetupResumes.delete(key);
+  }
+}
+function dispatchTeamSetupResume(entry: TeamSetupResumeEntry): void {
+  const { request, messageId } = entry;
+  const cancelled = () => entry.generation !== (teamSetupResumeGenerations.get(request.threadId) ?? 0);
+  if (cancelled()) return;
+  const owner = connectorThread(request.botId, request.threadId);
+  const message = store.messagesFor(request.threadId).find((item) => item.id === messageId);
+  if (!owner || !message?.card?.teamSetupRequest?.result) return;
+  if (owner.group ? owner.bot.busy : threadBusy(request.botId, request.threadId) || activeGroupTurnForBot(request.botId)) {
+    pendingTeamSetupResumes.set(request.requestId, entry);
+    return;
+  }
+  const prompt = `OpenMausBot team setup decision ${request.requestId}: ${JSON.stringify(request.result)}. Report this exact result and continue the user's already requested work. Do not ask for confirmation again or repeat this setup/deletion. A denied or cancelled operation did not authorize any substitute action. Existing thread models were not changed.`;
+  const failed = (error: string) => {
+    if (cancelled()) return;
+    const current = store.messagesFor(request.threadId).find((item) => item.id === messageId);
+    if (current?.card) store.patchMessage(request.threadId, messageId, { card: { ...current.card, held: `The decision was recorded, but the Chief could not continue: ${redactSecretsInText(error).slice(0, 300)}` } });
+  };
+  if (owner.group) {
+    const groupId = owner.group.id;
+    const operation = beginGroupTurnOperation(groupId, request.threadId, [request.botId]);
+    const previous = groupQueues.get(groupId) ?? Promise.resolve();
+    const next = previous.then(async () => {
+      if (operation.cancelled || cancelled()) return;
+      const current = connectorThread(request.botId, request.threadId);
+      if (!current?.group) return;
+      if (current.bot.busy) { pendingTeamSetupResumes.set(request.requestId, entry); return; }
+      await runGroupMemberTurn(groupId, request.threadId, request.botId, 0, new Set(), prompt, failed,
+        () => operation.cancelled, () => groupProviderHandshakeStarted(operation), () => groupProviderHandshakeSettled(operation));
+    });
+    groupQueues.set(groupId, next.finally(() => finishGroupTurnOperation(groupId, operation)).catch((error) => failed(error instanceof Error ? error.message : String(error))));
+    return;
+  }
+  void startTurn(request.botId, prompt, { threadId: request.threadId, cardContinuation: true, onDispatchError: failed }).catch((error) => {
+    if (cancelled()) return;
+    if (isTurnAdmissionBlocked(error)) pendingTeamSetupResumes.set(request.requestId, entry);
+    else failed(error instanceof Error ? error.message : String(error));
+  });
+}
+function drainTeamSetupResumes(): void {
+  for (const [key, entry] of pendingTeamSetupResumes) {
+    const owner = connectorThread(entry.request.botId, entry.request.threadId);
+    if (owner?.group ? owner.bot.busy : threadBusy(entry.request.botId, entry.request.threadId) || activeGroupTurnForBot(entry.request.botId)) continue;
+    pendingTeamSetupResumes.delete(key);
+    dispatchTeamSetupResume(entry);
+  }
+}
+async function resolveAndSendTeamSetup(res: ServerResponse, args: { botId: string; threadId: string; requestId: string; behavior: string }, ownerReview: boolean): Promise<boolean> {
+  const card = store.messagesFor(args.threadId).find((item) => item.card?.requestId === args.requestId && item.card.teamSetupRequest)?.card;
+  if (!card) return false;
+  if (args.behavior === "allow" && !ownerReview) { json(res, 403, { error: "Approve team setup or deletion from the desktop app or a paired owner device. In a local browser, wait until every bot is idle." }); return true; }
+  const resumeGeneration = teamSetupResumeGenerations.get(args.threadId) ?? 0;
+  const resolved = await teamSetupRequests.resolve(args);
+  if (!resolved) return false;
+  if (!resolved.duplicate) {
+    appendDecision(DATA_DIR, { threadId: args.threadId, requestId: args.requestId, botId: args.botId, tool: card.tool,
+      summary: card.subtitle, decision: resolved.result.state === "applied" ? "user-approved" : "user-denied", source: "user" });
+  }
+  const current = store.messagesFor(args.threadId).find((item) => item.id === resolved.messageId);
+  if (current?.card?.teamSetupRequest?.result && !current.card.teamSetupRequest.resumed) {
+    store.patchMessage(args.threadId, current.id, { card: { ...current.card, teamSetupRequest: { ...current.card.teamSetupRequest, resumed: true } } });
+    dispatchTeamSetupResume({ request: resolved.request, messageId: resolved.messageId, generation: resumeGeneration });
+  }
+  json(res, 200, { ok: true, outcome: resolved.result.state === "applied" ? "allowed-once" : "rejected", result: resolved.result, alreadySettled: resolved.duplicate });
+  return true;
+}
 const ROUTINE_WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
 const routineTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const routineTimestamp = (value: number | undefined) =>
@@ -6786,6 +7089,7 @@ async function runGroupMemberTurn(
     drainQueuedSends();
     drainConnectorResumes();
     drainSecretResumes();
+    drainTeamSetupResumes();
     return false;
   }
   if (outcome === "timed_out") {
@@ -6814,6 +7118,7 @@ async function runGroupMemberTurn(
         drainQueuedSends();
         drainConnectorResumes();
         drainSecretResumes();
+        drainTeamSetupResumes();
       }
     };
     const release = setTimeout(releaseOwnership, 6_000);
@@ -6839,6 +7144,7 @@ async function runGroupMemberTurn(
     drainQueuedSends();
     drainConnectorResumes();
     drainSecretResumes();
+    drainTeamSetupResumes();
   }
   if (outcome === "provider_failed") {
     if (skillAuthoring) skillAuthoringClaim.claimed = false;
@@ -6945,6 +7251,7 @@ async function runGroupMemberTurn(
       drainQueuedSends();
       drainConnectorResumes();
       drainSecretResumes();
+      drainTeamSetupResumes();
     }
   }
 }
@@ -7664,7 +7971,7 @@ function proposalPersistence(botId: string, threadId: string) {
   // one thread cannot pile up 8 of each.
   const openRequests = store.activePath(threadId).filter(
     (message) =>
-      (message.card?.routineRequest?.botId === botId || message.card?.profileRequest?.botId === botId) &&
+      (message.card?.routineRequest?.botId === botId || message.card?.profileRequest?.botId === botId || message.card?.teamSetupRequest?.botId === botId) &&
       !message.card.answered &&
       !message.card.dismissed,
   ).length;
@@ -8316,6 +8623,7 @@ bus.subscribe((event: RuntimeEvent) => {
   if (event.type === "turn.completed") {
     drainConnectorResumes();
     drainSecretResumes();
+    drainTeamSetupResumes();
   }
 });
 
@@ -8666,6 +8974,7 @@ async function reloadProviders() {
   drainQueuedSends();
   drainConnectorResumes();
   drainSecretResumes();
+  drainTeamSetupResumes();
 }
 
 // Config writes rebuild the whole provider registry. Keep the read-modify-write
@@ -9434,6 +9743,46 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           threadId: body.fromThreadId, requestId: proposed.requestId, botId: from.id, botName: from.name,
           tool: "update_profile", summary: proposed.detail, decision: "card-shown", source: "profile",
         });
+        return json(res, 201, proposed);
+      }
+      if (method === "GET" && path === "/api/internal/team-setup-catalog") {
+        let chief = store.bot(internalCapability.botId)!;
+        if (!chief.chiefOfStaff || chief.hidden) return json(res, 403, { error: "Only an active Chief may plan team setup" });
+        const instances = await registry.describe();
+        requireActiveInternalCapability();
+        chief = store.bot(internalCapability.botId)!;
+        if (!chief.chiefOfStaff || chief.hidden) return json(res, 403, { error: "Only an active Chief may plan team setup" });
+        return json(res, 200, {
+          teams: teamSetupTeams().filter((name) => canAccessTeam(chief, name)),
+          bots: store.bots.filter((bot) => !bot.hidden && canAccessTeam(chief, bot.section) && (bot.id === chief.id || peerAllowed(chief, bot.id)))
+            .map((bot) => ({ id: bot.id, name: bot.name, title: bot.title, section: bot.section ?? "", modelSelection: bot.modelSelection })),
+          instances: instances.map((instance) => ({ instanceId: instance.instanceId, driverKind: instance.driverKind, displayName: instance.displayName,
+            state: instance.snapshot.state, models: instance.models, effortLevels: instance.capabilities?.effortLevels ?? [] })),
+          scope: "Bot model defaults apply to groups and new threads; existing threads retain their models. New teams require explicit approval of their names and this Chief's access.",
+        });
+      }
+      if (method === "POST" && path === "/api/internal/team-setup-requests") {
+        const parsed = z.object({ fromBotId: z.string().optional(), fromThreadId: z.string().optional(), plan: z.unknown() }).strict().safeParse(await readInternalBody());
+        if (!parsed.success) return json(res, 400, { error: "Invalid team setup request" });
+        const chief = store.bot(internalCapability.botId)!;
+        const owner = connectorThread(chief.id, internalCapability.threadId);
+        if (!owner) return json(res, 403, { error: "Source conversation no longer belongs to the Chief" });
+        const proposed = teamSetupRequests.propose({ botId: chief.id, threadId: internalCapability.threadId, plan: parsed.data.plan,
+          ...(owner.group ? { from: { botId: chief.id, name: chief.name, color: chief.color } } : {}) });
+        appendDecision(DATA_DIR, { threadId: internalCapability.threadId, requestId: proposed.requestId, botId: chief.id,
+          tool: "set_up_team", summary: proposed.detail, decision: "card-shown", source: "profile" });
+        return json(res, 201, proposed);
+      }
+      if (method === "POST" && path === "/api/internal/bot-deletion-requests") {
+        const parsed = z.object({ fromBotId: z.string().optional(), fromThreadId: z.string().optional(), targetBotId: z.string().min(1), reason: z.string().trim().min(1).max(500) }).strict().safeParse(await readInternalBody());
+        if (!parsed.success) return json(res, 400, { error: "An exact bot id and deletion reason are required" });
+        const chief = store.bot(internalCapability.botId)!;
+        const owner = connectorThread(chief.id, internalCapability.threadId);
+        if (!owner) return json(res, 403, { error: "Source conversation no longer belongs to the Chief" });
+        const proposed = teamSetupRequests.proposeDeletion({ botId: chief.id, threadId: internalCapability.threadId, targetBotId: parsed.data.targetBotId, reason: parsed.data.reason,
+          ...(owner.group ? { from: { botId: chief.id, name: chief.name, color: chief.color } } : {}) });
+        appendDecision(DATA_DIR, { threadId: internalCapability.threadId, requestId: proposed.requestId, botId: chief.id,
+          tool: "delete_bot", summary: proposed.detail, decision: "card-shown", source: "profile" });
         return json(res, 201, proposed);
       }
       // session_search: ranked recall over the calling bot's OWN threads,
@@ -11640,6 +11989,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!store.groupTaskByThread(group.id, m[2])) return json(res, 404, { error: "no such channel task" });
       const stagedSkillCleanups = stagedSkillCleanupsForThread(m[2]);
       lastReply.delete(m[2]);
+      cancelTeamSetupResumesForThread(m[2]);
       const updated = store.deleteGroupTask(group.id, m[2]);
       if (!updated) return json(res, 400, { error: "a channel keeps at least one task" });
       rejectDeletedThreadSkillStages(stagedSkillCleanups);
@@ -11677,7 +12027,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const threadIds = new Set([group.threadId, ...(group.tasks ?? []).map((task) => task.threadId)]);
       const stagedSkillCleanups = [...threadIds].flatMap(stagedSkillCleanupsForThread);
-      for (const threadId of threadIds) lastReply.delete(threadId);
+      for (const threadId of threadIds) {
+        cancelTeamSetupResumesForThread(threadId);
+        lastReply.delete(threadId);
+      }
       routines!.disableForGroup(group.id);
       store.deleteGroup(group.id);
       rejectDeletedThreadSkillStages(stagedSkillCleanups);
@@ -12577,177 +12930,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     m = path.match(/^\/api\/bots\/([\w-]+)$/);
     if (m && method === "DELETE") {
-      const bot = store.bot(m[1]);
-      if (!bot) return json(res, 404, { error: "no such bot" });
-      if (computerProviderConfigTransitions.size > 0) {
-        return json(res, 409, { error: "computer provider settings are being updated — wait before deleting this bot" });
-      }
-      if (boxLifecycleBusyBots.has(bot.id)) {
-        return json(res, 409, { error: "wait for this bot's cloud computer action to finish before deleting the bot" });
-      }
-      const activeRoutine = routines!.activeRunForBot(bot.id);
-      if (activeRoutine) {
-        return json(res, 409, {
-          error: "stop this bot's active routine before deleting the bot",
-        });
-      }
-      const activeGroup = activeGroupTurnForBot(bot.id);
-      if (activeGroup) {
-        return json(res, 409, {
-          error: `stop this bot's work in channel ${activeGroup.group.name} before deleting the bot`,
-        });
-      }
-      // A direct turn that has already claimed the bot can provision a Box in
-      // its background setup. Do not let deletion race that work while a Box
-      // account is configured; the person can stop the turn and retry.
-      if ((box.boxConfigured(cfg) || vpsSshAlias(cfg)) && (bot.busy || hasDirectDispatch(bot.id))) {
-        return json(res, 409, { error: "stop this bot's work before checking and deleting its cloud computer" });
-      }
-      const botBoxRecovery = boxCreateRecoverySnapshot().filter((entry) => entry.botId === bot.id);
-      if (botBoxRecovery.some((entry) => !entry.resolved)) {
-        return json(res, 409, {
-          error: "finish reconciling this bot's pending cloud computer creation before deleting it — check ascii.dev, then retry Box setup",
-        });
-      }
-      // Bot deletion awaits VM/browser/provider cleanup. Claim the bot and
-      // every channel it belongs to before that first await so a phone save
-      // cannot begin halfway through teardown (or vice versa). The computer
-      // lifecycle claim is synchronous too, so either both claims are held or
-      // neither survives this request.
-      const releaseComputerLifecycle = claimBotComputerLifecycle(bot.id);
-      const releasePhoneSecretMutation = claimPhoneSecretBotDeletion(bot.id);
-      if (!releasePhoneSecretMutation) {
-        releaseComputerLifecycle();
-        return json(res, 409, { error: "this bot or one of its channels is securely saving a credential" });
-      }
-      try {
-        if (localVmMode(cfg) === "per-bot") {
-          const target = perBotLocalVmTarget(bot.id);
-          if (localVmActiveThreads.has(target.key) || localVmLifecycleBusy.has(target.key)) {
-            return json(res, 409, { error: "stop this bot's Local VM turn or setup action before deleting the bot" });
-          }
-          const vm = await containerComputerStatus(undefined, undefined, target);
-          if (!vm.daemonUp && existsSync(target.workspaceDir)) {
-            return json(res, 409, {
-              error: "start the container runtime and delete this bot's Local VM before deleting the bot",
-            });
-          }
-          if (vm.container !== "missing") {
-            return json(res, 409, { error: "delete this bot's Local VM from its Computer panel before deleting the bot" });
-          }
-        }
-        // VPS containers are also durable and may outlive a destination or
-        // backend switch. Keep the bot as the discoverable owner until the
-        // person explicitly removes that container from Settings.
-        const vpsInventory = await vps.listManagedVpsComputers(cfg, managedBoxOwners());
-        if (vpsInventory.configured && !vpsInventory.available) {
-          return json(res, 503, {
-            error: `${vpsInventory.problem ?? "VPS computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
-          });
-        }
-        if (vpsInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
-          return json(res, 409, {
-            error: "remove this bot's VPS computer from Settings → Computers before deleting the bot",
-          });
-        }
-        // LIST is eventually consistent, and a remembered Box may also have
-        // been renamed outside OpenMausBot. The create journal is stronger
-        // ownership evidence: inspect every durable id directly before the bot
-        // record that makes it discoverable can be removed. Missing credentials
-        // or an unavailable provider must fail closed.
-        for (const recovery of botBoxRecovery) {
-          if (!recovery.boxId) {
-            return json(res, 409, {
-              error: "finish reconciling this bot's pending cloud computer creation before deleting it",
-            });
-          }
-          const inspected = await box.inspectBoxIdentity(cfg, recovery.boxId);
-          if (!inspected.available) {
-            return json(res, 503, {
-              error: `${inspected.problem ?? "a remembered cloud computer could not be verified"}. Restore its Box account before deleting this bot`,
-            });
-          }
-          if (inspected.identity) {
-            return json(res, 409, {
-              error: "delete this bot's remembered cloud computer from Settings → Computers before deleting the bot",
-            });
-          }
-          // A direct 404/410 is authoritative even while account LIST catches
-          // up. Retire only this exact provider identity, then continue looking
-          // for any older name-based resource the journal never recorded.
-          retireDeletedBoxCreate(recovery.boxId);
-        }
-        // A Box survives destination/backend changes and contains browser
-        // sessions and files. Resolve ownership from a fresh provider listing;
-        // deleting the bot first would make that durable machine look orphaned.
-        const cloudInventory = await box.listManagedBoxes(cfg, managedBoxOwners());
-        if (cloudInventory.configured && !cloudInventory.available) {
-          return json(res, 503, {
-            error: `${cloudInventory.problem ?? "cloud computer inventory is unavailable"}. Refresh Settings → Computers before deleting this bot`,
-          });
-        }
-        if (cloudInventory.instances.some((instance) => instance.ownerBotId === bot.id)) {
-          return json(res, 409, {
-            error: "delete this bot's cloud computer from Settings → Computers before deleting the bot",
-          });
-        }
-        // Establish a durable cleanup intent before any teardown. A malformed
-        // or unreadable journal therefore rejects the delete with the bot and
-        // all of its live work untouched. The intent is aborted if a later
-        // pre-delete side effect fails, and committed only after Store deletion.
-        const browserCleanupRequest = browserCleanup.prepare("bot", bot.id);
-        try {
-          // a running turn dies with its bot
-          // Invalidate every bot-callable bearer before the first asynchronous
-          // teardown step. A request that already passed its initial header
-          // check is revalidated after its body arrives and must fail closed.
-          for (const task of store.tasks(bot.id)) revokeInternalCapabilitiesForThread(task.threadId);
-          await interruptAllDirectThreads(bot.id);
-          // Deletion removes the thread before a late turn.completed can fold
-          // staged provider images into a message, so dispose them here.
-          for (const task of store.tasks(bot.id)) {
-            purgeGeneratedImagesForThread(task.threadId);
-            settleDirectFollowup(directTurnGenerationByThread.get(task.threadId));
-            directTurnGenerationByThread.delete(task.threadId);
-            directTurnBots.delete(task.threadId);
-          }
-          stopScreenPoller(bot.id);
-          activeVpsThreads.delete(bot.id);
-          routines!.disableForBot(bot.id);
-          webhooks.disableForBot(bot.id);
-          calendarCalls!.removeBot(bot.id);
-          lastReply.delete(bot.threadId);
-          // a peer approval naming this bot can never be meaningfully answered
-          // now, and its caller would otherwise wait out the 15-minute timeout
-          cancelPeerApprovalsFor(bot.id);
-          discardDelegations(commsBus, bot.threadId);
-          computerControl.forget(bot.id);
-          computerControlRevision.delete(bot.id);
-          const target = perBotLocalVmTarget(bot.id);
-          localVmIdles.get(target.key)?.cancel();
-          localVmIdles.delete(target.key);
-          store.deleteBot(bot.id);
-          browserLive.closeForBot(bot.id);
-          await forgetTemporaryBrowser(bot.id);
-        } catch (error) {
-          if (browserCleanupRequest) browserCleanup.abort(browserCleanupRequest);
-          throw error;
-        }
-        if (browserCleanupRequest) {
-          const committedCleanup = browserCleanup.commit(browserCleanupRequest);
-          const acknowledged = await browserCleanup.ensure(committedCleanup);
-          requireBrowserCleanupAcknowledged(acknowledged, `Browser data for ${bot.name}`);
-        }
-        for (const dir of [EVENTS_DIR, NATIVE_DIR]) {
-          try {
-            unlinkSync(join(dir, `${bot.threadId}.ndjson`));
-          } catch {}
-        }
-        return json(res, 200, { ok: true });
-      } finally {
-        releaseComputerLifecycle();
-        releasePhoneSecretMutation();
-      }
+      const result = await deleteBotWithLifecycle(m[1]);
+      return json(res, result.status, result.body);
     }
 
     // ── bot skills: imported Agent Skills (SKILL.md) ────────────────────
@@ -13372,6 +13556,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const behavior = requestBehavior(body.behavior);
       const reviewedSha256 = typeof body.reviewedSha256 === "string" ? body.reviewedSha256 : undefined;
       if (!behavior) return json(res, 400, { error: "behavior must be allow, deny, or answer" });
+      if (await resolveAndSendTeamSetup(res, {
+        botId: bot.id, threadId: bot.threadId, requestId: String(body.requestId), behavior,
+      }, auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) && !store.bots.some((bot) => bot.busy || activeGroupTurnForBot(bot.id)) : auth.scopes.includes("admin"))) return;
       if (resolveAndSendRoutine(res, {
         botId: bot.id,
         botName: bot.name,
@@ -13448,6 +13635,13 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           requestId,
           behavior,
         })) return;
+      }
+      const setupCard = store.messagesFor(threadId).find((message) => message.card?.requestId === requestId && message.card.teamSetupRequest);
+      if (setupCard) {
+        const setupBotId = setupCard.from?.botId ?? store.botByThread(threadId)?.id;
+        if (!setupBotId) return json(res, 400, { error: "This team setup has no valid owner" });
+        if (await resolveAndSendTeamSetup(res, { botId: setupBotId, threadId, requestId, behavior },
+          auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) && !store.bots.some((bot) => bot.busy || activeGroupTurnForBot(bot.id)) : auth.scopes.includes("admin"))) return;
       }
       const profileCard = store.messagesFor(threadId).find(
         (message) => message.card?.requestId === requestId && message.card.profileRequest,
@@ -13733,6 +13927,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       }
       const stagedSkillCleanups = stagedSkillCleanupsForThread(m[2]);
       roomHandoffs.cancelDirect(m[2], "The source conversation was deleted");
+      cancelTeamSetupResumesForThread(m[2]);
       const updated = store.deleteTask(m[1], m[2]);
       if (!updated) return json(res, 404, { error: "no such task" });
       settleDirectFollowup(directTurnGenerationByThread.get(m[2]));
@@ -14827,6 +15022,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             drainDelegationWakes();
             drainConnectorResumes();
             drainSecretResumes();
+            drainTeamSetupResumes();
           }
           if (mandatoryError) throw mandatoryError;
           return status;

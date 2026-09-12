@@ -500,6 +500,45 @@ const TOOLS = [
     },
   },
   {
+    name: "list_team_setup",
+    description: "Chief of Staff only: list authorized teams, teammate IDs, and exact engine/model choices for team setup. Call before proposing configuration; never invent model IDs. Existing thread models are independent of bot defaults.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+  },
+  {
+    name: "propose_team_setup",
+    description: "Chief of Staff only: propose all requested specialist creation, profile/model configuration, and authorized team moves in ONE combined review card. Nothing changes until the user applies it. Use exact catalog engine/model IDs from list_team_setup. Combine all fields for each bot; use the same create key or botId to coalesce repeated entries. New teams must be named explicitly in newTeams and have a specialist in this plan; the card also asks to authorize your access to just those new teams. Existing unauthorized teams cannot be included. Models change bot defaults for groups/new threads; existing threads and execution permissions stay unchanged. After proposing, end your turn. The decision and structured result automatically resume you once; do not ask again, poll, or repeat the proposal.",
+    inputSchema: {
+      type: "object", additionalProperties: false,
+      properties: {
+        reason: { type: "string", minLength: 1, maxLength: 500 },
+        newTeams: { type: "array", maxItems: 8, items: { type: "string", minLength: 1, maxLength: 60 } },
+        operations: { type: "array", minItems: 1, maxItems: 24, items: {
+          type: "object", additionalProperties: false,
+          properties: {
+            action: { type: "string", enum: ["create", "update"] },
+            key: { type: "string", description: "For create: your stable short name for this new bot in this plan." },
+            botId: { type: "string", description: "For update: exact existing bot ID from list_team_setup." },
+            fields: { type: "object", additionalProperties: false, properties: {
+              name: { type: "string", maxLength: 100 }, title: { type: "string", maxLength: 200 },
+              description: { type: "string", maxLength: 4000 }, soul: { type: "string", description: "Standing instructions; required with name/title/modelSelection for every new bot." },
+              section: { type: "string", maxLength: 60, description: "Exact authorized existing team, or a team explicitly named in newTeams. Empty string means General." },
+              modelSelection: { type: "object", additionalProperties: false, properties: {
+                instanceId: { type: "string" }, model: { type: "string" }, effort: { type: "string" },
+              }, required: ["instanceId", "model"] },
+            } },
+          }, required: ["action", "fields"],
+        } },
+      }, required: ["reason", "operations"],
+    },
+  },
+  {
+    name: "propose_bot_deletion",
+    description: "Chief of Staff only: when the user explicitly asks to delete a named teammate, create a separate confirmation card for that exact bot. Deletion removes its conversations, memory, instructions and skills; generated project files remain. Running work and owned computers can block deletion. Never delete yourself, substitute an archive, or put deletion into a setup batch. End your turn after proposing; the decision and result resume you once.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {
+      bot_id: { type: "string", minLength: 1 }, reason: { type: "string", minLength: 1, maxLength: 500 },
+    }, required: ["bot_id", "reason"] },
+  },
+  {
     name: "create_room",
     description:
       "Create a room in your own section when the user asks for one (maximum four per turn). Chiefs only. Choose active peers from list_bots; you are included automatically as the default responder. This creates no turns or messages. Section moves stay with the user. If peer approval is enabled, ask the user to make the room change instead.",
@@ -1122,6 +1161,18 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     return {
       text: `${opened}${timing}${approval} Its result will be delivered to this conversation automatically (delegation id: ${delegationId || "unknown"}). Acknowledge it, mention it to the person as #${threadTitle}, and finish your turn; do not check or wait for it in this turn.`,
     };
+  }
+  if (name === "list_team_setup") {
+    return { text: JSON.stringify(await api("/api/internal/team-setup-catalog")) };
+  }
+  if (name === "propose_team_setup" || name === "propose_bot_deletion") {
+    const deleting = name === "propose_bot_deletion";
+    const result = await api(deleting ? "/api/internal/bot-deletion-requests" : "/api/internal/team-setup-requests", {
+      method: "POST", body: JSON.stringify({ fromBotId: BOT_ID, fromThreadId: THREAD_ID,
+        ...(deleting ? { targetBotId: args.bot_id, reason: args.reason } : { plan: args }),
+      }),
+    });
+    return { text: `One review card is visible: ${String(result.title)}. Nothing has been applied. End this turn; the decision and structured result resume you automatically once. Do not ask again, poll, or repeat this proposal.` };
   }
   if (name === "create_bot") {
     const botName = String(args.name ?? "").trim();
