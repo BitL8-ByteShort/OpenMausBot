@@ -1,11 +1,13 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
 import { launchVerificationServer, runControlOmb } from "../scripts/control-omb.ts";
 import { request } from "../scripts/mcp-server.ts";
+import { removeTempDir } from "./testing/cleanup.ts";
 
-async function fixture(test: (f: any) => Promise<void>) {
-  const session = await launchVerificationServer(process.env, undefined, undefined, undefined, undefined, { scripted: true });
+async function fixture(test: (f: any) => Promise<void>, fakeEnv: NodeJS.ProcessEnv = {}) {
+  const session = await launchVerificationServer({ ...process.env, ...fakeEnv }, undefined, undefined, undefined, undefined, { scripted: true });
   const cli = (...args: string[]) => runControlOmb(args, { env: { OPENMAUSBOT_URL: session.info.url } }) as Promise<any>;
   const api = (path: string, body?: unknown, method = "POST") => request(path, body === undefined ? {} : { method, body: JSON.stringify(body) }, session.info.url) as Promise<any>;
   try {
@@ -52,6 +54,37 @@ it("coordinates a lead and its specialist from ordinary chat, returns to Clive, 
   expect(tools).not.toContain("start_thread");
   expect(turn.system).toContain("only an actual coordinate_bots result proves that teammate participated");
 }), 45_000);
+
+it("returns a nested coordinated result after Claude retries a transient provider exit", async () => {
+  const scratch = mkdtempSync(join(tmpdir(), "omb-coordination-retry-"));
+  try {
+    await fixture(async f => {
+      await f.start();
+      expect((await f.wait()).status).toBe("settled");
+      expect(f.nodes()).toHaveLength(3);
+      expect(f.nodes().every((node: any) => node.status === "completed")).toBe(true);
+      expect(f.evidence().map((turn: any) => turn.botId)).toEqual([f.chief.id, f.lead.id, f.specialist.id, f.lead.id, f.chief.id]);
+      expect((await f.messages(f.chief.activeTaskId)).some((message: any) => message.text === "The requested CSV export is implemented and verified")).toBe(true);
+      expect(Number(readFileSync(join(scratch, "launches"), "utf8"))).toBeGreaterThan(5);
+    }, { FAKE_CLAUDE_TRANSIENTS: "1", FAKE_CLAUDE_STATE: join(scratch, "launches"), FAKE_CLAUDE_RETRY_SCALE: "0.001" });
+  } finally { await removeTempDir(scratch); }
+}, 45_000);
+
+it("returns nested results after Claude rejects the source's prior resume cursor", () => fixture(async f => {
+  const coordination = f.plan[f.chief.id];
+  f.plan[f.chief.id] = { reply: "Earlier conversation" };
+  f.save();
+  await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", "Hello before the task");
+  expect((await f.wait()).status).toBe("settled");
+  f.plan[f.chief.id] = coordination;
+  await f.start();
+  expect((await f.wait()).status).toBe("settled");
+  expect(f.nodes()).toHaveLength(3);
+  expect(f.nodes().every((node: any) => node.status === "completed")).toBe(true);
+  expect(f.evidence().map((turn: any) => turn.botId)).toEqual([f.chief.id, f.chief.id, f.lead.id, f.specialist.id, f.lead.id, f.chief.id]);
+  const transcript = await f.messages(f.chief.activeTaskId);
+  expect(transcript.some((message: any) => message.tool?.name?.includes("resume_rejected"))).toBe(true);
+}, { FAKE_CLAUDE_MODE: "dead-session" }), 45_000);
 
 it("uses recipient bot defaults for its new task, never the sender's or its selected old thread's settings", () => fixture(async f => {
   const models = await f.cli("models");

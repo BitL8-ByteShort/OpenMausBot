@@ -38,6 +38,7 @@ pnpm exec vitest run server/room-handoffs.test.ts server/room-coordination.e2e.t
 pnpm exec vitest run server/group-goal-run.e2e.test.ts server/group-goal-wait-cap.e2e.test.ts server/drivers/agents-proxy.test.ts --maxWorkers=2
 pnpm exec vitest run server/room-recovery.e2e.test.ts server/testing/room-handoff-agent.test.ts
 pnpm exec vitest run server/direct-coordination.e2e.test.ts --maxWorkers=1
+pnpm exec vitest run server/turn-dispatch-guard.test.ts
 OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/direct-coordination-ui.e2e.test.ts
 ```
 
@@ -59,6 +60,14 @@ Follow-up checks cover retained report context and withholding after peer access
 is revoked, without mirroring a second visible transcript.
 Unit checks cover bounded depth/fan-out, idempotent retry, original request
 retention, automatic return, cancellation and restart without replay.
+Turn-correlation checks cover completion before the provider's dispatch ACK,
+late completion after Stop and a replacement turn, cross-thread isolation, and
+bounded single-use early receipts. Coordination uses the exact provider turn's
+reply, never the latest reply or generation of a reused conversation.
+The real fake-Claude subprocess checks transient retry and rejected-cursor
+recovery through a nested coordinated task. Driver regressions also prove that
+retrying a later turn in a retained session preserves that turn's prompt and
+acknowledged identity, not the session's first request.
 The recovery fixture restarts the same disposable server with an interrupted
 routine and verifies its source-room card and error-free recovery broadcasts.
 The subprocess fixture checks malformed output, unexpected exit and bounded

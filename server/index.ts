@@ -816,10 +816,11 @@ const directTurnDispatchClaims = new Map<string, DirectTurnDispatchClaim>();
 const directTurnGenerationByThread = new Map<string, string>();
 // Stop revokes credentials before completion, but the receipt must retain its
 // exact provider-turn owner until that completion or explicit failure cleanup.
-const directFollowupTurns = new ProviderTurnGenerationRegistry();
-const directFollowupSettlers = new Map<string, { threadId: string; settle: () => void }>();
-const directCoordinationSettlers = new Map<string, (outcome: { ok: boolean; text: string }) => void>();
-function settleDirectCoordination(generation: string | undefined, outcome: { ok: boolean; text: string }) {
+type DirectTurnOutcome = { ok: boolean; text: string };
+const directFollowupTurns = new ProviderTurnGenerationRegistry<DirectTurnOutcome>();
+const directFollowupSettlers = new Map<string, { threadId: string; settle?: () => void }>();
+const directCoordinationSettlers = new Map<string, (outcome: DirectTurnOutcome) => void>();
+function settleDirectCoordination(generation: string | undefined, outcome: DirectTurnOutcome) {
   if (!generation) return;
   roomHandoffs.sourceSettled(generation, outcome.ok);
   const settle = directCoordinationSettlers.get(generation);
@@ -832,8 +833,10 @@ function settleDirectFollowup(generation: string | undefined): void {
   const pending = directFollowupSettlers.get(generation);
   if (!pending) return;
   directFollowupSettlers.delete(generation);
-  directFollowupTurns.deleteGeneration(pending.threadId, generation);
-  pending.settle();
+  // Failure/Stop can precede the adapter's terminal event. Quarantine only
+  // this generation's bound ids, including after the watchdog frees its slot.
+  for (const turnId of directFollowupTurns.deleteGeneration(pending.threadId, generation)) retireProviderTurn(turnId);
+  pending.settle?.();
 }
 // Keep the exact provider/profile settings that own a running conversation.
 // Selecting another thread or changing a default must not retarget its tools.
@@ -3008,6 +3011,7 @@ const watchdog = new TurnWatchdog({
   onStall: (turn) => {
     const stalledResourceOwner = turnResourceOwners.get(turn.threadId);
     const stalledGeneration = directTurnGenerationByThread.get(turn.threadId);
+    cancelDirectTurnDispatch(turn.botId, turn.threadId);
     // Room targets carry an invocation identity; only those claims belong
     // to the room grace cleanup added here.
     const stalledVmTarget = groupSpeakers.has(turn.threadId) ? localVmThreadTargets.get(turn.threadId) : undefined;
@@ -3089,13 +3093,16 @@ bus.subscribe((event: RuntimeEvent) => {
   else if (event.type === "request.resolved") watchdog.setWaitingOnHuman(event.threadId, false);
   else if (event.type === "turn.completed") {
     watchdog.settle(event.threadId);
-    settleDirectCoordination(directTurnGenerationByThread.get(event.threadId), {
-      ok: event.ok, text: lastReply.get(event.threadId) || event.stopReason || "The bot finished without a text reply",
-    });
     revokeInternalCapabilityForProviderEvent(event);
-    if (event.turnId) {
-      const owner = directFollowupTurns.complete(event.threadId, event.turnId);
-      if (owner) settleDirectFollowup(owner.generation);
+    if (event.turnId && store.botByThread(event.threadId)) {
+      const reply = store.messagesFor(event.threadId).findLast(message =>
+        message.role === "bot" && message.kind === "text" && message.turnId === event.turnId);
+      const outcome = { ok: event.ok, text: (reply?.text || event.stopReason || "The bot finished without a text reply").slice(0, 12_000) };
+      const owner = directFollowupTurns.complete(event.threadId, event.turnId, outcome);
+      if (owner) {
+        settleDirectCoordination(owner.generation, outcome);
+        settleDirectFollowup(owner.generation);
+      }
     }
   } else if (event.type !== "session.exited") watchdog.touch(event.threadId);
 });
@@ -4946,7 +4953,9 @@ async function startTurn(
   turnResourceOwners.set(threadId, resourceOwner);
   directTurnGenerationByThread.set(threadId, dispatchClaimId);
   if (opts?.coordination) directCoordinationSettlers.set(dispatchClaimId, opts.coordination.settle);
-  if (opts?.onTurnSettled) directFollowupSettlers.set(dispatchClaimId, { threadId, settle: opts.onTurnSettled });
+  // Ordinary sources need the same exact completion ownership as queued
+  // follow-ups: any normal turn may ask teammates to coordinate work.
+  directFollowupSettlers.set(dispatchClaimId, { threadId, settle: opts?.onTurnSettled });
   directTurnDispatchClaims.set(threadId, { id: dispatchClaimId, botId, threadId, phase: "setup" });
   directTurnBots.set(threadId, bot);
   beginInternalCapabilityGeneration(threadId, dispatchClaimId);
@@ -5421,6 +5430,8 @@ async function startTurn(
       if (directFollowupSettlers.has(dispatchClaimId) && dispatch.value.turnId &&
         !directFollowupTurns.bind(threadId, dispatchClaimId, dispatch.value.turnId)) {
         // This exact queued turn completed before its dispatch ACK arrived.
+        const outcome = directFollowupTurns.takeEarlyCompletion(threadId, dispatch.value.turnId);
+        if (outcome) settleDirectCoordination(dispatchClaimId, outcome);
         settleDirectFollowup(dispatchClaimId);
       }
       clearDirectTurnDispatch(threadId, dispatchClaimId);
