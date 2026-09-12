@@ -13,6 +13,7 @@ import type { ModelSelection } from "./contracts.ts";
 import * as mdb from "./message-db.ts";
 import { peerAllowKey } from "./peer-approval-key.ts";
 import { Store, type BotRecord } from "./store.ts";
+import type { TeamSetupRequest } from "../shared/team-setup.ts";
 
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-sonnet-5" });
 
@@ -1407,6 +1408,53 @@ describe("soul", () => {
     expect(existsSync(soulFile(bot.id))).toBe(true);
     store.deleteBot(bot.id);
     expect(existsSync(join(DATA_DIR, "bots", bot.id))).toBe(false);
+  });
+
+  it("reviewed setup freezes legacy thread settings and persists valid team grants and its receipt on reload", () => {
+    const store = new Store(selection);
+    const chief = store.createBot({ name: "Clive", section: "Operations" });
+    const bot = store.createBot({ name: "Patch", section: "Operations" });
+    store.patchBot(chief.id, { chiefOfStaff: true, managedSections: Array.from({ length: 99 }, (_, i) => `Team ${i}`) });
+    store.patchBot(bot.id, { approvalMode: "edits", autoApprove: false, alwaysAllow: ["Read"] });
+    const task = bot.tasks![0];
+    delete task.modelSelection; delete task.approvalMode; delete task.autoApprove; delete task.alwaysAllow;
+    const name = "T".repeat(60);
+    const request: TeamSetupRequest = { version: 1, requestId: "setup-reload", botId: chief.id, threadId: chief.threadId,
+      reason: "Requested", createdAt: 1, requesterRevision: "fixture", newTeams: [name], operations: [
+        { action: "update", botId: bot.id, fields: { section: name, modelSelection: { instanceId: "codex", model: "fixture" } } },
+      ] };
+    const original = structuredClone(store.bots);
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots")
+      .mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.applyTeamSetup(request)).toThrow("disk full");
+    expect(store.bots).toEqual(original); save.mockRestore();
+    const result = store.applyTeamSetup(request);
+    expect(store.applyTeamSetup(request)).toEqual(result);
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(chief.id)?.managedSections).toHaveLength(100);
+    expect(reloaded.bot(chief.id)?.managedSections).toContain(name);
+    expect(reloaded.bot(chief.id)?.lastTeamSetupReceipt?.requestId).toBe(request.requestId);
+    expect(reloaded.bot(bot.id)).toMatchObject({ section: name, modelSelection: { instanceId: "codex", model: "fixture" } });
+    expect(reloaded.bot(bot.id)?.tasks?.[0]).toMatchObject({ modelSelection: selection(), approvalMode: "edits", autoApprove: false, alwaysAllow: ["Read"] });
+    expect(() => reloaded.applyTeamSetup({ ...request, requestId: "too-many", newTeams: ["Overflow"] })).toThrow(/scope/);
+    expect(() => reloaded.applyTeamSetup({ ...request, requestId: "too-long", newTeams: ["X".repeat(61)] })).toThrow(/scope/);
+    expect(reloaded.bot(chief.id)?.managedSections).toHaveLength(100);
+  });
+
+  it("reviewed deletion saves its receipt with removal before deleting any bot files", () => {
+    const store = new Store(selection); const chief = store.createBot(); const bot = store.createBot();
+    const request: TeamSetupRequest = { version: 1, requestId: "delete-reload", botId: chief.id, threadId: chief.threadId,
+      reason: "Requested", createdAt: 1, requesterRevision: "fixture", newTeams: [], operations: [],
+      deletion: { botId: bot.id, name: bot.name, expectedRevision: "fixture" } };
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots")
+      .mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.deleteBot(bot.id, request)).toThrow("disk full");
+    expect(store.bot(bot.id)).toBe(bot); expect(store.bot(chief.id)?.lastTeamSetupReceipt).toBeUndefined();
+    expect(existsSync(soulFile(bot.id))).toBe(true); expect(store.messagesFor(bot.threadId)).toHaveLength(1);
+    save.mockRestore(); expect(store.deleteBot(bot.id, request)).toBe(true);
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(bot.id)).toBeNull();
+    expect(reloaded.bot(chief.id)?.lastTeamSetupReceipt).toMatchObject({ requestId: request.requestId, result: { state: "applied" } });
   });
 
   it("setSoul still returns the updated record when the mirror write fails", () => {

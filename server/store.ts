@@ -1690,6 +1690,9 @@ export class Store {
     const chief = this.bot(request.botId);
     if (!chief) throw new Error("The requesting Chief no longer exists");
     if (chief.lastTeamSetupReceipt?.requestId === request.requestId) return chief.lastTeamSetupReceipt.result;
+    const managedSections = [...new Set([...(chief.managedSections ?? []), ...request.newTeams])];
+    if (managedSections.length > 100 || managedSections.some((name) => name.trim() !== name || name.length > 60) ||
+        request.newTeams.some((name) => !name) || (request.newTeams.length && !chief.chiefOfStaff)) throw new Error("Invalid reviewed Chief team scope");
     const nextBots = [...this.bots];
     const changed: BotRecord[] = [];
     for (const operation of request.operations) {
@@ -1709,7 +1712,15 @@ export class Store {
         nextBots.unshift(next);
       } else {
         if (at < 0) throw new Error("A setup target no longer exists");
-        next = { ...nextBots[at], ...operation.fields };
+        const previous = nextBots[at];
+        next = { ...previous, ...operation.fields };
+        if (operation.fields.modelSelection) next.tasks = previous.tasks?.map((task) => ({
+          ...task,
+          modelSelection: structuredClone(task.modelSelection ?? previous.modelSelection),
+          approvalMode: approvalModeFor(this.projectBotForTask(previous.id, task.threadId)!),
+          autoApprove: task.autoApprove ?? previous.autoApprove,
+          alwaysAllow: structuredClone(task.alwaysAllow ?? previous.alwaysAllow ?? []),
+        }));
         nextBots[at] = next;
       }
       next.section = sectionKey(next.section) || undefined;
@@ -1725,8 +1736,7 @@ export class Store {
     // Only the newly-created teams explicitly named in the human review may
     // extend this Chief's reach. Existing teams require owner settings.
     if (request.newTeams.length) {
-      const scoped = nextChief as BotRecord & { managedSections?: string[] };
-      scoped.managedSections = [...new Set([...(scoped.managedSections ?? []), ...request.newTeams])];
+      nextChief.managedSections = managedSections;
     }
     nextBots[chiefAt] = nextChief;
     this.saveBots(nextBots);
@@ -1741,10 +1751,22 @@ export class Store {
     return result;
   }
 
-  deleteBot(id: string): boolean {
+  deleteBot(id: string, setupRequest?: TeamSetupRequest): boolean {
     const bot = this.bot(id);
     if (!bot) return false;
-    this.bots = this.bots.filter((b) => b.id !== id);
+    let nextBots = this.bots.filter((b) => b.id !== id);
+    if (setupRequest) {
+      const chief = this.bot(setupRequest.botId);
+      if (!chief || chief.id === id || setupRequest.deletion?.botId !== id) throw new Error("The reviewed deletion no longer has a valid owner");
+      const lastTeamSetupReceipt: NonNullable<BotRecord["lastTeamSetupReceipt"]> = { requestId: setupRequest.requestId, result: { state: "applied", newTeams: [], bots: [
+        { id: bot.id, name: bot.name, action: "deleted" },
+      ] } };
+      nextBots = nextBots.map((candidate) => candidate.id === chief.id ? { ...candidate, lastTeamSetupReceipt } : candidate);
+    }
+    // Persist removal and the review receipt before deleting conversation or
+    // workspace data. A failed save must leave the bot recoverable in place.
+    this.saveBots(nextBots);
+    this.bots = nextBots;
     this.legacyActivities.delete(id);
     // every task's transcript goes with the bot, not just the open one
     for (const threadId of new Set([bot.threadId, ...(bot.tasks ?? []).map((t) => t.threadId)])) {
@@ -1765,7 +1787,6 @@ export class Store {
     } catch {}
     // The bot folder (SOUL.md mirror) is the bot's too.
     removeBotFolder(id);
-    this.saveBots();
     this.emit({ type: "bot.deleted", botId: id });
     return true;
   }

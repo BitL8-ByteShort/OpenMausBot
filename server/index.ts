@@ -261,6 +261,7 @@ import {
 } from "./memory-journal.ts";
 import {
   readSectionContext,
+  readSections,
   sectionContextKey,
   sectionContextLabel,
   sectionContextSystemPrompt,
@@ -1409,7 +1410,7 @@ if (browserCleanupReferencesReconciled) browserCleanup.startPending();
 const wireTask = ({ resumeCursors: _resumeCursors, lastInstanceId: _lastInstanceId, ...task }: TaskRecord) => task;
 
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
-  const { resumeCursors: _resumeCursors, tasks, approvalGrant, lastProfileRequestId: _lastProfileRequestId, ...rest } = bot;
+  const { resumeCursors: _resumeCursors, tasks, approvalGrant, lastProfileRequestId: _lastProfileRequestId, lastTeamSetupReceipt: _lastTeamSetupReceipt, ...rest } = bot;
   // An elevated selection is inert until the desktop confirms its exact
   // private reply. Every ordinary client sees the effective Ask state during
   // that two-phase window, never a grant that may still roll back.
@@ -1422,7 +1423,7 @@ const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
 /** The correlated private response carries the requested value so Electron
  * can validate it before sending the confirmation that makes it effective. */
 const wireTrustedApprovalBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
-  const { resumeCursors: _resumeCursors, tasks, approvalGrant: _approvalGrant, lastProfileRequestId: _lastProfileRequestId, ...rest } = bot;
+  const { resumeCursors: _resumeCursors, tasks, approvalGrant: _approvalGrant, lastProfileRequestId: _lastProfileRequestId, lastTeamSetupReceipt: _lastTeamSetupReceipt, ...rest } = bot;
   return { ...rest, avatarUrl: rest.avatarUrl ?? null, ...(tasks ? { tasks: tasks.map(wireTask) } : {}) };
 };
 
@@ -5833,7 +5834,7 @@ const routineRequests = new RoutineRequestService({
     return null;
   },
 });
-async function deleteBotWithLifecycle(botId: string, revalidate: () => void = () => {}) {
+async function deleteBotWithLifecycle(botId: string, revalidate: () => void = () => {}, setupRequest?: TeamSetupRequest) {
   const deletionResponse = (status: number, body: { error?: string; ok?: boolean }) => ({ status, body });
       revalidate();
       const bot = store.bot(botId);
@@ -5987,7 +5988,7 @@ async function deleteBotWithLifecycle(botId: string, revalidate: () => void = ()
           const target = perBotLocalVmTarget(bot.id);
           localVmIdles.get(target.key)?.cancel();
           localVmIdles.delete(target.key);
-          store.deleteBot(bot.id);
+          store.deleteBot(bot.id, setupRequest);
           browserLive.closeForBot(bot.id);
           await forgetTemporaryBrowser(bot.id);
         } catch (error) {
@@ -6024,9 +6025,10 @@ const profileRequests = new ProfileRequestService({
     return null;
   },
 });
-const teamSetupTeams = () => [...new Set(["", ...store.bots.map((bot) => sectionKey(bot.section)), ...store.groups.map((group) => sectionKey(group.section))])];
+const teamSetupTeams = () => [...new Set(["", ...readSections(), ...store.bots.map((bot) => sectionKey(bot.section)), ...store.groups.map((group) => sectionKey(group.section))])];
 const teamSetupRequests = new TeamSetupRequestService({
   store, teams: teamSetupTeams, canAccessTeam, canPersist: proposalPersistence, maxBots: MAX_WORKSPACE_BOTS,
+  ownsThread: (botId, threadId) => Boolean(connectorThread(botId, threadId)),
   targetBusy: (botId) => Boolean(store.bot(botId)?.busy || hasDirectDispatch(botId) || activeGroupTurnForBot(botId) || routines?.activeRunForBot(botId)),
   validateModel: (selection, current) => {
     const checked = checkedModelSelection(selection, undefined, true);
@@ -6041,8 +6043,8 @@ const teamSetupRequests = new TeamSetupRequestService({
     }
     return null;
   },
-  deleteBot: async (botId, revalidate) => {
-    const result = await deleteBotWithLifecycle(botId, revalidate);
+  deleteBot: async (botId, revalidate, request) => {
+    const result = await deleteBotWithLifecycle(botId, revalidate, request);
     if (result.status >= 400) throw new TeamSetupError(result.body.error ?? "The bot could not be deleted", result.status);
   },
 });
@@ -6057,7 +6059,7 @@ function dispatchTeamSetupResume(entry: { request: TeamSetupRequest; messageId: 
     pendingTeamSetupResumes.set(request.requestId, entry);
     return;
   }
-  const prompt = `OpenMausBot team setup decision: ${JSON.stringify(request.result)}. Report this exact result and continue the user's already requested work. Do not ask for confirmation again or repeat this setup/deletion. A denied or cancelled operation did not authorize any substitute action. Existing thread models were not changed.`;
+  const prompt = `OpenMausBot team setup decision ${request.requestId}: ${JSON.stringify(request.result)}. Report this exact result and continue the user's already requested work. Do not ask for confirmation again or repeat this setup/deletion. A denied or cancelled operation did not authorize any substitute action. Existing thread models were not changed.`;
   const failed = (error: string) => {
     const current = store.messagesFor(request.threadId).find((item) => item.id === messageId);
     if (current?.card) store.patchMessage(request.threadId, messageId, { card: { ...current.card, held: `The decision was recorded, but the Chief could not continue: ${redactSecretsInText(error).slice(0, 300)}` } });
@@ -6093,7 +6095,7 @@ function drainTeamSetupResumes(): void {
 async function resolveAndSendTeamSetup(res: ServerResponse, args: { botId: string; threadId: string; requestId: string; behavior: string }, ownerReview: boolean): Promise<boolean> {
   const card = store.messagesFor(args.threadId).find((item) => item.card?.requestId === args.requestId && item.card.teamSetupRequest)?.card;
   if (!card) return false;
-  if (args.behavior === "allow" && !ownerReview) { json(res, 403, { error: "Approve team setup or deletion from the app or an owner device" }); return true; }
+  if (args.behavior === "allow" && !ownerReview) { json(res, 403, { error: "Approve team setup or deletion from the desktop app or a paired owner device. In a local browser, wait until every bot is idle." }); return true; }
   const resolved = await teamSetupRequests.resolve(args);
   if (!resolved) return false;
   if (!resolved.duplicate) {
@@ -6101,7 +6103,7 @@ async function resolveAndSendTeamSetup(res: ServerResponse, args: { botId: strin
       summary: card.subtitle, decision: resolved.result.state === "applied" ? "user-approved" : "user-denied", source: "user" });
   }
   const current = store.messagesFor(args.threadId).find((item) => item.id === resolved.messageId);
-  if (current?.card?.teamSetupRequest && !current.card.teamSetupRequest.resumed) {
+  if (current?.card?.teamSetupRequest?.result && !current.card.teamSetupRequest.resumed) {
     store.patchMessage(args.threadId, current.id, { card: { ...current.card, teamSetupRequest: { ...current.card.teamSetupRequest, resumed: true } } });
     dispatchTeamSetupResume({ request: resolved.request, messageId: resolved.messageId });
   }
@@ -9635,10 +9637,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return json(res, 201, proposed);
       }
       if (method === "GET" && path === "/api/internal/team-setup-catalog") {
-        const chief = store.bot(internalCapability.botId)!;
+        let chief = store.bot(internalCapability.botId)!;
         if (!chief.chiefOfStaff || chief.hidden) return json(res, 403, { error: "Only an active Chief may plan team setup" });
         const instances = await registry.describe();
         requireActiveInternalCapability();
+        chief = store.bot(internalCapability.botId)!;
+        if (!chief.chiefOfStaff || chief.hidden) return json(res, 403, { error: "Only an active Chief may plan team setup" });
         return json(res, 200, {
           teams: teamSetupTeams().filter((name) => canAccessTeam(chief, name)),
           bots: store.bots.filter((bot) => !bot.hidden && canAccessTeam(chief, bot.section) && (bot.id === chief.id || peerAllowed(chief, bot.id)))
@@ -13390,7 +13394,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!behavior) return json(res, 400, { error: "behavior must be allow, deny, or answer" });
       if (await resolveAndSendTeamSetup(res, {
         botId: bot.id, threadId: bot.threadId, requestId: String(body.requestId), behavior,
-      }, auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) : auth.scopes.includes("admin"))) return;
+      }, auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) && !store.bots.some((bot) => bot.busy || activeGroupTurnForBot(bot.id)) : auth.scopes.includes("admin"))) return;
       if (resolveAndSendRoutine(res, {
         botId: bot.id,
         botName: bot.name,
@@ -13473,7 +13477,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const setupBotId = setupCard.from?.botId ?? store.botByThread(threadId)?.id;
         if (!setupBotId) return json(res, 400, { error: "This team setup has no valid owner" });
         if (await resolveAndSendTeamSetup(res, { botId: setupBotId, threadId, requestId, behavior },
-          auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) : auth.scopes.includes("admin"))) return;
+          auth.kind === "loopback" ? DESKTOP_MANAGED || Boolean(req.headers.origin) && !store.bots.some((bot) => bot.busy || activeGroupTurnForBot(bot.id)) : auth.scopes.includes("admin"))) return;
       }
       const profileCard = store.messagesFor(threadId).find(
         (message) => message.card?.requestId === requestId && message.card.profileRequest,

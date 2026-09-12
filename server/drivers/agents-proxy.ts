@@ -509,7 +509,7 @@ const TOOLS = [
       type: "object", additionalProperties: false,
       properties: {
         reason: { type: "string", minLength: 1, maxLength: 500 },
-        newTeams: { type: "array", maxItems: 8, items: { type: "string", minLength: 1, maxLength: 100 } },
+        newTeams: { type: "array", maxItems: 8, items: { type: "string", minLength: 1, maxLength: 60 } },
         operations: { type: "array", minItems: 1, maxItems: 24, items: {
           type: "object", additionalProperties: false,
           properties: {
@@ -519,7 +519,7 @@ const TOOLS = [
             fields: { type: "object", additionalProperties: false, properties: {
               name: { type: "string", maxLength: 100 }, title: { type: "string", maxLength: 200 },
               description: { type: "string", maxLength: 4000 }, soul: { type: "string", description: "Standing instructions; required with name/title/modelSelection for every new bot." },
-              section: { type: "string", maxLength: 100, description: "Exact authorized existing team, or a team explicitly named in newTeams. Empty string means General." },
+              section: { type: "string", maxLength: 60, description: "Exact authorized existing team, or a team explicitly named in newTeams. Empty string means General." },
               modelSelection: { type: "object", additionalProperties: false, properties: {
                 instanceId: { type: "string" }, model: { type: "string" }, effort: { type: "string" },
               }, required: ["instanceId", "model"] },

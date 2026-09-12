@@ -162,7 +162,7 @@ export const PendingApprovalPanel = memo(function PendingApprovalPanel({
           </span>
         )}
         <span className="text-[13px] text-ink">{label(pending)}</span>
-        <span className="font-mono text-[11px] text-ink-secondary">
+        {!pending.message.card?.teamSetupRequest && <span className="font-mono text-[11px] text-ink-secondary">
           {isSkillApproval(pending)
             ? pending.message.card?.skillRequest?.action === "update" ? "update_skill" : "stage_skill"
             : isRoutineApproval(pending)
@@ -172,7 +172,7 @@ export const PendingApprovalPanel = memo(function PendingApprovalPanel({
             : isProfileApproval(pending)
               ? "update_profile"
               : pending.tool}
-        </span>
+        </span>}
       </div>
       {/* never truncated — long commands wrap and scroll */}
       <pre
