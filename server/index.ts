@@ -83,7 +83,7 @@ import {
 } from "./cloud-backend.ts";
 import * as composio from "./composio.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
-import { canAccessTeam, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, roomPeerRosterSystemPrompt, roomRosterLine } from "./peer-roster.ts";
+import { canAccessTeam, canReachPeer, peerAllowed, peerName, peerRosterSystemPrompt, peerStatus, peerStatusWords, reachablePeers, roomPeerRosterSystemPrompt, roomRosterLine } from "./peer-roster.ts";
 import { openMausStatusSystemPrompt } from "./openmaus-status-capsule.ts";
 import {
   containerComputerAction,
@@ -1536,6 +1536,7 @@ async function botOverview(bot: BotRecord): Promise<BotOverview> {
       composio: bot.composio,
       browser: bot.browser,
       chiefOfStaff: bot.chiefOfStaff,
+      managedSections: bot.managedSections,
     },
     routines: routines!.listRoutines()
       .filter((routine) => routine.botId === bot.id)
@@ -2151,19 +2152,20 @@ function roomHandoffProblem(node: Pick<RoomHandoff, "groupId" | "threadId" | "bo
   const bot = store.bot(node.botId);
   if (!group || group.dm || !store.groupTaskByThread(group.id, node.threadId)) return "Destination room task no longer exists";
   if (!bot || bot.hidden || !group.memberIds.includes(bot.id)) return "The addressed agent is no longer a member of this room";
-  // Room coordination does not override the existing section
-  // boundary. Every reader matters, including members not addressed to speak.
-  const outsideSection = (room: GroupRecord) => room.memberIds.some(id => {
+  // Every reader matters, including members not addressed to speak. The
+  // recipient must be allowed to read its destination; the sender's grant
+  // cannot silently give a specialist access to another team's transcript.
+  const outsideSection = (room: GroupRecord, speaker: BotRecord) => room.memberIds.some(id => {
     const member = store.bot(id);
-    return member && sectionKey(member.section) !== sectionKey(bot.section);
+    return member && !canAccessTeam(speaker, member.section);
   });
-  if (outsideSection(group)) return "Destination room includes a member outside the agent's section";
+  if (outsideSection(group, bot)) return "Destination room includes a member outside the agent's section";
   if (roomSetupPending(group)) return "Destination room setup is unfinished";
   if (parent) {
     const from = store.bot(parent.botId);
     const source = store.group(parent.groupId);
     if (!source || !from || from.hidden || !source.memberIds.includes(from.id) || !store.groupTaskByThread(source.id, parent.threadId)) return "Source room membership or task was removed";
-    if (sectionKey(from.section) !== sectionKey(bot.section) || outsideSection(source)) return "Room work cannot cross the sender's section boundary";
+    if (!canAccessTeam(from, bot.section) || outsideSection(source, from)) return "Room work cannot cross the sender's section boundary";
     if (source.id === group.id && parent.threadId !== node.threadId) return "Same-room work must stay in the originating conversation";
     if (!peerAllowed(from, bot.id)) return "The recipient is not an allowed peer of the sender";
   }
@@ -4081,6 +4083,16 @@ function finalizeDelegationWatch(
   const watched = delegationWatch.get(threadId);
   if (!watched) return false;
   delegationWatch.delete(threadId);
+  const target = store.bot(watched.toBotId);
+  const targetName = target?.name ?? watched.toBotName ?? watched.toBotId;
+  const source = watched.sourceBotId
+    ? store.bot(watched.sourceBotId)
+    : (watched.sourceThreadId ? store.botByThread(watched.sourceThreadId) : undefined);
+  if (source && target && !canReachPeer(source, target)) {
+    ok = false;
+    reply = "";
+    failureName = "Result withheld: team or peer access changed while the teammate was working";
+  }
   // The receipt is written before any mirror short-circuits: the delegating
   // bot's check/wait_delegation must see a terminal state even when the
   // channel or target is gone.
@@ -4094,12 +4106,6 @@ function finalizeDelegationWatch(
       result: ok ? reply : failureName,
     });
   }
-  const target = store.bot(watched.toBotId);
-  const targetName = target?.name ?? watched.toBotName ?? watched.toBotId;
-  const source = watched.sourceBotId
-    ? store.bot(watched.sourceBotId)
-    : (watched.sourceThreadId ? store.botByThread(watched.sourceThreadId) : undefined);
-
   let channel: GroupRecord | undefined = watched.channelId ? store.group(watched.channelId) : undefined;
   let terminalThreadId: string | undefined = watched.sourceThreadId;
 
@@ -5474,7 +5480,7 @@ function routineSourceOwner(run: Pick<RoutineRun, "botId" | "sourceThreadId" | "
   // a result, since either bot may have moved since confirmation.
   const sourceBot = store.botByThread(threadId);
   if (sourceBot && !sourceBot.hidden && !store.taskByThread(sourceBot.id, threadId)?.routineRunId &&
-    sectionKey(sourceBot.section) === sectionKey(bot.section)) {
+    (sourceBot.id === bot.id || canReachPeer(sourceBot, bot))) {
     return { bot: sourceBot, group: undefined, threadId };
   }
   const group = store.groupByThread(threadId);
@@ -5828,7 +5834,7 @@ const routineRequests = new RoutineRequestService({
     const proposer = store.bot(proposerBotId);
     const targetBot = store.bot(target.botId);
     if (!targetBot) return `@${target.name} no longer exists, so this routine cannot be scheduled for it`;
-    if (!proposer || sectionKey(targetBot.section) !== sectionKey(proposer.section)) {
+    if (!proposer || !canReachPeer(proposer, targetBot)) {
       return `@${target.name} is no longer in this section, so this routine cannot be scheduled for it`;
     }
     return null;
@@ -6021,7 +6027,7 @@ const profileRequests = new ProfileRequestService({
     const target = store.bot(targetBotId);
     if (!target) return "that bot no longer exists";
     if (!proposer?.chiefOfStaff) return "only a section's Chief of Staff can change another bot's profile";
-    if (sectionKey(target.section) !== sectionKey(proposer.section)) return "that bot belongs to a different section";
+    if (!canReachPeer(proposer, target)) return "that bot is not in a team this Chief is allowed to manage";
     return null;
   },
 });
@@ -7833,7 +7839,7 @@ function roomPostEligibility(
   }
   const outsider = group.memberIds
     .map((id) => store.bot(id))
-    .find((member) => member && sectionKey(member.section) !== sectionKey(bot.section));
+    .find((member) => member && !canAccessTeam(bot, member.section));
   if (outsider) {
     return {
       ok: false,
@@ -9400,6 +9406,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             return {
               id: b.id,
               name: b.name,
+              section: b.section?.trim() || "",
               model: b.modelSelection.model,
               busy: !!b.busy,
               status,
@@ -9570,7 +9577,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             if (!target) {
               return json(res, 404, { error: "no bot with that id — call list_bots and copy the exact id from the result" });
             }
-            if (sectionKey(target.section) !== sectionKey(from.section)) {
+            if (!canReachPeer(from, target)) {
               return json(res, 403, { error: "that bot belongs to a different section" });
             }
             forBot = { botId: target.id, name: target.name };
@@ -9852,7 +9859,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // unresolvable id the cheapest way past the gate, so it is now a
         // hard refusal — every peer turn has an accountable sender.
         const from = internalSender;
-        if (sectionKey(from.section) !== sectionKey(target.section)) {
+        if (!canAccessTeam(from, target.section) || target.hidden) {
           return json(res, 403, { error: "that bot belongs to a different section" });
         }
         // The sender's allow-list, when it has one. Checked here rather than
@@ -9919,7 +9926,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           const freshFrom = store.bot(fromBotId);
           const freshTarget = store.bot(toBotId);
           if (!freshFrom || !freshTarget) return json(res, 404, { error: "no such bot" });
-          if (sectionKey(freshFrom.section) !== sectionKey(freshTarget.section)) {
+          if (!canAccessTeam(freshFrom, freshTarget.section) || freshTarget.hidden) {
             return json(res, 200, { error: "that bot moved to a different section" });
           }
           if (!peerAllowed(freshFrom, freshTarget.id)) {
@@ -9958,6 +9965,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const targetThreadId = currentTarget.threadId;
         const outcome = await askBotAndWait(toBotId, prefixed, depth, fromBotId, fromThreadId, targetThreadId);
         requireActiveInternalCapability();
+        const replySender = store.bot(fromBotId);
+        const replyTarget = store.bot(toBotId);
+        if (!replySender || !replyTarget || !canReachPeer(replySender, replyTarget)) {
+          return json(res, 403, { error: "Result withheld: team access changed while the teammate was working" });
+        }
         if (outcome.status === "timeout" && !delegationWatch.has(targetThreadId)) {
           // The peer's turn is still running — only the wait ended. Convert
           // the ask into a delegation claim ticket: the watch mirrors the
@@ -10069,7 +10081,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const from = internalSender;
         const target = store.bot(toBotId);
         if (!target) return json(res, 404, { error: "no such bot" });
-        if (sectionKey(from.section) !== sectionKey(target.section)) {
+        if (!canAccessTeam(from, target.section) || target.hidden) {
           return json(res, 403, { error: "that bot belongs to a different section" });
         }
         if (!peerAllowed(from, target.id)) {
@@ -10387,7 +10399,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (depth >= MAX_COMMS_DEPTH) {
           return json(res, 200, { error: "thread chains are limited to one hop — open the thread on yourself, or do this one here" });
         }
-        if (sectionKey(from.section) !== sectionKey(target.section)) {
+        if (!canAccessTeam(from, target.section) || target.hidden) {
           return json(res, 403, { error: "that bot belongs to a different section" });
         }
         if (!peerAllowed(from, target.id)) {
@@ -12606,6 +12618,25 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         }
         patch.peers = nextPeers;
       }
+      if (body.managedSections !== undefined) {
+        const parsed = z.array(z.string().trim().max(60)).max(100).safeParse(body.managedSections);
+        if (!parsed.success) return json(res, 400, { error: "managedSections must be a list of up to 100 team names (60 characters each)" });
+        const sections = [...new Set(parsed.data)];
+        const newSections = sections.filter(section => !(existingBot?.managedSections ?? []).includes(section));
+        if (newSections.some(section => section !== "" && !store.sections.includes(section))) {
+          return json(res, 400, { error: "Create the named team before giving a Chief access to it" });
+        }
+        if (sections.length && !(body.chiefOfStaff === true || (existingBot?.chiefOfStaff && body.chiefOfStaff !== false))) {
+          return json(res, 400, { error: "Only a Chief of Staff can be given access to additional teams" });
+        }
+        if (newSections.length && body.acknowledgePeerScope !== true) {
+          return json(res, 400, { error: "Confirm which additional teams this Chief may work with (acknowledgePeerScope)" });
+        }
+        patch.managedSections = sections;
+      }
+      // Removing the role revokes its grants, rather than leaving dormant
+      // authority to return if this bot is elected Chief again later.
+      if (body.chiefOfStaff === false) patch.managedSections = [];
       if (body.alwaysAllow !== undefined) {
         if (!Array.isArray(body.alwaysAllow) || body.alwaysAllow.some((t: unknown) => typeof t !== "string")) {
           return json(res, 400, { error: "alwaysAllow must be a list of tool keys" });
@@ -12629,6 +12660,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // desktop capability or a paired session, which is what the refusal
       // points at.
       const loosened: string[] = [];
+      if (Array.isArray(patch.managedSections) && patch.managedSections.some(section => !(existingBot?.managedSections ?? []).includes(section))) {
+        loosened.push("managedSections");
+      }
+      // A shell can forge an Origin header. New cross-team authority may
+      // come from local scripts only when all bots are idle; paired owners
+      // and the packaged desktop's private capability can grant it mid-turn.
+      if (loosened.includes("managedSections") && auth.kind === "loopback" && !DESKTOP_MANAGED && store.bots.some(bot => bot.busy)) {
+        return json(res, 409, { error: "Stop running bots before granting access to another team, or use the desktop app or a paired owner session." });
+      }
       if (body.peers !== undefined && Array.isArray(existingBot?.peers)) {
         const nextPeers = patch.peers;
         if (nextPeers === undefined || (Array.isArray(nextPeers) && nextPeers.some((peerId) => !existingBot.peers!.includes(peerId)))) {
