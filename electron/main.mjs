@@ -1534,12 +1534,16 @@ async function forgetEnvironment(id) {
   if (wasActive) navigateMainWindow(activeOrigin());
   try {
     // Revoke the session on the server while the cookie is still here.
-    await session.defaultSession.fetch(`${env.origin}/api/auth/logout`, { method: "POST", signal: AbortSignal.timeout(5_000) });
+    const response = await session.defaultSession.fetch(`${env.origin}/api/auth/logout`, { method: "POST", credentials: "include", headers: { origin: env.origin }, signal: AbortSignal.timeout(5_000) });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
   } catch (error) {
     slog(`forget server: logout skipped (${error?.message ?? error})`);
+    await dialog.showMessageBox({ type: "warning", message: "Connection forgotten; server sign-out could not be confirmed", detail: "Computer sharing is stopped. Revoke this desktop’s session on that server when it is reachable again." });
   }
   try {
-    await session.defaultSession.clearStorageData({ origin: env.origin, storages: ["cookies", "localstorage", "indexdb", "serviceworkers", "cachestorage"] });
+    // Logout clears this server's exact cookie. Cookie storage is host-wide,
+    // not port-scoped: clearing it here would sign out other saved workspaces.
+    await session.defaultSession.clearStorageData({ origin: env.origin, storages: ["localstorage", "indexdb", "serviceworkers", "cachestorage"] });
   } catch (error) {
     slog(`forget server: storage clear failed: ${error?.message ?? error}`);
   }

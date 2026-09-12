@@ -41,6 +41,8 @@ export function createComputerSharing({ file, fetch: fetchImpl, environments, cu
     fs.renameSync(temporary, file); records = next;
   };
   const request = async (env, route, body, signal, secret) => {
+    const origin = new URL(env.origin);
+    if (origin.protocol !== "https:" && !(origin.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname))) throw new Error("Computer sharing requires an HTTPS workspace address");
     const response = await fetchImpl(`${env.origin}${route}`, {
       method: body === undefined ? "GET" : "POST", credentials: "include", redirect: "error", cache: "no-store",
       signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(35_000)]) : AbortSignal.timeout(10_000),

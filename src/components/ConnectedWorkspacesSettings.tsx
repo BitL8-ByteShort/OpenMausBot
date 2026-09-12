@@ -13,7 +13,7 @@ export function ConnectedWorkspacesSettings() {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [computerId, setComputerId] = useState<string | null>(() => new URL(window.location.href).searchParams.get("share-computer"));
+  const [computerId, setComputerId] = useState<string | null>(() => new URLSearchParams(window.location?.search ?? "").get("share-computer"));
   const pending = useRef(false);
   const generation = useRef(0);
   useEffect(() => {
