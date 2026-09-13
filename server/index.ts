@@ -2442,6 +2442,20 @@ const roomHandoffs = new RoomHandoffs(join(DATA_DIR, "room-handoffs.json"), {
       const source = store.bot(parent.botId);
       if (source) markTaskContextExternallyUpdated(source, parent.threadId);
     }
+    // A work thread exists only because the pair conversation was busy with
+    // another job. Its result is now in the sender's conversation, so it
+    // closes itself exactly as close_thread would — folded out of the
+    // sidebar, never deleted, and open again the moment anyone speaks
+    // there. A finished job tidies up after itself; a failed or withheld
+    // one stays in the sidebar where the person can see it. The pair
+    // conversation is the standing line between two bots and never
+    // auto-closes.
+    const childTask = store.taskByThread(child.botId, child.threadId);
+    if (!child.groupId && child.status === "completed" && !problem && !childTask?.closedBy
+      && childTask?.openedBy?.kind === "work" && childTask.openedBy.botId === parent.botId) {
+      store.setTaskClosedBy(child.botId, child.threadId,
+        { botId: parent.botId, name: store.bot(parent.botId)?.name ?? childTask.openedBy.name, at: Date.now() });
+    }
   },
   run: async (node, resumed, signal) => {
     const group = node.groupId ? store.group(node.groupId) : undefined;
@@ -10721,8 +10735,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             botIds: z.array(z.string().min(1).max(128)).min(1).max(4).refine(ids => new Set(ids).size === ids.length),
             message: z.string().trim().min(1).max(4000), requestKey: z.string().regex(/^[\w-]{1,100}$/),
             rework: z.boolean().default(false),
+            // Only ever a name for a thread, so it travels under the same
+            // one-line rule as a peer thread title.
+            label: z.string().trim().min(1).max(60).refine(fitsOnOneLine).optional(),
           }).safeParse(await readInternalBody());
-          if (!parsed.success) return json(res, 400, { error: "Provide 1-4 distinct botIds, message (1-4000 characters) and a short requestKey (letters, digits, underscores or hyphens)." });
+          if (!parsed.success) return json(res, 400, { error: "Provide 1-4 distinct botIds, message (1-4000 characters), a short requestKey (letters, digits, underscores or hyphens) and an optional one-line label of at most 60 characters." });
           const groupId = parsed.data.groupId ?? source?.id;
           const destination = groupId ? store.group(groupId) : undefined;
           if (groupId && !destination) return json(res, 404, { error: "No such room; use list_room_targets." });
@@ -10751,7 +10768,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
                 // One durable conversation per pair of bots, resolved from
                 // the recipient's own threads — never from this turn, the
                 // request key, or the thread the person has selected there.
-                const resolved = store.resolvePairConversation(internalSender, target.botId);
+                const resolved = store.resolvePairConversation(internalSender, target.botId, {
+                  label: parsed.data.label,
+                  // "Still working" exactly as close_thread reads it: a
+                  // running turn, a queued one, or coordinated work already
+                  // addressed at that thread.
+                  working: threadId => threadBusy(target.botId, threadId)
+                    || queuedThreadPosition(target.botId, threadId) !== null
+                    || roomHandoffs.activeDirect(threadId),
+                });
                 if (!resolved) throw new Error("The recipient no longer exists");
                 target.threadId = resolved.task.threadId;
                 if (resolved.created) createdThread = resolved.task.threadId;

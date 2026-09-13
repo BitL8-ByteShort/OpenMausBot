@@ -2328,7 +2328,7 @@ export class Store {
 
   /** Where a bot-to-bot send outside a room lands: the PAIR CONVERSATION
    * for (sender, recipient) — the recipient's task stamped `openedBy` this
-   * sender with kind "pair". It never auto-closes.
+   * sender with kind "pair".
    *
    * Its scope is global for those two bots: deliberately not per source
    * thread and not per assignment, so a teammate you work with all day is
@@ -2338,17 +2338,26 @@ export class Store {
    * generation, no request key — and never the recipient's selected
    * thread, which belongs to the person.
    *
-   * One thing bends that rule: a recipient still carrying threads this
-   * sender opened before pair conversations existed (one per assignment,
-   * each titled with a sliced brief) has its most recently active one
-   * stamped as the pair conversation instead of gaining yet another row,
-   * so the sprawl stops on upgrade day. Nothing is deleted or closed. A
-   * start_thread handoff is left alone: the sender named that job itself
-   * and tracks it by its own delegation id.
- */
+   * Two things bend that rule, both deliberately:
+   *
+   *   adoption — a recipient still carrying threads this sender opened
+   *   before pair conversations existed (one per assignment, each titled
+   *   with a sliced brief) has its most recently active one stamped as the
+   *   pair conversation instead of gaining yet another row, so the sprawl
+   *   stops on upgrade day. Nothing is deleted or closed. A start_thread
+   *   handoff is left alone: the sender named that job itself and tracks
+   *   it by its own delegation id.
+   *
+   *   concurrency — a second assignment arriving while the pair
+   *   conversation is still working (`working`, which the caller answers
+   *   from live turn state) gets its own work thread, so two jobs never
+   *   interleave in one transcript. `label` names that thread; the caller
+   *   closes it once its result has been reported. A pair conversation
+   *   never auto-closes. */
   resolvePairConversation(
     sender: Pick<BotRecord, "id" | "name">,
     recipientId: string,
+    options: { label?: string; working: (threadId: string) => boolean },
   ): { task: TaskRecord; created: boolean } | null {
     if (!this.bot(recipientId)) return null;
     const title = `@${sender.name}`;
@@ -2378,7 +2387,7 @@ export class Store {
         pair = adopted;
       }
     }
-    if (pair) {
+    if (pair && !options.working(pair.threadId)) {
       // A conversation the sender closed after reading a result is picked
       // back up, never replaced: closing is only the sidebar's idle state.
       if (pair.closedBy) this.setTaskClosedBy(recipientId, pair.threadId, null);
@@ -2387,7 +2396,8 @@ export class Store {
     // The brief is never a title. An 80-character slice of an assignment
     // is the row nobody can read, and a durable conversation outlives the
     // one brief that opened it.
-    const task = this.createTask(recipientId, title, false, undefined, opener("pair"));
+    const task = this.createTask(recipientId, pair ? `${title} · ${options.label || "parallel work"}` : title,
+      false, undefined, opener(pair ? "work" : "pair"));
     return task ? { task, created: true } : null;
   }
 

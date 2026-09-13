@@ -1009,8 +1009,9 @@ describe("Store change stream", () => {
     const recipient = store.createBot({ name: "Scout" });
     const sender = store.createBot({ name: "Clive" });
     const other = store.createBot({ name: "Ada" });
+    const idle = { working: () => false };
     const selected = store.activeTask(recipient.id)!;
-    const first = store.resolvePairConversation(sender, recipient.id)!;
+    const first = store.resolvePairConversation(sender, recipient.id, idle)!;
     expect(first.created).toBe(true);
     // the sender's name, never the brief: an 80-character slice of an
     // assignment is the sidebar row nobody can read
@@ -1022,18 +1023,18 @@ describe("Store change stream", () => {
     // every later send from that sender continues it — nothing about a
     // turn, a request key or the recipient's selected thread takes part
     store.switchTask(recipient.id, first.task.threadId);
-    const second = store.resolvePairConversation(sender, recipient.id)!;
-    const third = store.resolvePairConversation(sender, recipient.id)!;
+    const second = store.resolvePairConversation(sender, recipient.id, idle)!;
+    const third = store.resolvePairConversation(sender, recipient.id, { label: "unused while idle", working: () => false })!;
     expect([second.task.threadId, third.task.threadId]).toEqual([first.task.threadId, first.task.threadId]);
     expect([second.created, third.created]).toEqual([false, false]);
     // a different sender gets its own line, not this one
-    const elsewhere = store.resolvePairConversation(other, recipient.id)!;
+    const elsewhere = store.resolvePairConversation(other, recipient.id, idle)!;
     expect(elsewhere.task.threadId).not.toBe(first.task.threadId);
     expect(elsewhere.task.title).toBe("@Ada");
     expect(store.tasks(recipient.id)).toHaveLength(3);
-    expect(store.resolvePairConversation(sender, "no-such-bot")).toBeNull();
+    expect(store.resolvePairConversation(sender, "no-such-bot", idle)).toBeNull();
     const reloaded = new Store(selection);
-    expect(reloaded.resolvePairConversation(sender, recipient.id)!.task.threadId).toBe(first.task.threadId);
+    expect(reloaded.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(first.task.threadId);
   });
 
   it("resolvePairConversation adopts the sender's most recent old thread instead of adding one more row", () => {
@@ -1041,6 +1042,7 @@ describe("Store change stream", () => {
     const recipient = store.createBot({ name: "Scout" });
     const sender = store.createBot({ name: "Clive" });
     const other = store.createBot({ name: "Ada" });
+    const idle = { working: () => false };
     const brief = "Implement and independently verify the CSV export for the reporting page";
     const header = "Add the header row to that export";
     // the rows a 0.1.76 server left behind: one per assignment, titled with
@@ -1059,7 +1061,7 @@ describe("Store change stream", () => {
     store.appendMessage(older.threadId, { role: "bot", kind: "text", text: `@Scout ${brief}`, at: 1_000 });
     store.appendMessage(newer.threadId, { role: "bot", kind: "text", text: `@Scout ${header}`, at: 2_000 });
     const before = store.tasks(recipient.id).length;
-    const adopted = store.resolvePairConversation(sender, recipient.id)!;
+    const adopted = store.resolvePairConversation(sender, recipient.id, idle)!;
     expect(adopted.created).toBe(false);
     expect(adopted.task.threadId).toBe(newer.threadId);
     expect(store.tasks(recipient.id)).toHaveLength(before);
@@ -1073,7 +1075,7 @@ describe("Store change stream", () => {
     expect(store.taskByThread(recipient.id, handoff.threadId)!.title).toBe("Review PR 12");
     expect(store.taskByThread(recipient.id, stranger.threadId)!.openedBy).toEqual({ botId: other.id, name: "Ada", at: 50 });
     // and the next send continues the adopted one
-    expect(store.resolvePairConversation(sender, recipient.id)!.task.threadId).toBe(newer.threadId);
+    expect(store.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(newer.threadId);
     expect(store.tasks(recipient.id)).toHaveLength(before);
   });
 
@@ -1081,6 +1083,7 @@ describe("Store change stream", () => {
     const store = new Store(selection);
     const recipient = store.createBot({ name: "Scout" });
     const sender = store.createBot({ name: "Clive" });
+    const idle = { working: () => false };
     const brief = "Implement and independently verify the CSV export for the reporting page";
     const row = store.createTask(recipient.id, brief, false, undefined, { botId: sender.id, name: "Clive", at: 10 })!;
     store.appendMessage(row.threadId, { role: "bot", kind: "text", text: `@Scout ${brief}`, at: 1_000 });
@@ -1088,30 +1091,44 @@ describe("Store change stream", () => {
     // gone, so adoption has nothing to recognise as its own and must not
     // guess
     store.renameTask(recipient.id, row.threadId, "Reporting exports");
-    const adopted = store.resolvePairConversation(sender, recipient.id)!;
+    const adopted = store.resolvePairConversation(sender, recipient.id, idle)!;
     expect(adopted.created).toBe(false);
     expect(adopted.task.threadId).toBe(row.threadId);
     expect(adopted.task.title).toBe("Reporting exports");
     expect(adopted.task.openedBy).toMatchObject({ botId: sender.id, kind: "pair" });
     // it is the pair conversation all the same: the next send continues it
-    expect(store.resolvePairConversation(sender, recipient.id)!.task.threadId).toBe(row.threadId);
+    expect(store.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(row.threadId);
     expect(store.taskByThread(recipient.id, row.threadId)!.title).toBe("Reporting exports");
     expect(store.tasks(recipient.id)).toHaveLength(2);
   });
 
-  it("resolvePairConversation reopens a closed pair conversation instead of opening a second one", () => {
+  it("resolvePairConversation reopens a closed pair conversation and gives concurrent work its own thread", () => {
     const store = new Store(selection);
     const recipient = store.createBot({ name: "Scout" });
     const sender = store.createBot({ name: "Clive" });
-    const pair = store.resolvePairConversation(sender, recipient.id)!.task;
+    const idle = { working: () => false };
+    const pair = store.resolvePairConversation(sender, recipient.id, idle)!.task;
     // closed once its result was read; picking it back up must not open a
     // second line between the same two bots
     store.setTaskClosedBy(recipient.id, pair.threadId, { botId: sender.id, name: "Clive", at: 5 });
-    const reopened = store.resolvePairConversation(sender, recipient.id)!;
+    const reopened = store.resolvePairConversation(sender, recipient.id, idle)!;
     expect(reopened.task.threadId).toBe(pair.threadId);
     expect(reopened.created).toBe(false);
     expect(store.taskByThread(recipient.id, pair.threadId)).not.toHaveProperty("closedBy");
-    expect(store.tasks(recipient.id)).toHaveLength(2);
+    // a second assignment arriving while that one is still working gets its
+    // own thread, named by the caller's label
+    const busy = { working: (threadId: string) => threadId === pair.threadId };
+    const work = store.resolvePairConversation(sender, recipient.id, { ...busy, label: "Header row" })!;
+    expect(work.created).toBe(true);
+    expect(work.task.threadId).not.toBe(pair.threadId);
+    expect(work.task.title).toBe("@Clive · Header row");
+    expect(work.task.openedBy).toMatchObject({ botId: sender.id, kind: "work" });
+    // no label is still honest and short, never the brief
+    expect(store.resolvePairConversation(sender, recipient.id, busy)!.task.title).toBe("@Clive · parallel work");
+    // a work thread is never mistaken for the pair conversation afterwards
+    expect(store.resolvePairConversation(sender, recipient.id, idle)!.task.threadId).toBe(pair.threadId);
+    expect(store.tasks(recipient.id).filter((task) => task.openedBy?.kind === "pair")).toHaveLength(1);
+    expect(store.tasks(recipient.id).filter((task) => task.openedBy?.kind === "work")).toHaveLength(2);
   });
 
   it("setTaskClosedBy stamps who closed a thread, survives a reload, and null reopens it", () => {

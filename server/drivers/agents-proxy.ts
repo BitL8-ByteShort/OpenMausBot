@@ -412,6 +412,7 @@ const TOOLS = [
       message: { type: "string", minLength: 1, maxLength: 4000, description: "Self-contained question or task for these teammates. Send separate requests when responsibilities differ." },
       request_key: { type: "string", description: "A short unique assignment key. Reuse for an identical retry." },
       rework: { type: "boolean", description: "True only for concrete additional work from someone who already completed a request." },
+      label: { type: "string", description: "Optional short name (one line, at most 60 characters) for this job. Used only when the teammate is still working on your previous assignment and this one therefore runs in its own thread beside your standing conversation." },
     }, required: ["bot_ids", "message", "request_key"] },
   },
   {
@@ -991,7 +992,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
   if (name === "coordinate_bots") {
     const r = await api("/api/internal/coordinate-bots", { method: "POST", body: JSON.stringify({
       groupId: args.group_id, botIds: args.bot_ids, message: args.message,
-      requestKey: args.request_key, rework: args.rework,
+      requestKey: args.request_key, rework: args.rework, label: args.label,
     }) });
     return { text: JSON.stringify(r), ...(r.error ? { isError: true } : {}) };
   }

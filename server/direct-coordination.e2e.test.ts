@@ -227,6 +227,31 @@ it("keeps one conversation per bot pair across separate user turns, titled for t
   expect((await f.messages(f.chief.activeTaskId)).filter((message: any) => message.threadRef?.threadId === pair.threadId)).toHaveLength(6);
 }), 90_000);
 
+it("gives a second simultaneous assignment its own labelled thread, which closes once its result is reported", () => fixture(async f => {
+  f.plan[f.lead.id] = { turns: [{ reply: "Export implemented" }, { reply: "Benchmark finished" }] };
+  f.plan[f.chief.id] = { steps: [
+    { arguments: { bot_ids: [f.lead.id], request_key: "build", message: "Implement the CSV export" } },
+    { arguments: { bot_ids: [f.lead.id], request_key: "bench", message: "Benchmark the exporter on the large fixture", label: "Benchmark" } },
+  ], reply: "Both assignments are out", resumeReply: "Both came back" };
+  await f.start();
+  expect((await f.wait()).status).toBe("settled");
+  const tasks = (await f.api("/api/bots")).bots.find((bot: any) => bot.id === f.lead.id).tasks;
+  expect(tasks).toHaveLength(3);
+  const pair = tasks.find((task: any) => task.openedBy?.kind === "pair");
+  const work = tasks.find((task: any) => task.openedBy?.kind === "work");
+  expect(pair.title).toBe("@Clive");
+  expect(work.title).toBe("@Clive · Benchmark");
+  // the two jobs never share a transcript
+  const threads = f.nodes().filter((node: any) => node.botId === f.lead.id).map((node: any) => node.threadId);
+  expect(new Set(threads)).toEqual(new Set([pair.threadId, work.threadId]));
+  expect((await f.messages(pair.threadId)).some((message: any) => message.text?.includes("Implement the CSV export"))).toBe(true);
+  expect((await f.messages(work.threadId)).some((message: any) => message.text?.includes("Benchmark the exporter"))).toBe(true);
+  expect((await f.messages(pair.threadId)).some((message: any) => message.text?.includes("Benchmark the exporter"))).toBe(false);
+  // scaffolding tidies up after itself; the standing conversation stays
+  expect(work.closedBy).toMatchObject({ botId: f.chief.id, name: "Clive" });
+  expect(pair).not.toHaveProperty("closedBy");
+}), 60_000);
+
 it("refuses a reused request_key for different work and leaves no thread behind", () => fixture(async f => {
   f.plan[f.lead.id] = { reply: "Export implemented" };
   f.plan[f.chief.id] = { steps: [
