@@ -4668,7 +4668,14 @@ bus.subscribe((event: RuntimeEvent) => {
       // workspace has configured instead of leaving them to notice, open
       // settings, and switch by hand. maybeRaiseQuotaCard is the one place
       // that decides whether this actually was a quota error.
-      if (bot) maybeRaiseQuotaCard(quotaSwitchBus, bot, event.threadId, event.message);
+      if (bot) {
+        // The user message this failing turn was answering to, captured
+        // NOW — the quota card leaves the composer open, so re-deriving
+        // "the last user message" once the card is answered could catch a
+        // message sent afterward instead of the one that actually failed.
+        const failedUserMessage = [...store.activePath(event.threadId)].reverse().find((m) => m.role === "user");
+        void maybeRaiseQuotaCard(quotaSwitchBus, bot, event.threadId, event.message, failedUserMessage?.id);
+      }
       break;
     case "thread.token-usage.updated":
       // running totals for the turn in flight; folded into the task's
