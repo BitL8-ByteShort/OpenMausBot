@@ -10727,7 +10727,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           })).filter(g => g.members.length);
           return json(res, 200, { currentRoom: source ? { id: source.id, name: source.name, workingFolder: source.cwd || null } : null,
             bots: reachablePeers(store.bots, internalSender).map(bot => ({ id: bot.id, name: bot.name, title: bot.title, section: bot.section, busy: bot.busy })),
-            rooms, note: "Without group_id: use this room when in a room, otherwise a new separate recipient task. Each bot uses its own environment and permissions. Files are not transferred: pass absolute paths only when accessible to the recipient, otherwise pass the content." });
+            rooms, note: "Without group_id: use this room when in a room, otherwise your standing conversation with that teammate — every assignment you send it continues the same thread, so write as if it remembers the last one. Each bot uses its own environment and permissions. Files are not transferred: pass absolute paths only when accessible to the recipient, otherwise pass the content." });
         }
         if (method === "POST" && path === "/api/internal/coordinate-bots") {
           const parsed = z.object({
