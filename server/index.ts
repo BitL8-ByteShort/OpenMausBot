@@ -10748,18 +10748,21 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             try {
               requireActiveInternalCapability();
               if (!destination) {
-                const existing = roomHandoffs.children(internalCapability.roomHandoffId ?? internalCapability.generation)
-                  .find(node => node.key === parsed.data.requestKey + ":" + target.botId);
-                if (existing) target.threadId = existing.threadId;
-                else {
-                  const task = store.createTask(target.botId, parsed.data.message, false, undefined,
-                    { botId: internalSender.id, name: internalSender.name, at: Date.now() });
-                  if (!task) throw new Error("The recipient no longer exists");
-                  target.threadId = createdThread = task.threadId;
-                }
+                // One durable conversation per pair of bots, resolved from
+                // the recipient's own threads — never from this turn, the
+                // request key, or the thread the person has selected there.
+                const resolved = store.resolvePairConversation(internalSender, target.botId);
+                if (!resolved) throw new Error("The recipient no longer exists");
+                target.threadId = resolved.task.threadId;
+                if (resolved.created) createdThread = resolved.task.threadId;
               }
               const { node, duplicate } = roomHandoffs.enqueue(address, internalCapability.generation, internalCapability.roomHandoffId,
                 target, parsed.data.requestKey + ":" + target.botId, parsed.data.message, approvalGranted, parsed.data.rework, [...store.messagesFor(address.threadId)].reverse().find(m => m.role === "user" && m.kind === "text")?.text ?? "");
+              // A re-dispatched request_key is answered by the request it
+              // already made, so a thread resolved for the retry (the pair
+              // conversation was busy with that very request) goes back
+              // before anyone sees a row that leads nowhere.
+              if (duplicate && createdThread && createdThread !== node.threadId) store.deleteTask(target.botId, createdThread);
               createdThread = undefined; // The durable coordinator now owns this task.
               accepted.push({ requestId: node.id, botId: node.botId, duplicate, status: node.status });
               if (!duplicate) {
