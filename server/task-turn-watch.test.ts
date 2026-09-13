@@ -26,7 +26,7 @@ describe("task turn watch", () => {
     vi.useFakeTimers();
     try {
       const claimed = claim();
-      const watch = createTaskTurnWatch();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
       watch.watch(claimed.id, "thread-1");
 
       // Simulate the turn producing real activity every 60s (well under the
@@ -52,7 +52,7 @@ describe("task turn watch", () => {
     vi.useFakeTimers();
     try {
       const claimed = claim();
-      const watch = createTaskTurnWatch();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
       watch.watch(claimed.id, "thread-8");
       // No handle() calls at all — the turn's event stream is completely
       // silent (one long tool call, say) — but the turn is still actually
@@ -76,7 +76,7 @@ describe("task turn watch", () => {
 
   it("moves a task to review when its watched turn completes successfully", () => {
     const claimed = claim();
-    const watch = createTaskTurnWatch();
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
     watch.watch(claimed.id, "thread-2");
 
     watch.handle({ type: "item.completed", threadId: "thread-2" });
@@ -89,7 +89,7 @@ describe("task turn watch", () => {
 
   it("moves a task to blocked with the reason when its watched turn fails", () => {
     const claimed = claim();
-    const watch = createTaskTurnWatch();
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
     watch.watch(claimed.id, "thread-3");
 
     watch.handle({ type: "turn.completed", threadId: "thread-3", ok: false, stopReason: "provider quota exhausted" });
@@ -101,7 +101,7 @@ describe("task turn watch", () => {
 
   it("treats a session exit with no turn.completed as a failure too", () => {
     const claimed = claim();
-    const watch = createTaskTurnWatch();
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
     watch.watch(claimed.id, "thread-4");
 
     watch.handle({ type: "session.exited", threadId: "thread-4" });
@@ -113,7 +113,7 @@ describe("task turn watch", () => {
     vi.useFakeTimers();
     try {
       const claimed = claim();
-      const watch = createTaskTurnWatch();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
       watch.watch(claimed.id, "thread-5");
       // One burst of real activity, then the process dies: nothing in this
       // module survives that (no more handle() calls, and the keepalive
@@ -139,7 +139,7 @@ describe("task turn watch", () => {
     vi.useFakeTimers();
     try {
       const claimed = claim();
-      const watch = createTaskTurnWatch();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
       watch.watch(claimed.id, "thread-10");
       expect(vi.getTimerCount()).toBeGreaterThan(0);
 
@@ -159,7 +159,7 @@ describe("task turn watch", () => {
 
   it("stops reacting to a threadId once its turn has settled — no leaked listener", () => {
     const claimed = claim();
-    const watch = createTaskTurnWatch();
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
     watch.watch(claimed.id, "thread-6");
     watch.handle({ type: "turn.completed", threadId: "thread-6", ok: true });
     expect(board.getTask(claimed.id)?.status).toBe("review");
@@ -171,8 +171,136 @@ describe("task turn watch", () => {
     expect(board.getTask(claimed.id)?.status).toBe("review");
   });
 
+  it("stops beating once the keepalive's silence budget runs out, so a wedged turn is reclaimable", async () => {
+    // The keepalive must be genuinely bounded: a turn that never emits a
+    // single event and never completes (a dispatch that failed inside the
+    // un-awaited setup IIFE, say) otherwise keeps a timer heartbeating the
+    // task for the life of the process, and staleRunning can never reclaim
+    // it — the task holds a concurrency slot in "running" forever.
+    vi.useFakeTimers();
+    try {
+      const claimed = claim();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000, maxSilentMs: 600_000 });
+      watch.watch(claimed.id, "thread-wedged");
+
+      vi.advanceTimersByTime(600_000 + 180_000 + 1_000); // budget spent, then a full stale window of silence
+
+      const dispatch = vi.fn(async () => ({ threadId: "thread-wedged-retry" }));
+      await createDispatcher({ dispatch, now: () => Date.now(), staleAfterMs: 180_000 }).tick();
+
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(board.getTask(claimed.id)?.attempts).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("beats only while the harness agrees the thread is still working", async () => {
+    // Honest evidence, not a blind timer: the moment the harness says that
+    // thread is not busy any more, the keepalive stops asserting liveness
+    // and the stale sweep is allowed to do its job.
+    vi.useFakeTimers();
+    try {
+      const claimed = claim();
+      let working = true;
+      const watch = createTaskTurnWatch({
+        staleAfterMs: 180_000,
+        isThreadAlive: () => working,
+      });
+      watch.watch(claimed.id, "thread-quiet", { botId: "bot-1" });
+      vi.advanceTimersByTime(120_000);
+      working = false;
+      vi.advanceTimersByTime(181_000);
+
+      const dispatch = vi.fn(async () => ({ threadId: "thread-quiet-retry" }));
+      await createDispatcher({ dispatch, now: () => Date.now(), staleAfterMs: 180_000 }).tick();
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("settles a task to blocked when the dispatch itself fails without ever emitting a completion", async () => {
+    const claimed = claim();
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
+    watch.watch(claimed.id, "thread-failed");
+
+    watch.fail("thread-failed", "the bot's provider account is being updated");
+
+    const after = board.getTask(claimed.id);
+    expect(after?.status).toBe("blocked");
+    expect(after?.blockedReason).toBe("the bot's provider account is being updated");
+  });
+
+  it("redacts a provider's own words before they are stored as a blocked reason", () => {
+    const claimed = claim();
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
+    watch.watch(claimed.id, "thread-secret");
+
+    watch.handle({
+      type: "turn.completed",
+      threadId: "thread-secret",
+      ok: false,
+      stopReason: "401 from https://api.example.com with api_key=sk-liveSECRETvalue123",
+    });
+
+    const reason = board.getTask(claimed.id)?.blockedReason ?? "";
+    expect(reason).not.toContain("sk-liveSECRETvalue123");
+    expect(reason).toContain("401 from");
+  });
+
+  it("ignores a superseded attempt's terminal signal instead of settling the attempt that replaced it", () => {
+    // A reclaim (or a human moving a task back to ready) re-dispatches the
+    // task under a NEW thread. When the OLD turn finally completes, its
+    // settle would be a perfectly legal running -> review move on the task —
+    // marking the NEW attempt finished while its turn is still running.
+    const claimed = claim("re-dispatched");
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
+    watch.watch(claimed.id, "thread-old");
+
+    board.setStatus(claimed.id, "ready");
+    const again = board.setStatus(claimed.id, "running");
+    watch.watch(again.id, "thread-new");
+
+    watch.handle({ type: "turn.completed", threadId: "thread-old", ok: true });
+    expect(board.getTask(claimed.id)?.status).toBe("running");
+
+    watch.handle({ type: "turn.completed", threadId: "thread-new", ok: true });
+    expect(board.getTask(claimed.id)?.status).toBe("review");
+  });
+
+  it("tears down a task's previous watch when the same task is watched again", () => {
+    vi.useFakeTimers();
+    try {
+      const claimed = claim();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
+      watch.watch(claimed.id, "thread-a");
+      watch.watch(claimed.id, "thread-b");
+      expect(vi.getTimerCount()).toBe(1);
+      watch.handle({ type: "turn.completed", threadId: "thread-b", ok: true });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forgets a watch that was armed for a turn that never started", () => {
+    vi.useFakeTimers();
+    try {
+      const claimed = claim();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
+      watch.watch(claimed.id, "thread-stillborn");
+      watch.unwatch(claimed.id);
+      expect(vi.getTimerCount()).toBe(0);
+      watch.handle({ type: "turn.completed", threadId: "thread-stillborn", ok: true });
+      expect(board.getTask(claimed.id)?.status).toBe("running");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ignores events for threads nobody is watching", () => {
-    const watch = createTaskTurnWatch();
+    const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
     expect(() => watch.handle({ type: "turn.completed", threadId: "stranger", ok: true })).not.toThrow();
   });
 
@@ -180,7 +308,7 @@ describe("task turn watch", () => {
     vi.useFakeTimers();
     try {
       const claimed = claim();
-      const watch = createTaskTurnWatch();
+      const watch = createTaskTurnWatch({ staleAfterMs: 180_000 });
       watch.watch(claimed.id, "thread-7");
       expect(vi.getTimerCount()).toBeGreaterThan(0);
       watch.stopAll();
