@@ -4968,16 +4968,21 @@ async function startTurn(
   // driver's own SendTurnInput.transcript must not change for this — only
   // buildTurnContext's inline replay gets the richer version.
   //
-  // selectReplayLines (server/turn-context.ts) owns the actual selection:
-  // content is capped at 40 exactly like `transcript` above, tool lines are
-  // capped separately at 20 and only fill in alongside content already in
-  // the window — so a chatty turn's tool calls can never evict an older
-  // text reply or a teammate's returned report, and a message that is BOTH
-  // content and tool-bearing (a returned-report receipt: kind "activity",
-  // `roomRequest.phase === "result"`, and a `tool` chip) always renders as
-  // content, never downgraded to a throwaway tool line. Only the eligible
-  // (non-skipped) messages are handed in; skipTranscript exclusion is a
-  // store/index.ts concern the pure selector does not need to know about.
+  // selectReplayLines (server/turn-context.ts) owns the actual selection —
+  // the full invariant: content is capped at 40 exactly like `transcript`
+  // above (so a chatty turn's tool calls can never evict an older text
+  // reply or a teammate's returned report); tool lines fill in only from
+  // STRICTLY INSIDE that content window — never before its first message,
+  // never after its last (a long tail of trailing activity, for instance
+  // the very turn about to be replayed, does not count as "inside the
+  // conversation so far") — capped separately at 20, keeping the most
+  // recent, so a tool-heavy thread can never balloon the replayed prompt;
+  // and a message that is BOTH content and tool-bearing (a returned-report
+  // receipt: kind "activity", `roomRequest.phase === "result"`, and a
+  // `tool` chip) always renders as content, never downgraded to a
+  // throwaway tool line. Only the eligible (non-skipped) messages are
+  // handed in; skipTranscript exclusion is a store/index.ts concern the
+  // pure selector does not need to know about.
   const eligibleForReplay = activeMessages.filter((m) => !skipTranscript.has(m.id));
   const replayTranscript = selectReplayLines(
     eligibleForReplay.map((m) => ({

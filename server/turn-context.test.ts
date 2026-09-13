@@ -112,14 +112,21 @@ describe("selectReplayLines", () => {
     // roomRequest.phase === "result", AND a tool chip, all at once
     return { isContent: true, hasTool: true };
   }
+  /** an identifiable tool line, so a test can assert WHICH ones survive a
+   * cap, not merely how many. */
+  function taggedTool(tag: number): ReplayCandidate & { tag: number } {
+    return { isContent: false, hasTool: true, tag };
+  }
 
   it("keeps every content message in the window even with far more than 40 tool lines interleaved", () => {
     const items: ReplayCandidate[] = [];
     for (let i = 0; i < 45; i++) {
       items.push(content());
       // ten tool calls between every pair of content messages — 450 tool
-      // lines total, more than ten times REPLAY_TOOL_LINE_CAP
-      for (let j = 0; j < 10; j++) items.push(tool());
+      // lines total, more than ten times REPLAY_TOOL_LINE_CAP, and every
+      // one of them strictly between two content messages (inside the
+      // window this builds, never trailing after the last one)
+      if (i < 44) for (let j = 0; j < 10; j++) items.push(tool());
     }
     const selected = selectReplayLines(items);
     const contentKept = selected.filter((entry) => entry.line === "content");
@@ -142,17 +149,46 @@ describe("selectReplayLines", () => {
     expect(selected[1]!.item).toBe(items[1]);
   });
 
-  it("adds tool lines only from inside the span content already covers, capped separately", () => {
-    const items: ReplayCandidate[] = [tool(), tool(), content(), tool(), tool(), tool()];
+  it("keeps tool lines only strictly between the first and last kept content messages", () => {
+    const items: ReplayCandidate[] = [
+      tool(), tool(), // before the window content defines — dropped
+      content(),
+      tool(), tool(), tool(), // inside the window — kept
+      content(),
+      tool(), tool(), // after the window — for instance the very turn
+      // about to be replayed — dropped, however recent
+    ];
     const selected = selectReplayLines(items);
-    // the two tool lines before the first kept content message are outside
-    // the window content defines and must not appear
     expect(selected.filter((entry) => entry.line === "tool")).toHaveLength(3);
-    expect(selected).toHaveLength(4);
+    expect(selected).toHaveLength(5); // 2 content + 3 tool
+  });
+
+  // The bound this round adds: tool lines were already capped overall, but
+  // the window they were drawn from used to run to the end of the eligible
+  // messages instead of stopping at the last kept content message — a
+  // tool-heavy thread could still balloon the replayed prompt with a long
+  // tail of trailing activity. Both defenses are exercised together here.
+  it("caps tool lines inside the window at REPLAY_TOOL_LINE_CAP, keeping the most recent and dropping the oldest", () => {
+    const items: ReplayCandidate[] = [
+      content(),
+      // far more than REPLAY_TOOL_LINE_CAP (20) tool lines, all strictly
+      // inside the window
+      ...Array.from({ length: 30 }, (_, i) => taggedTool(i)),
+      content(),
+    ];
+    const selected = selectReplayLines(items);
+    const toolKept = selected.filter((entry) => entry.line === "tool");
+    expect(toolKept).toHaveLength(REPLAY_TOOL_LINE_CAP);
+    // tags 10..29 — the most recent 20 — not 0..19, the oldest
+    expect(toolKept.map((entry) => (entry.item as unknown as { tag: number }).tag)).toEqual(
+      Array.from({ length: REPLAY_TOOL_LINE_CAP }, (_, i) => i + (30 - REPLAY_TOOL_LINE_CAP)),
+    );
+    // content is never displaced by the cap on tool lines
+    expect(selected.filter((entry) => entry.line === "content")).toHaveLength(2);
   });
 
   it("preserves original chronological order when merging content and tool lines", () => {
-    const items = [content(), tool(), tool(), content(), tool()];
+    const items = [content(), tool(), tool(), content()];
     const selected = selectReplayLines(items);
     expect(selected.map((entry) => entry.item)).toEqual(items);
   });

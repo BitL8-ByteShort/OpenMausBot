@@ -61,20 +61,35 @@ export interface ReplayCandidate {
 }
 
 /** Which of `messages` (in their original order) an inline replay should
- * carry, and how. Content is selected FIRST and capped at
- * REPLAY_CONTENT_CAP exactly like the plain text-only transcript — this is
- * the fix for a real regression: an earlier version ran content and tool
- * lines through one shared cap, so a turn with many tool calls could evict
- * an older text reply, or a teammate's returned report, from the replay.
- * Tool lines are added only from inside the span content already spans
- * (from the first kept content message onward — nothing before it, since
- * that span is exactly what "the replay" means), capped separately at
- * REPLAY_TOOL_LINE_CAP (most recent kept). A message flagged `isContent`
- * is NEVER also emitted as a tool line, even when `hasTool` is also true —
- * that exact double nature (a returned-report receipt) is what broke
- * server/direct-coordination.e2e.test.ts's "rechecks access before replay"
- * case: the report was still inside the window, but got rendered as a
- * throwaway tool line instead of the report itself. */
+ * carry, and how. The full invariant:
+ *
+ * - Content is selected FIRST and capped at REPLAY_CONTENT_CAP (40),
+ *   exactly like the plain text-only transcript — this is the fix for a
+ *   real regression: an earlier version ran content and tool lines through
+ *   one shared cap, so a turn with many tool calls could evict an older
+ *   text reply, or a teammate's returned report, from the replay. Since
+ *   this selection is identical to the plain transcript's own, it cannot
+ *   regress to contain less content than before.
+ * - Tool lines are added only from STRICTLY INSIDE the span content
+ *   already covers — between the first and last kept content messages;
+ *   never before the first, and never after the last (trailing tool
+ *   activity after the newest kept content message — for instance the
+ *   very turn about to be replayed — is not "inside the conversation so
+ *   far" and is dropped, however recent it is).
+ * - Within that window, tool lines are capped SEPARATELY at
+ *   REPLAY_TOOL_LINE_CAP (20), keeping the most recent and dropping the
+ *   oldest — a tool-heavy thread must not be able to balloon the replayed
+ *   prompt. This matters most for quota-switch: the person is switching
+ *   engines BECAUSE they ran out of quota, so sending a much larger prompt
+ *   to the new engine is the worst possible moment for unbounded growth.
+ * - Tool lines never displace, or get mistaken for, content: a message
+ *   flagged `isContent` is NEVER also emitted as a tool line, even when
+ *   `hasTool` is also true. That exact double nature (a returned-report
+ *   receipt is `kind: "activity"` with a `tool` chip AND
+ *   `roomRequest.phase === "result"`) is what broke
+ *   server/direct-coordination.e2e.test.ts's "rechecks access before
+ *   replay" case: the report was still inside the window, but got
+ *   rendered as a throwaway tool line instead of the report itself. */
 export function selectReplayLines<T extends ReplayCandidate>(
   messages: readonly T[],
 ): Array<{ item: T; line: "content" | "tool" }> {
@@ -82,10 +97,17 @@ export function selectReplayLines<T extends ReplayCandidate>(
     .map((item, index) => ({ item, index }))
     .filter(({ item }) => item.isContent)
     .slice(-REPLAY_CONTENT_CAP);
+  // Tool lines may only fill the SPAN content covers — bounded above by the
+  // last kept content message's own index, not "to the end of messages".
+  // Anything after that last content message (including the very turn
+  // about to be replayed) is not "inside the conversation so far" and is
+  // dropped, however recent it is.
   const contentWindowStart = indexedContent.length ? indexedContent[0]!.index : messages.length;
+  const contentWindowEnd = indexedContent.length ? indexedContent[indexedContent.length - 1]!.index : -1;
   const indexedToolLines = messages
     .map((item, index) => ({ item, index }))
-    .filter(({ item, index }) => index >= contentWindowStart && item.hasTool && !item.isContent)
+    .filter(({ item, index }) =>
+      index >= contentWindowStart && index <= contentWindowEnd && item.hasTool && !item.isContent)
     .slice(-REPLAY_TOOL_LINE_CAP);
   return [
     ...indexedContent.map(({ item, index }) => ({ item, index, line: "content" as const })),
