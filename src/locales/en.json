@@ -2006,5 +2006,21 @@
   "backup.skipDrafts": "Continue without restoring drafts",
   "backup.skipDraftsHint": "Keep this browser’s current drafts and preferences. This does not undo the workspace restore.",
   "backup.serverBusy": "A workspace backup operation is already running.",
-  "backup.checkStatus": "Checking backup availability…"
+  "backup.checkStatus": "Checking backup availability…",
+  "canvas.description": "Your bots, their teams, and how they work together.",
+  "canvas.botCount": "{count} bots",
+  "canvas.editBot": "Edit {name}",
+  "canvas.bot": "Bot",
+  "canvas.openChat": "Open chat",
+  "canvas.changeModel": "Change default model for {name}",
+  "canvas.defaultModel": "Default model",
+  "canvas.arrange": "Arrange {name} team",
+  "canvas.arrangeHint": "Drag to arrange. Arrow keys move this team; Shift moves farther.",
+  "canvas.manageTeam": "Manage {name} team",
+  "canvas.dropHere": "Drag bots here, or add existing bots from the team menu.",
+  "canvas.hint": "Drag to arrange · Click a bot to edit · Scroll to pan · Ctrl + scroll to zoom",
+  "canvas.fitHint": "Fit teams to view (0)",
+  "canvas.moving": "Moving {name}…",
+  "canvas.moved": "Moved {name} to {team}.",
+  "canvas.handoffs": "Agent handoffs"
 }

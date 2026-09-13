@@ -11,6 +11,7 @@ Run the isolated lifecycle checks:
 ```sh
 pnpm exec vitest run server/team-lifecycle.e2e.test.ts server/section-context.test.ts server/store.test.ts src/lib/team-map.test.ts --maxWorkers=2
 OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/team-lifecycle-ui.e2e.test.ts scripts/testing/team-template-ui.e2e.test.ts --maxWorkers=1
+OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/team-canvas-ui.e2e.test.ts --maxWorkers=1
 ```
 
 The server test uses `launchVerificationServer`, sends a sample conversation,
@@ -35,6 +36,28 @@ the team's instructions will be removed. It captures
 `.omb-scratch/verify-evidence/team-lifecycle.png` before deletion.
 New lifecycle labels use the existing string catalog; untranslated packs fall
 back to the English labels without changing or regenerating other translations.
+
+The canvas renderer check uses that same isolated full-app launcher. It seeds
+two Chiefs, two specialists with different model defaults, an empty team, and
+a real conversation with the fake engine. Opening a bot's settings or model
+section keeps Team map mounted. A multi-bot move preserves bot identities,
+threads, model defaults, messages, and shared instructions; selecting a Chief
+and another bot for a conflicting move leaves both memberships unchanged.
+Team controls are grouped under each team's **Manage** menu.
+The General-team move is also completed with keyboard input through the native
+menu and bot picker, with focus returning to the menu summary afterward.
+Synthetic drag/drop moves a bot through the real API, while arranging a team
+stores its canvas position without changing membership. Panning, zoom controls,
+fitting the teams to view, and restoring arranged positions on reload are
+checked against the rendered layout. Leaving a pending gesture permits the next
+bot click, and Escape during arrangement restores the original position.
+
+The test retains its before/after receipts and dark/light screenshots beside
+the fixture log as `*.team-canvas.json` and `*.team-canvas-*.png`. Its injected
+pointer events exercise renderer gesture handlers against the isolated API;
+they do not prove native pointer capture or physical mouse/touch behavior.
+Native input and narrow-window appearance need separate fixture browser or
+Electron verification. Never use the running desktop app for those checks.
 
 The owner API keeps the existing `/api/sidebar-sections` name for older clients:
 
