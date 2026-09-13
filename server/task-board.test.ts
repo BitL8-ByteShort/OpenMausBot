@@ -109,3 +109,51 @@ describe("comments", () => {
     expect(board.commentsOf(task.id).map((c) => c.botId)).toEqual(["bot-1", null]);
   });
 });
+
+describe("heartbeat and staleness", () => {
+  beforeEach(() => board.openBoard(join(DATA, `h-${Math.random()}.db`)));
+
+  it("bumps heartbeatAt for a running task", () => {
+    const task = board.createTask({ title: "long haul" });
+    board.setStatus(task.id, "ready");
+    const running = board.setStatus(task.id, "running");
+    const bumped = board.heartbeat(task.id);
+    expect(bumped.status).toBe("running");
+    expect(bumped.heartbeatAt).toBeGreaterThanOrEqual(running.heartbeatAt ?? 0);
+  });
+
+  it("refuses to heartbeat a task that isn't running", () => {
+    const task = board.createTask({ title: "not started yet" });
+    expect(() => board.heartbeat(task.id)).toThrow(/running/);
+  });
+
+  it("finds a running task whose heartbeat is older than the cutoff", () => {
+    const task = board.createTask({ title: "flatlined" });
+    board.setStatus(task.id, "ready");
+    board.setStatus(task.id, "running");
+    expect(board.staleRunning(Date.now() + 1000).map((t) => t.id)).toContain(task.id);
+    expect(board.staleRunning(Date.now() - 1000).map((t) => t.id)).not.toContain(task.id);
+  });
+
+  it("excludes tasks that are not running from staleness", () => {
+    const task = board.createTask({ title: "idle" });
+    expect(board.staleRunning(Date.now() + 1000).map((t) => t.id)).not.toContain(task.id);
+  });
+});
+
+describe("attachThread", () => {
+  beforeEach(() => board.openBoard(join(DATA, `a-${Math.random()}.db`)));
+
+  it("records the thread a running task executed in without changing its status", () => {
+    const task = board.createTask({ title: "long haul" });
+    board.setStatus(task.id, "ready");
+    board.setStatus(task.id, "running");
+    const withThread = board.attachThread(task.id, "thread-42");
+    expect(withThread.status).toBe("running");
+    expect(withThread.threadId).toBe("thread-42");
+  });
+
+  it("throws for a task that does not exist", () => {
+    expect(() => board.attachThread("no-such-id", "thread-1")).toThrow(/no such task/);
+  });
+});

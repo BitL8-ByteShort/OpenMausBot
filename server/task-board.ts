@@ -299,6 +299,54 @@ export function promotable(): BoardTask[] {
   return rows.map(rowToTask);
 }
 
+/** A running task's liveness stamp. The dispatcher tick treats a running
+ * task whose heartbeat has gone cold as dead and reclaims it — a bot
+ * that is still alive must call this while it works, or its own task
+ * gets handed back to the pool out from under it. */
+export function heartbeat(id: string): BoardTask {
+  const task = getTask(id);
+  if (!task) throw new Error(`no such task: ${id}`);
+  if (task.status !== "running") {
+    throw new Error(`cannot heartbeat a task that is not running: ${task.status}`);
+  }
+  const now = Date.now();
+  handle().prepare("UPDATE tasks SET heartbeat_at = ?, updated_at = ? WHERE id = ?").run(now, now, id);
+  const updated = getTask(id);
+  if (!updated) throw new Error(`task vanished during update: ${id}`);
+  return updated;
+}
+
+/** Running tasks whose heartbeat has gone cold. Despite the name, this
+ * takes an absolute cutoff timestamp, not a duration — the dispatcher
+ * calls it as `staleRunning(now() - staleAfterMs)`, so anything with a
+ * heartbeat older than that instant is presumed dead. */
+export function staleRunning(olderThanMs: number): BoardTask[] {
+  const rows = handle()
+    .prepare(`
+      SELECT * FROM tasks
+      WHERE status = 'running' AND heartbeat_at IS NOT NULL AND heartbeat_at < ?
+      ORDER BY priority DESC, created_at ASC
+    `)
+    .all(olderThanMs) as unknown as TaskRow[];
+  return rows.map(rowToTask);
+}
+
+/** Record the thread a running task executed in, without moving it
+ * through the status machine again. The dispatcher already claimed the
+ * task via setStatus(id, "running") before it knows which thread the
+ * turn landed in — calling setStatus(id, "running", ...) a second time
+ * to attach it would be an illegal running -> running move, so this is
+ * a dedicated writer instead of a widened TRANSITIONS table. */
+export function attachThread(id: string, threadId: string): BoardTask {
+  const task = getTask(id);
+  if (!task) throw new Error(`no such task: ${id}`);
+  const now = Date.now();
+  handle().prepare("UPDATE tasks SET thread_id = ?, updated_at = ? WHERE id = ?").run(threadId, now, id);
+  const updated = getTask(id);
+  if (!updated) throw new Error(`task vanished during update: ${id}`);
+  return updated;
+}
+
 export function linkTasks(parentId: string, childId: string): void {
   handle()
     .prepare("INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)")
