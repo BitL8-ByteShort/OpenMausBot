@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fitTeams, layoutTeams, parsePositions, teamSize, zoomAt, type Tile } from "./team-canvas";
+import { fitTeams, layoutTeams, orderBots, parseBotOrders, parsePositions, reorderBot, teamSize, zoomAt, type Tile } from "./team-canvas";
 import type { TeamMapSection } from "./team-map";
 
 function section(key: string, chiefs = 0, members = 0): TeamMapSection {
@@ -84,5 +84,36 @@ describe("saved team positions", () => {
     expect(parsePositions(JSON.stringify(positions))).toEqual(positions);
     expect(layoutTeams([section("__proto__"), section("constructor"), section("")], positions)
       .map(({ x, y }) => ({ x, y }))).toEqual([{ x: -10, y: 20 }, { x: 30, y: 40 }, { x: 50, y: 60 }]);
+  });
+});
+
+describe("personal bot arrangement", () => {
+  const bots = [{ id: "A" }, { id: "B" }, { id: "C" }];
+
+  it("reorders only existing cards without mutating membership or source arrays", () => {
+    expect(reorderBot(bots, "A", 2)).toEqual(["B", "C", "A"]);
+    expect(reorderBot(bots, "C", 0)).toEqual(["C", "A", "B"]);
+    expect(reorderBot(bots, "B", -10)).toEqual(["B", "A", "C"]);
+    expect(reorderBot(bots, "B", 99)).toEqual(["A", "C", "B"]);
+    expect(reorderBot(bots, "missing", 0)).toEqual(["A", "B", "C"]);
+    expect(bots.map((bot) => bot.id)).toEqual(["A", "B", "C"]);
+  });
+
+  it("keeps new bots visible, ignores deleted IDs and applies the order separately to Chief/member lanes", () => {
+    const order = ["C", "removed", "A", "chief"];
+    expect(orderBots(bots, order).map((bot) => bot.id)).toEqual(["C", "A", "B"]);
+    expect(orderBots([{ id: "chief" }], order)).toEqual([{ id: "chief" }]);
+    expect(orderBots(bots)).toEqual(bots);
+  });
+
+  it("ignores invalid saved orders and preserves unusual section names safely", () => {
+    for (const raw of [null, "broken", "null", "[]", "42"]) expect(parseBotOrders(raw)).toEqual({});
+    const orders = parseBotOrders('{"Team":["B","B",null,4,"","A"],"bad":{},"__proto__":["C"],"constructor":["A"],"":["B"]}');
+    expect(orders.Team).toEqual(["B", "A"]);
+    expect(Object.hasOwn(orders, "bad")).toBe(false);
+    expect(Object.getPrototypeOf(orders)).toBe(Object.prototype);
+    expect(Object.hasOwn(orders, "__proto__")).toBe(true);
+    expect(orders["__proto__"]).toEqual(["C"]);
+    expect(parseBotOrders(JSON.stringify(orders))).toEqual(orders);
   });
 });

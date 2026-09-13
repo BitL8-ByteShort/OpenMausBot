@@ -9,6 +9,33 @@ export const CARD_HEIGHT = 126;
 export const GAP = 16;
 export const TEAM_PADDING = 20;
 export const HEADER_HEIGHT = 64;
+export const COMPUTER_DRAG_TYPE = "application/x-omb-computer";
+
+/** Personal card order never changes a bot's team or Chief role. */
+export function orderBots<T extends { id: string }>(bots: T[], order: string[] = []): T[] {
+  const rank = new Map(order.map((id, index) => [id, index]));
+  return [...bots].sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity));
+}
+
+export function reorderBot(bots: { id: string }[], botId: string, insertionIndex: number): string[] {
+  const ids = bots.map((bot) => bot.id);
+  if (!ids.includes(botId)) return ids;
+  const remaining = ids.filter((id) => id !== botId);
+  remaining.splice(Math.max(0, Math.min(remaining.length, insertionIndex)), 0, botId);
+  return remaining;
+}
+
+export function parseBotOrders(raw: string | null): Record<string, string[]> {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? "null");
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) => Array.isArray(value)
+      ? [[key, [...new Set(value.filter((id): id is string => typeof id === "string" && id.length > 0))]]]
+      : []));
+  } catch {
+    return {};
+  }
+}
 
 export function teamSize(section: TeamMapSection): { width: number; height: number } {
   const hierarchy = section.chiefs.length > 0 && section.members.length > 0;

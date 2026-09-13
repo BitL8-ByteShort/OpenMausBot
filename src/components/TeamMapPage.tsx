@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { ArrowRight, BookOpen, Loader2, Network, Plus, Save, X } from "lucide-react";
+import { ArrowRight, BookOpen, Box, Loader2, Monitor, Network, Plus, Save, Users, X } from "lucide-react";
 
 import { api, formatTime, useStore, type Bot } from "@/state/store";
 import {
@@ -15,6 +15,8 @@ import { TeamCanvas } from "./TeamCanvas";
 import { TeamDialog } from "./TeamDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { t } from "@/lib/i18n";
+import { CanvasComputers } from "./CanvasComputers";
+import type { TeamComputer } from "../../shared/team-computer";
 
 function EdgeRow({ edge, bots }: { edge: TeamMapEdge; bots: Bot[] }) {
   const { dispatch } = useStore();
@@ -255,6 +257,15 @@ export function TeamMapPage() {
   const [contextEditor, setContextEditor] = useState<{ section: string; label: string } | null>(null);
   const [teamEditor, setTeamEditor] = useState<{ section?: string; rename?: boolean } | null>(null);
   const [deletingTeam, setDeletingTeam] = useState<string | null>(null);
+  const [computersOpen, setComputersOpen] = useState(false);
+  const [createComputerRequest, setCreateComputerRequest] = useState(0);
+  const [computers, setComputers] = useState<TeamComputer[]>([]);
+  const [computerDrop, setComputerDrop] = useState<{ id: string; section: string } | null>(null);
+  const clearComputerDrop = useCallback(() => setComputerDrop(null), []);
+  const [pendingMove, setPendingMove] = useState<{ bot: Bot; destination: string; resolve: (moved: boolean) => void } | null>(null);
+  const pendingMoveRef = useRef(pendingMove);
+  pendingMoveRef.current = pendingMove;
+  useEffect(() => () => pendingMoveRef.current?.resolve(false), []);
   const bots = useMemo(() => state.bots.filter((bot) => !bot.hidden), [state.bots]);
   const sections = useMemo(() => {
     const names = [...new Set([...(state.sections ?? []), ...state.groups.flatMap((group) => group.section ? [group.section] : [])])];
@@ -294,6 +305,15 @@ export function TeamMapPage() {
     }
   };
 
+  const requestMove = (bot: Bot, destination: string) => new Promise<boolean>((resolve) => {
+    pendingMoveRef.current?.resolve(false);
+    setPendingMove({ bot, destination, resolve });
+  });
+  const cancelMove = useCallback(() => {
+    pendingMoveRef.current?.resolve(false);
+    setPendingMove(null);
+  }, []);
+
   return (
     <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-app text-ink">
       <header className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-hairline/40 px-6 py-4 max-md:pl-12">
@@ -305,17 +325,40 @@ export function TeamMapPage() {
           </div>
           <p className="mt-1 text-[12px] text-ink-secondary">{t("canvas.description")}</p>
         </div>
-        {!remoteClient && <button onClick={() => setTeamEditor({})} className="flex items-center gap-1.5 rounded-lg border border-hairline/60 bg-panel px-3 py-2 text-[12px] font-medium hover:bg-control"><Plus size={14} /> {t("team.create")}</button>}
+        {!remoteClient && <div className="flex items-center gap-2">
+          <button onClick={() => setComputersOpen((value) => !value)} aria-label="Computers" aria-expanded={computersOpen} className="rounded-lg p-2 text-ink-secondary hover:bg-control hover:text-ink"><Monitor size={17} /></button>
+          <details className="relative" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.removeAttribute("open"); }} onKeyDown={(event) => {
+            if (event.key === "Escape") { event.currentTarget.removeAttribute("open"); event.currentTarget.querySelector("summary")?.focus(); }
+          }}>
+            <summary aria-label="Add to team map" className="flex cursor-pointer list-none items-center gap-1.5 rounded-lg border border-hairline/60 bg-panel px-3 py-2 text-[12px] font-medium hover:bg-control [&::-webkit-details-marker]:hidden"><Plus size={14} /> Add</summary>
+            <div className="absolute right-0 top-full z-40 mt-2 w-52 rounded-xl border border-hairline/60 bg-panel p-1.5 shadow-xl" onClick={(event) => {
+              const details = event.currentTarget.closest("details"); details?.querySelector("summary")?.focus(); details?.removeAttribute("open");
+            }}>
+              <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-[12px] hover:bg-control" onClick={() => setTeamEditor({})}><Users size={14} />{t("team.create")}</button>
+              <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-[12px] hover:bg-control" onClick={() => { setComputersOpen(true); setCreateComputerRequest((value) => value + 1); }}><Box size={14} />Box computer</button>
+              <button className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-left text-[12px] hover:bg-control" onClick={() => dispatch({ type: "toggleAppSettings", section: "computer", open: true })}><Monitor size={14} />Local VM…</button>
+            </div>
+          </details>
+        </div>}
       </header>
       {(error || refreshError) && <div role="alert" className="flex shrink-0 items-center justify-between gap-3 border-b border-danger/20 bg-danger/10 px-6 py-2 text-[12px] text-danger">
         {error || refreshError}
         <button aria-label={t("common.close")} className="rounded p-1 hover:bg-danger/10" onClick={() => { setError(null); setRefreshError(null); }}><X size={14} /></button>
       </div>}
-      <TeamCanvas sections={sections} canManage={!remoteClient} onMove={moveBot}
+      <div className="relative flex min-h-0 flex-1">
+      <TeamCanvas sections={sections} canManage={!remoteClient} onMove={requestMove}
+        connectedBotIds={state.settingsOpen ? edges.flatMap((edge) => edge.sourceBotId === state.selectedId ? [edge.targetBotId] : edge.targetBotId === state.selectedId ? [edge.sourceBotId] : []) : []}
+        onComputer={(bot) => dispatch({ type: "toggleSettings", botId: bot.id, section: "access", open: true })}
+        teamComputers={Object.fromEntries(computers.filter((computer) => computer.section !== null).map((computer) => [computer.section!, { name: computer.name, state: computer.state }]))}
+        onTeamComputer={() => setComputersOpen(true)}
+        onComputerDrop={(id, section) => { if (!remoteClient) { setComputersOpen(true); setComputerDrop({ id, section }); } }}
         onInstructions={(section, label) => setContextEditor({ section, label })}
         onEditTeam={(section, rename) => setTeamEditor({ section, rename })}
         onDeleteTeam={setDeletingTeam}
         isEmpty={(key) => ![...state.bots, ...state.groups].some((record) => record.section?.trim() === key)} />
+      {!remoteClient && <CanvasComputers open={computersOpen} createRequest={createComputerRequest} drop={computerDrop} sections={sections}
+        onClose={() => setComputersOpen(false)} onDropHandled={clearComputerDrop} onChange={setComputers} />}
+      </div>
       {edges.length > 0 && <details className="shrink-0 border-t border-hairline/40 bg-panel px-6 py-3">
         <summary className="cursor-pointer text-[12px] text-ink-secondary">{t("canvas.handoffs")} · {edges.length}</summary>
         <div className="mt-3 max-h-48 space-y-2 overflow-y-auto">{edges.slice(0, 12).map((edge) => <EdgeRow key={`${edge.sourceBotId}:${edge.targetBotId}`} edge={edge} bots={bots} />)}</div>
@@ -328,6 +371,14 @@ export function TeamMapPage() {
         />
       )}
       {teamEditor && <TeamDialog {...teamEditor} onClose={() => setTeamEditor(null)} />}
+      <ConfirmDialog open={pendingMove !== null} tone="neutral" title={`Move ${pendingMove?.bot.name ?? "bot"} to ${pendingMove?.destination || "General"}?`}
+        body="This changes the bot's home team and shared instructions, not just its position. Its conversations and model stay with it. To arrange visually, drag within the same team."
+        confirmLabel="Move bot" onCancel={cancelMove} onConfirm={() => {
+          const move = pendingMoveRef.current;
+          if (!move) return;
+          setPendingMove(null);
+          void moveBot(move.bot, move.destination).then(() => move.resolve(true), () => move.resolve(false));
+        }} />
       <ConfirmDialog open={deletingTeam !== null} title={t("team.deleteTitle", { name: deletingTeam ?? "" })}
         body={t("team.deleteDescription")}
         confirmLabel={t("team.delete")} onCancel={() => setDeletingTeam(null)} onConfirm={() => {
