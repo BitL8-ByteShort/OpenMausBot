@@ -225,7 +225,7 @@ import {
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
-import { buildRecoveryText, buildTurnContext, engineIsFresh, formatToolActivityLine } from "./turn-context.ts";
+import { buildRecoveryText, buildTurnContext, engineIsFresh, formatToolActivityLine, selectReplayLines } from "./turn-context.ts";
 import { extractTurnImages } from "./turn-images.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import { TurnResources, workspaceResource, type TurnOwner } from "./turn-resources.ts";
@@ -4966,21 +4966,32 @@ async function startTurn(
   // which commands ran, not just what was said. `transcript` above stays
   // text-only: engineIsFresh's history check and a transcript-replay
   // driver's own SendTurnInput.transcript must not change for this — only
-  // buildTurnContext's inline replay gets the richer version. The same
-  // slice(-40) cap applies here too, so tool lines cannot make the replay
-  // grow without bound.
-  const replayTranscript = activeMessages
-    .filter((m) =>
-      ((m.kind === "text" && m.text) || m.roomRequest?.phase === "result" || (m.kind === "activity" && m.tool)) &&
-      !skipTranscript.has(m.id))
-    .slice(-40)
-    .map((m) => ({
-      role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-      text: m.kind === "activity" && m.tool
-        ? formatToolActivityLine(m.tool)
-        : m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
-          : transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
-    }));
+  // buildTurnContext's inline replay gets the richer version.
+  //
+  // selectReplayLines (server/turn-context.ts) owns the actual selection:
+  // content is capped at 40 exactly like `transcript` above, tool lines are
+  // capped separately at 20 and only fill in alongside content already in
+  // the window — so a chatty turn's tool calls can never evict an older
+  // text reply or a teammate's returned report, and a message that is BOTH
+  // content and tool-bearing (a returned-report receipt: kind "activity",
+  // `roomRequest.phase === "result"`, and a `tool` chip) always renders as
+  // content, never downgraded to a throwaway tool line. Only the eligible
+  // (non-skipped) messages are handed in; skipTranscript exclusion is a
+  // store/index.ts concern the pure selector does not need to know about.
+  const eligibleForReplay = activeMessages.filter((m) => !skipTranscript.has(m.id));
+  const replayTranscript = selectReplayLines(
+    eligibleForReplay.map((m) => ({
+      m,
+      isContent: (m.kind === "text" && Boolean(m.text)) || m.roomRequest?.phase === "result",
+      hasTool: m.kind === "activity" && Boolean(m.tool),
+    })),
+  ).map(({ item: { m }, line }) => ({
+    role: m.role === "user" ? ("user" as const) : ("assistant" as const),
+    text: line === "tool" && m.tool
+      ? formatToolActivityLine(m.tool)
+      : m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
+        : transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
+  }));
 
   // After a rewind (edit / branch switch) the provider's native session
   // still contains the abandoned branch: start a fresh session instead of

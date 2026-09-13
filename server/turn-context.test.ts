@@ -1,6 +1,15 @@
 import { describe, expect, it } from "vitest";
 
-import { buildTurnContext, engineIsFresh, buildRecoveryText, formatToolActivityLine } from "./turn-context.ts";
+import {
+  buildTurnContext,
+  engineIsFresh,
+  buildRecoveryText,
+  formatToolActivityLine,
+  selectReplayLines,
+  REPLAY_CONTENT_CAP,
+  REPLAY_TOOL_LINE_CAP,
+  type ReplayCandidate,
+} from "./turn-context.ts";
 
 const transcript = [
   { role: "user" as const, text: "my dog is named Biscuit" },
@@ -85,6 +94,67 @@ describe("formatToolActivityLine", () => {
     expect(line.length).toBe(120);
     expect(line.endsWith("…")).toBe(true);
     expect(line.startsWith("[ran: " + "x".repeat(10))).toBe(true);
+  });
+});
+
+describe("selectReplayLines", () => {
+  // Regression guard for server/direct-coordination.e2e.test.ts's "rechecks
+  // access before replay" case: a naive single shared cap let a chatty
+  // turn's tool calls evict older content from the window.
+  function content(): ReplayCandidate {
+    return { isContent: true, hasTool: false };
+  }
+  function tool(): ReplayCandidate {
+    return { isContent: false, hasTool: true };
+  }
+  function contentWithTool(): ReplayCandidate {
+    // a teammate's returned-report receipt: kind "activity",
+    // roomRequest.phase === "result", AND a tool chip, all at once
+    return { isContent: true, hasTool: true };
+  }
+
+  it("keeps every content message in the window even with far more than 40 tool lines interleaved", () => {
+    const items: ReplayCandidate[] = [];
+    for (let i = 0; i < 45; i++) {
+      items.push(content());
+      // ten tool calls between every pair of content messages — 450 tool
+      // lines total, more than ten times REPLAY_TOOL_LINE_CAP
+      for (let j = 0; j < 10; j++) items.push(tool());
+    }
+    const selected = selectReplayLines(items);
+    const contentKept = selected.filter((entry) => entry.line === "content");
+    // the same 40-message cap the plain text-only transcript has always
+    // used — this must not shrink just because tool lines exist
+    expect(contentKept).toHaveLength(REPLAY_CONTENT_CAP);
+    expect(contentKept.every((entry) => entry.item.isContent)).toBe(true);
+    const toolKept = selected.filter((entry) => entry.line === "tool");
+    expect(toolKept.length).toBeLessThanOrEqual(REPLAY_TOOL_LINE_CAP);
+  });
+
+  it("never downgrades a message that is both content and tool-bearing into a tool line", () => {
+    // this exact shape — isContent AND hasTool together — is what broke the
+    // e2e test: the receipt was still inside the window, but a naive check
+    // of "hasTool" first rendered it as a throwaway tool line instead of
+    // the actual returned report.
+    const items = [content(), contentWithTool(), content()];
+    const selected = selectReplayLines(items);
+    expect(selected.map((entry) => entry.line)).toEqual(["content", "content", "content"]);
+    expect(selected[1]!.item).toBe(items[1]);
+  });
+
+  it("adds tool lines only from inside the span content already covers, capped separately", () => {
+    const items: ReplayCandidate[] = [tool(), tool(), content(), tool(), tool(), tool()];
+    const selected = selectReplayLines(items);
+    // the two tool lines before the first kept content message are outside
+    // the window content defines and must not appear
+    expect(selected.filter((entry) => entry.line === "tool")).toHaveLength(3);
+    expect(selected).toHaveLength(4);
+  });
+
+  it("preserves original chronological order when merging content and tool lines", () => {
+    const items = [content(), tool(), tool(), content(), tool()];
+    const selected = selectReplayLines(items);
+    expect(selected.map((entry) => entry.item)).toEqual(items);
   });
 });
 

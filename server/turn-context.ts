@@ -38,6 +38,63 @@ export function formatToolActivityLine(tool: { name: string; ok?: boolean }): st
   return line.length > TOOL_LINE_MAX_LENGTH ? `${line.slice(0, TOOL_LINE_MAX_LENGTH - 1)}…` : line;
 }
 
+/** Content messages selected for a replay window (settled text, or a
+ * teammate's returned-report receipt) — the same 40-message cap the
+ * text-only transcript has always used. */
+export const REPLAY_CONTENT_CAP = 40;
+/** Tool-call lines added ON TOP of that window, capped separately so they
+ * add context without ever being able to push content out of it. */
+export const REPLAY_TOOL_LINE_CAP = 20;
+
+/** What server/index.ts's replay-window builder needs to know about one
+ * candidate message, decided upstream from the actual Message shape:
+ * `isContent` mirrors the plain text-only transcript's own filter (settled
+ * text, or a room-handoff result), `hasTool` says it carries a tool chip
+ * worth a compact line. A message can be both — a teammate's returned
+ * report is `kind: "activity"` with a `tool` chip AND
+ * `roomRequest.phase === "result"` — `isContent` always wins for it (see
+ * selectReplayLines). skipTranscript exclusion happens before this: an
+ * excluded message should never appear in `messages` at all. */
+export interface ReplayCandidate {
+  isContent: boolean;
+  hasTool: boolean;
+}
+
+/** Which of `messages` (in their original order) an inline replay should
+ * carry, and how. Content is selected FIRST and capped at
+ * REPLAY_CONTENT_CAP exactly like the plain text-only transcript — this is
+ * the fix for a real regression: an earlier version ran content and tool
+ * lines through one shared cap, so a turn with many tool calls could evict
+ * an older text reply, or a teammate's returned report, from the replay.
+ * Tool lines are added only from inside the span content already spans
+ * (from the first kept content message onward — nothing before it, since
+ * that span is exactly what "the replay" means), capped separately at
+ * REPLAY_TOOL_LINE_CAP (most recent kept). A message flagged `isContent`
+ * is NEVER also emitted as a tool line, even when `hasTool` is also true —
+ * that exact double nature (a returned-report receipt) is what broke
+ * server/direct-coordination.e2e.test.ts's "rechecks access before replay"
+ * case: the report was still inside the window, but got rendered as a
+ * throwaway tool line instead of the report itself. */
+export function selectReplayLines<T extends ReplayCandidate>(
+  messages: readonly T[],
+): Array<{ item: T; line: "content" | "tool" }> {
+  const indexedContent = messages
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.isContent)
+    .slice(-REPLAY_CONTENT_CAP);
+  const contentWindowStart = indexedContent.length ? indexedContent[0]!.index : messages.length;
+  const indexedToolLines = messages
+    .map((item, index) => ({ item, index }))
+    .filter(({ item, index }) => index >= contentWindowStart && item.hasTool && !item.isContent)
+    .slice(-REPLAY_TOOL_LINE_CAP);
+  return [
+    ...indexedContent.map(({ item, index }) => ({ item, index, line: "content" as const })),
+    ...indexedToolLines.map(({ item, index }) => ({ item, index, line: "tool" as const })),
+  ]
+    .sort((a, b) => a.index - b.index)
+    .map(({ item, line }) => ({ item, line }));
+}
+
 /** Does this engine need the thread replayed to it? True when a DIFFERENT
  * instance ran the last turn here — a cursor of our own is not enough,
  * because it only proves we once had a session covering some prefix of the
