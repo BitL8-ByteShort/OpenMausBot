@@ -365,6 +365,7 @@ import {
   type TaskPatch as BoardTaskPatch,
 } from "./task-board.ts";
 import { createDispatcher as createBoardDispatcher } from "./task-dispatcher.ts";
+import { createTaskTurnWatch } from "./task-turn-watch.ts";
 import { BUILT_IN_BROWSER_SYSTEM_PROMPT } from "./browser-engine.ts";
 import { BrowserRuntime } from "./browser-runtime.ts";
 import { BrowserLive } from "./browser-live.ts";
@@ -6925,6 +6926,29 @@ function boardTaskPrompt(task: BoardTask): string {
   const detail = task.body.trim() ? `\n\n${task.body.trim()}` : "";
   return `A task was filed on the shared task board: "${task.title}"${detail}`;
 }
+// Closes the crash-recovery gap the dispatcher above deliberately left
+// open: nothing yet heartbeats a claimed task while its turn runs, or
+// settles it when the turn ends, so a dispatched task whose turn SUCCEEDS
+// still goes cold under staleRunning and is reclaimed, retried, and
+// eventually blocked — indistinguishable from one that actually crashed.
+// task-turn-watch.ts is the observer: dispatch() below calls .watch() the
+// moment a turn actually starts, and the bus subscriber just under it feeds
+// every runtime event for that thread back in — heartbeat on real activity,
+// settle (review/blocked) the instant the turn ends. See
+// server/task-turn-watch.ts for why this is event-driven rather than a
+// timer: a blind interval would keep a wedged turn looking alive forever,
+// defeating the exact reclaim path this closes the gap for.
+const boardTurnWatch = createTaskTurnWatch();
+bus.subscribe((event: RuntimeEvent) => {
+  // Same guard every other terminal-state listener on this bus applies
+  // (see delegationWatch's subscriber above): a quarantined post-stop event,
+  // or a session.exited with no turnId while the bot/group is still busy,
+  // is not real evidence the turn ended — a resumable driver can cycle its
+  // underlying session mid-turn. Treating either as "the turn is over"
+  // would settle a board task to blocked while its turn is still running.
+  if (shouldIgnoreProviderEvent(event)) return;
+  boardTurnWatch.handle(event);
+});
 const boardDispatcher = createBoardDispatcher({
   maxRunning: boardMaxRunning(cfg),
   emit: (payload) => broadcast(payload),
@@ -6966,6 +6990,11 @@ const boardDispatcher = createBoardDispatcher({
       source: "board",
       unattended: true,
     });
+    // The claim itself (setStatus(..., "running")) already happened inside
+    // task-dispatcher.ts's tick before this callback ran; watch() picks up
+    // from there so the task never has a gap between being claimed and
+    // being watched.
+    boardTurnWatch.watch(task.id, runThread.threadId);
     return { threadId: runThread.threadId };
   },
 });
