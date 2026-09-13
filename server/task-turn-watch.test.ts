@@ -48,6 +48,32 @@ describe("task turn watch", () => {
     }
   });
 
+  it("keeps a quiet-but-alive turn from going stale via the keepalive alone, and still settles it when it later completes", async () => {
+    vi.useFakeTimers();
+    try {
+      const claimed = claim();
+      const watch = createTaskTurnWatch();
+      watch.watch(claimed.id, "thread-8");
+      // No handle() calls at all — the turn's event stream is completely
+      // silent (one long tool call, say) — but the turn is still actually
+      // in flight in this process, so the keepalive alone must carry it.
+      vi.advanceTimersByTime(400_000); // well past the 180s default stale threshold
+
+      const dispatch = vi.fn(async () => ({ threadId: "unused" }));
+      const dispatcher = createDispatcher({ dispatch, now: () => Date.now(), staleAfterMs: 180_000 });
+      await dispatcher.tick();
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(board.getTask(claimed.id)?.status).toBe("running");
+
+      // And it still settles correctly once the (still silent, still
+      // in-flight) turn eventually finishes.
+      watch.handle({ type: "turn.completed", threadId: "thread-8", ok: true });
+      expect(board.getTask(claimed.id)?.status).toBe("review");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("moves a task to review when its watched turn completes successfully", () => {
     const claimed = claim();
     const watch = createTaskTurnWatch();
@@ -83,15 +109,18 @@ describe("task turn watch", () => {
     expect(board.getTask(claimed.id)?.status).toBe("blocked");
   });
 
-  it("a crashed turn (heartbeats simply stop arriving) is still reclaimed by the dispatcher tick", async () => {
+  it("a crashed turn — the process dies mid-turn, taking its keepalive down with it — is still reclaimed by the dispatcher tick", async () => {
     vi.useFakeTimers();
     try {
       const claimed = claim();
       const watch = createTaskTurnWatch();
       watch.watch(claimed.id, "thread-5");
-      // One burst of real activity, then nothing ever again — the process
-      // died mid-turn. No more handle() calls follow.
+      // One burst of real activity, then the process dies: nothing in this
+      // module survives that (no more handle() calls, and the keepalive
+      // timer itself is gone) — simulated here with stopAll(), the closest
+      // a single process can come to modeling its own crash.
       watch.handle({ type: "item.started", threadId: "thread-5" });
+      watch.stopAll();
 
       vi.advanceTimersByTime(181_000); // just past the default 180s stale window
 
@@ -101,6 +130,28 @@ describe("task turn watch", () => {
 
       expect(dispatch).toHaveBeenCalledTimes(1);
       expect(board.getTask(claimed.id)?.attempts).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the keepalive timer itself the moment the turn settles — no leaked timer", () => {
+    vi.useFakeTimers();
+    try {
+      const claimed = claim();
+      const watch = createTaskTurnWatch();
+      watch.watch(claimed.id, "thread-10");
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      watch.handle({ type: "turn.completed", threadId: "thread-10", ok: true });
+      expect(vi.getTimerCount()).toBe(0);
+
+      // And advancing the clock afterwards produces no further heartbeats —
+      // a settled task is never heartbeated again, keepalive or otherwise.
+      const settledHeartbeatAt = board.getTask(claimed.id)?.heartbeatAt;
+      vi.advanceTimersByTime(600_000);
+      expect(board.getTask(claimed.id)?.heartbeatAt).toBe(settledHeartbeatAt);
+      expect(board.getTask(claimed.id)?.status).toBe("review");
     } finally {
       vi.useRealTimers();
     }
@@ -125,12 +176,19 @@ describe("task turn watch", () => {
     expect(() => watch.handle({ type: "turn.completed", threadId: "stranger", ok: true })).not.toThrow();
   });
 
-  it("stopAll forgets every watched task without settling it", () => {
-    const claimed = claim();
-    const watch = createTaskTurnWatch();
-    watch.watch(claimed.id, "thread-7");
-    watch.stopAll();
-    watch.handle({ type: "turn.completed", threadId: "thread-7", ok: true });
-    expect(board.getTask(claimed.id)?.status).toBe("running");
+  it("stopAll forgets every watched task without settling it, and clears its keepalive timer", () => {
+    vi.useFakeTimers();
+    try {
+      const claimed = claim();
+      const watch = createTaskTurnWatch();
+      watch.watch(claimed.id, "thread-7");
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      watch.stopAll();
+      expect(vi.getTimerCount()).toBe(0);
+      watch.handle({ type: "turn.completed", threadId: "thread-7", ok: true });
+      expect(board.getTask(claimed.id)?.status).toBe("running");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
