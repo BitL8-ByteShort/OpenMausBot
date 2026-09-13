@@ -157,3 +157,29 @@ describe("attachThread", () => {
     expect(() => board.attachThread("no-such-id", "thread-1")).toThrow(/no such task/);
   });
 });
+
+describe("patchTask", () => {
+  beforeEach(() => board.openBoard(join(DATA, `p-${Math.random()}.db`)));
+
+  it("updates only the fields given, leaving the rest untouched", () => {
+    const task = board.createTask({ title: "draft", body: "first pass", priority: 0 });
+    const patched = board.patchTask(task.id, { title: "final", priority: 3 });
+    expect(patched.title).toBe("final");
+    expect(patched.priority).toBe(3);
+    expect(patched.body).toBe("first pass");
+    expect(patched.status).toBe("todo");
+  });
+
+  it("assigns and then unassigns a bot, distinguishing omitted from null", () => {
+    const task = board.createTask({ title: "needs an owner" });
+    expect(board.patchTask(task.id, { assigneeBotId: "bot-1" }).assigneeBotId).toBe("bot-1");
+    // Omitted entirely: assigneeBotId must survive untouched.
+    expect(board.patchTask(task.id, { priority: 1 }).assigneeBotId).toBe("bot-1");
+    // Explicit null: clears it.
+    expect(board.patchTask(task.id, { assigneeBotId: null }).assigneeBotId).toBeNull();
+  });
+
+  it("throws for a task that does not exist", () => {
+    expect(() => board.patchTask("no-such-id", { title: "x" })).toThrow(/no such task/);
+  });
+});

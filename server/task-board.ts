@@ -22,6 +22,19 @@ import { newId } from "./contracts.ts";
 
 export type BoardStatus = "todo" | "ready" | "running" | "blocked" | "review" | "done" | "archived";
 
+/** Every legal status, in the order the plan lists them — for validating an
+ * untrusted status string (an HTTP PATCH body, a tool argument) before it
+ * reaches a typed BoardStatus parameter. */
+export const BOARD_STATUSES: readonly BoardStatus[] = [
+  "todo",
+  "ready",
+  "running",
+  "blocked",
+  "review",
+  "done",
+  "archived",
+];
+
 export interface BoardTask {
   id: string;
   title: string;
@@ -62,6 +75,17 @@ export interface StatusPatch {
   result?: string;
   blockedReason?: string;
   threadId?: string;
+}
+
+/** Fields a human (or a future assignment tool) can edit without moving the
+ * task through the status machine. `assigneeBotId: null` clears an
+ * assignment; omitting the field entirely leaves it untouched — the two
+ * are not the same request. */
+export interface TaskPatch {
+  title?: string;
+  body?: string;
+  assigneeBotId?: string | null;
+  priority?: number;
 }
 
 /** The only legal moves. Everything else throws, including the ones that
@@ -273,6 +297,39 @@ export function setStatus(id: string, next: BoardStatus, patch: StatusPatch = {}
       patch.result ?? null,
       next,
       patch.blockedReason ?? null,
+      id,
+    );
+  const updated = getTask(id);
+  if (!updated) throw new Error(`task vanished during update: ${id}`);
+  return updated;
+}
+
+/** Edit title, body, assignee, or priority without touching status or
+ * attempts — the fields a human triages with, not the ones the state
+ * machine owns. The only tri-state field is assigneeBotId: omitted leaves
+ * the current assignee alone, null clears it, a string sets it. */
+export function patchTask(id: string, patch: TaskPatch): BoardTask {
+  const task = getTask(id);
+  if (!task) throw new Error(`no such task: ${id}`);
+  const now = Date.now();
+  const setAssignee = patch.assigneeBotId !== undefined;
+  handle()
+    .prepare(`
+      UPDATE tasks SET
+        title = COALESCE(?, title),
+        body = COALESCE(?, body),
+        assignee_bot_id = CASE WHEN ? THEN ? ELSE assignee_bot_id END,
+        priority = COALESCE(?, priority),
+        updated_at = ?
+      WHERE id = ?
+    `)
+    .run(
+      patch.title ?? null,
+      patch.body ?? null,
+      setAssignee ? 1 : 0,
+      patch.assigneeBotId ?? null,
+      patch.priority ?? null,
+      now,
       id,
     );
   const updated = getTask(id);
