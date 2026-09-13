@@ -275,16 +275,31 @@ it("does not cancel a live coordination when an automation turn lands in the con
   await expect.poll(async () => (await f.messages(f.chief.activeTaskId)).some((message: any) => message.tool?.name === "Engineering lead replied"), { timeout: 15_000 }).toBe(true);
 }), 60_000);
 
-it("stops a waiting source and its running subtree without needing to delete any bot", () => fixture(async f => {
-  f.plan[f.lead.id] = { delayMs: 5000, reply: "Must not finish after Stop" };
+// Stop belongs to the conversation it was pressed in. It stops this bot and
+// stops awaiting its teammates; a teammate already mid-turn keeps its own
+// provider process and its result is still recorded here.
+it("stops a waiting source without reaching into the teammate already working", () => fixture(async f => {
+  f.plan[f.lead.id] = { delayMs: 4000, reply: "Finished after the source was stopped" };
   await f.start();
   await expect.poll(() => f.nodes().find((node: any) => node.parentId)?.status, { timeout: 15_000 }).toBe("running");
   await f.api(`/api/bots/${f.chief.id}/interrupt`, { threadId: f.chief.activeTaskId });
-  await expect.poll(() => f.nodes().every((node: any) => node.status === "cancelled")).toBe(true);
+
+  // The source stops awaiting immediately; the teammate keeps running.
+  await expect.poll(() => f.nodes().find((node: any) => !node.parentId)?.status).toBe("cancelled");
+  expect(f.nodes().find((node: any) => node.parentId).status).toBe("running");
   expect((await f.wait()).status).toBe("settled");
+  const chip = (await f.messages(f.chief.activeTaskId)).find((message: any) => message.tool?.name?.startsWith("Stopped here"));
+  expect(chip.tool.name).toContain("Engineering lead");
+  expect(chip.threadRef).toMatchObject({ botId: f.lead.id, threadId: f.nodes().find((node: any) => node.parentId).threadId });
+
+  // Its work lands: the result is recorded and reported into the stopped chat.
+  await expect.poll(() => f.nodes().find((node: any) => node.parentId)?.status, { timeout: 20_000 }).toBe("completed");
+  expect(f.nodes().find((node: any) => node.parentId).result).toContain("Finished after the source was stopped");
+  await expect.poll(async () => (await f.messages(f.chief.activeTaskId)).some((message: any) => message.tool?.name === "Engineering lead replied")).toBe(true);
+  // ...but nothing resumes the conversation the person stopped.
   expect(f.evidence().filter((turn: any) => turn.botId === f.chief.id)).toHaveLength(1);
   expect((await f.messages(f.chief.activeTaskId)).some((message: any) => message.text === "The requested CSV export is implemented and verified")).toBe(false);
-}), 45_000);
+}), 60_000);
 
 it("deleting the waiting source cancels its tree and never recreates the deleted conversation", () => fixture(async f => {
   f.plan[f.lead.id] = { delayMs: 5000, reply: "Must not return to a deleted task" };

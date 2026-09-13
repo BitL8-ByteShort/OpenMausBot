@@ -941,12 +941,35 @@ function requestedTaskBot(botId: string, rawThreadId: unknown): BotRecord {
 }
 
 async function interruptDirectThread(botId: string, threadId: string): Promise<void> {
-  roomHandoffs.cancelDirect(threadId);
+  // Stop belongs to the conversation it was pressed in. This bot's turn ends
+  // and this conversation stops awaiting its teammates, so nothing resumes
+  // into a stopped chat; assignments that never started are dropped. A
+  // teammate already mid-turn keeps its own provider process, finishes, and
+  // its result is still recorded here.
+  noteTeammatesLeftRunning(botId, threadId, roomHandoffs.stopAwaitingDirect(threadId));
   const owner = botForThread(botId, threadId);
   cancelDirectTurnDispatch(botId, threadId);
   revokeInternalCapabilitiesForThread(threadId);
   await (owner ? registry.get(owner.modelSelection.instanceId) : undefined)?.adapter.interruptTurn(threadId);
   closeOpenApprovals(threadId);
+}
+
+/** Stop left teammates mid-turn: say so in the transcript, name them, and
+ * give the person the second gesture. One pill each, like the "Sent to"
+ * receipt, so it survives Tool calls being hidden and one click away is the
+ * teammate's own conversation — where Stop really reaches that turn. */
+function noteTeammatesLeftRunning(botId: string, threadId: string, running: RoomHandoff[]): void {
+  if (!store.taskByThread(botId, threadId)) return;
+  for (const node of running) {
+    const name = store.bot(node.botId)?.name ?? "A teammate";
+    const task = store.taskByThread(node.botId, node.threadId);
+    store.appendMessage(threadId, {
+      role: "bot",
+      kind: "activity",
+      tool: { name: `Stopped here — ${name} is still working; open to stop it too`, ok: true },
+      ...(task ? { threadRef: { botId: node.botId, threadId: node.threadId, title: task.title } } : {}),
+    });
+  }
 }
 
 async function interruptAllDirectThreads(botId: string): Promise<void> {
