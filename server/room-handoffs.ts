@@ -154,6 +154,15 @@ export class RoomHandoffs {
   activeDirect(threadId: string) {
     return [...this.nodes.values()].some(n => !n.groupId && n.threadId === threadId && !terminal(n));
   }
+  /** Work this conversation handed out that has not settled yet. The
+   * conversation's own node is not outstanding — only what it waits on. */
+  outstandingDirect(threadId: string): RoomHandoff[] {
+    return [...this.nodes.values()].filter(node => {
+      if (terminal(node) || !node.parentId) return false;
+      const parent = this.nodes.get(node.parentId);
+      return Boolean(parent && !parent.groupId && parent.threadId === threadId);
+    });
+  }
 
   tick() {
     if (this.loadError) return;
