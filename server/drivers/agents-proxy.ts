@@ -809,7 +809,7 @@ const TOOLS = [
   {
     name: "task_list",
     description:
-      "See what is filed on the durable task board, across every status (todo, ready, running, blocked, review, done) unless you ask for specific ones — archived tasks are left out unless you ask for them by name. Use mine_only to see just the tasks assigned to you.",
+      "See what is filed on the durable task board, across every status (todo, ready, running, blocked, review, done) unless you ask for specific ones — archived tasks are left out unless you ask for them by name. You see your own tasks, tasks involving a bot you can reach, and unassigned ones a person filed; another section's work is not yours to read. Use mine_only to see just the tasks assigned to you.",
     inputSchema: {
       type: "object",
       additionalProperties: false,

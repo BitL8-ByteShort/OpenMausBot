@@ -108,3 +108,62 @@ describe("the dispatcher tick", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("what the tick must never do", () => {
+  beforeEach(() => board.openBoard(join(DATA, `d-${Math.random()}.db`)));
+
+  it("burns no attempt on a task the wiring cannot dispatch, however many ticks pass", async () => {
+    // The default path, not an edge case: task_create tells the model it is
+    // fine to leave a task unassigned for a human. The wiring declines every
+    // one of those, and before this fix each decline still cost an attempt —
+    // four ticks took the task from ready to blocked with "gave up after 3
+    // attempts — no progress" without a single turn ever starting.
+    const task = board.createTask({ title: "left for a human" });
+    // Exactly what the wiring does with an undispatchable task today: it
+    // declines. The tick had already claimed (and charged) it by then.
+    const dispatch = vi.fn(async () => null);
+    const dispatcher = createDispatcher({ dispatch, canDispatch: () => false, maxAttempts: 3 });
+    for (let i = 0; i < 4; i++) await dispatcher.tick();
+
+    const after = board.getTask(task.id);
+    expect(after?.status).toBe("ready");
+    expect(after?.attempts).toBe(0);
+    expect(after?.blockedReason).toBeNull();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("hands a task back with its attempt refunded when a dispatch declines after the claim", async () => {
+    const task = board.createTask({ title: "busy bot", assigneeBotId: "bot-1" });
+    await createDispatcher({ dispatch: async () => null }).tick();
+    const after = board.getTask(task.id);
+    expect(after?.status).toBe("ready");
+    expect(after?.attempts).toBe(0);
+  });
+
+  it("mutates nothing at all while the board flag is off", async () => {
+    // Turning a feature flag off must never mutate the data behind it: no
+    // promote, no claim, no reclaim, no give-up, not even a bumped
+    // updated_at.
+    const task = board.createTask({ title: "filed while the flag was on", assigneeBotId: "bot-1" });
+    const dispatch = vi.fn(async () => ({ threadId: "t" }));
+    const dispatcher = createDispatcher({ dispatch, enabled: () => false });
+    for (let i = 0; i < 4; i++) await dispatcher.tick();
+
+    const after = board.getTask(task.id);
+    expect(after?.status).toBe("todo");
+    expect(after?.attempts).toBe(0);
+    expect(after?.updatedAt).toBe(task.updatedAt);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("claims a ready task exactly once even when two dispatchers race over one database", async () => {
+    // The in-process re-entrancy guard covers one server; the documented
+    // OMB2 side-by-side setup shares ~/.openmausbot, so the claim itself has
+    // to be the conditional write that decides.
+    const task = board.createTask({ title: "contended", assigneeBotId: "bot-1" });
+    board.setStatus(task.id, "ready");
+    expect(board.claimTask(task.id)?.status).toBe("running");
+    expect(board.claimTask(task.id)).toBeNull();
+    expect(board.getTask(task.id)?.attempts).toBe(1);
+  });
+});

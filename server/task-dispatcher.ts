@@ -13,7 +13,16 @@
 //   - Promoting before claiming means a todo task that just became
 //     eligible this tick (its last parent finished) can be claimed in
 //     the same pass, rather than waiting a full TICK_MS.
-import { type BoardTask, attachThread, listTasks, promotable, setStatus, staleRunning } from "./task-board.ts";
+import {
+  type BoardTask,
+  attachThread,
+  claimTask,
+  listTasks,
+  promotable,
+  releaseClaim,
+  setStatus,
+  staleRunning,
+} from "./task-board.ts";
 
 export const TICK_MS = 30_000;
 export const DEFAULT_STALE_AFTER_MS = 180_000;
@@ -22,11 +31,26 @@ export const DEFAULT_MAX_ATTEMPTS = 3;
 export interface DispatcherOptions {
   /** Injectable clock so tests never sleep for real. */
   now?: () => number;
+  /** Is the board turned on right now? Read live at the top of every tick,
+   * so the flag stays hot-flippable — and so a tick with the flag off is a
+   * genuine no-op rather than one that still reclaims, gives up, promotes
+   * and claims. Turning a feature flag off must never mutate the data
+   * behind it. Defaults to "on" for callers that own the gate themselves
+   * (the tests). */
+  enabled?: () => boolean;
+  /** Can this task be dispatched AT ALL right now — synchronously, before
+   * anything is claimed? Every "no" the wiring can give cheaply (no
+   * assignee, the assignee is missing/busy/hidden, its approval mode is not
+   * auto) belongs here rather than in dispatch(), because a claim is an
+   * ATTEMPT and the give-up pass blocks a task that runs out of them. A task
+   * nobody could ever have started must not walk itself to "blocked". */
+  canDispatch?: (task: BoardTask) => boolean;
   /** Hand a claimed task to the turn machinery. Resolves when the turn
    * has been STARTED, not when it finishes — the board tracks the rest
-   * through heartbeats and the completion callback. Returning null means
-   * the assignee could not take the task right now (e.g. busy elsewhere);
-   * the task goes back to ready without burning a concurrency slot. */
+   * through heartbeats and the completion callback. Returning null (or
+   * throwing) means no turn started after all — the world changed between
+   * canDispatch and the claim — so the task goes back to ready with its
+   * attempt refunded, because an attempt counts only when a turn began. */
   dispatch: (task: BoardTask) => Promise<{ threadId: string } | null>;
   /** Concurrency cap across the whole board. P1 replaces this with a
    * budget-derived number; until then it is config with a default of 2. */
@@ -50,10 +74,17 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
   const staleAfterMs = options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
   const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const maxRunning = options.maxRunning ?? 2;
+  const canDispatch = options.canDispatch;
   let timer: ReturnType<typeof setInterval> | null = null;
   let ticking = false;
 
   async function tick(): Promise<void> {
+    // The flag gate is the FIRST thing in the tick, before any read or
+    // write: with features.board off the board's data must be exactly as
+    // the person left it — no reclaim, no give-up, no promote, no claim,
+    // not even a bumped updated_at. It reads live config, so flipping the
+    // flag back on takes effect on the very next tick with no restart.
+    if (options.enabled && !options.enabled()) return;
     // A slow dispatch (an in-flight await options.dispatch(...)) must
     // never let a second tick double-claim the rest of the board.
     if (ticking) return;
@@ -108,13 +139,32 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
         // same tick never had attempts near the cap anyway, so this is
         // just a belt-and-braces guard against claiming a cursed task.
         if (task.attempts >= maxAttempts) continue;
-        const claimed = setStatus(task.id, "running");
-        const started = await options.dispatch(claimed);
+        // Ask BEFORE claiming. The claim is what charges an attempt, so a
+        // task the wiring could never dispatch (unassigned, assignee busy or
+        // hidden, not in auto-approve mode, board off) is skipped untouched
+        // rather than claimed, declined, and charged — which is how an
+        // unassigned task used to reach "gave up after 3 attempts" in two
+        // minutes without a single turn ever starting.
+        if (canDispatch && !canDispatch(task)) continue;
+        // The claim is a conditional write: exactly one caller can move a
+        // row out of "ready", even if a second process shares this database.
+        const claimed = claimTask(task.id);
+        if (!claimed) continue;
+        let started: { threadId: string } | null;
+        try {
+          started = await options.dispatch(claimed);
+        } catch {
+          // A dispatch that threw started no turn either. Refund the claim
+          // and keep ticking: one bad task must not take the whole pass
+          // down. The wiring owns reporting the cause; the tick owns the row.
+          options.emit?.({ kind: "board.dispatch-failed", task: releaseClaim(claimed.id) });
+          continue;
+        }
         if (!started) {
-          // The assignee could not take it right now (e.g. busy
-          // elsewhere). Put it back without burning a concurrency slot —
-          // the claim itself still counted as an attempt.
-          setStatus(task.id, "ready");
+          // The world changed between canDispatch and the claim. No turn
+          // started, so the attempt is refunded with the claim — otherwise
+          // the give-up pass counts attempts that never happened.
+          releaseClaim(claimed.id);
           continue;
         }
         slots -= 1;
