@@ -54,10 +54,34 @@ describe("the dispatcher tick", () => {
       board.setStatus(task.id, "ready");
       board.setStatus(task.id, "running");
     }
+    // Reclaimed after its 3rd failed attempt — back in "ready" with
+    // attempts already at the cap, which is where give-up must catch it:
+    // before a 4th claim, not while it is mid-flight (see the next test).
+    board.setStatus(task.id, "ready");
     const dispatch = vi.fn(async () => ({ threadId: "t" }));
     await createDispatcher({ dispatch, maxAttempts: 3 }).tick();
     expect(board.getTask(task.id)?.status).toBe("blocked");
     expect(board.getTask(task.id)?.blockedReason).toMatch(/3 attempts/);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("does not force-block a running task whose attempt count already sits at the cap, as long as it is still heartbeating", async () => {
+    // A task on its 3rd (final) attempt is legitimately running right now —
+    // it has not failed yet, it might still succeed. Give-up must judge a
+    // task by whether it is back in the pool asking for another attempt,
+    // not by a historical attempt count that a healthy in-flight task also
+    // happens to carry.
+    const task = board.createTask({ title: "still going", assigneeBotId: "bot-1" });
+    for (let i = 0; i < 3; i++) {
+      board.setStatus(task.id, "ready");
+      board.setStatus(task.id, "running");
+    }
+    board.heartbeat(task.id);
+    const dispatch = vi.fn(async () => ({ threadId: "t" }));
+    await createDispatcher({ dispatch, maxAttempts: 3 }).tick();
+    const after = board.getTask(task.id);
+    expect(after?.status).toBe("running");
+    expect(after?.blockedReason).toBeNull();
     expect(dispatch).not.toHaveBeenCalled();
   });
 

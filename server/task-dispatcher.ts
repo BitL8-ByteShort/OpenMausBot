@@ -70,12 +70,21 @@ export function createDispatcher(options: DispatcherOptions): Dispatcher {
       // including a reclaim (task-board.ts bumps it on every entry to
       // "running"). Once that count hits the cap the task is blocked
       // outright rather than being handed back into the pool to loop
-      // again — this checks both "ready" (about to be reclaimed into
-      // another attempt) and "running" (already at the cap, e.g. because
-      // maxAttempts was lowered, or a caller outside this tick claimed
-      // it directly) since TRANSITIONS legally allows blocked from
-      // either state.
-      for (const task of listTasks({ status: ["ready", "running"] })) {
+      // again.
+      //
+      // This checks "ready" only, deliberately excluding "running":
+      // attempts is a count of attempts STARTED, not attempts FAILED, so a
+      // task on its final allowed attempt carries attempts === maxAttempts
+      // while it is still legitimately in flight and might still succeed.
+      // Scanning "running" here would force-block a healthy, heartbeating
+      // task out from under itself for no reason but its own historical
+      // attempt count — killing work that hasn't failed yet. The task
+      // that actually needs to be judged is one back in "ready" asking
+      // for ANOTHER attempt (reclaimed above, this tick or an earlier
+      // one): that is the point where "no progress" is an established
+      // fact, and where give-up must act before claim hands out a claim
+      // it will never survive.
+      for (const task of listTasks({ status: ["ready"] })) {
         if (task.attempts < maxAttempts) continue;
         const given = setStatus(task.id, "blocked", {
           blockedReason: `gave up after ${task.attempts} attempts — no progress`,
