@@ -170,6 +170,7 @@ import {
   newId,
 } from "./contracts.ts";
 import { RETRY_MAX_ATTEMPTS } from "./drivers/retry.ts";
+import { maybeRaiseQuotaCard, resolveQuotaSwitch, type QuotaSwitchDeps } from "./quota-switch.ts";
 import { decodeGeneratedImage } from "./generated-image.ts";
 import {
   MAX_MCP_SERVERS,
@@ -256,7 +257,7 @@ import {
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
-import { buildRecoveryText, buildTurnContext, engineIsFresh } from "./turn-context.ts";
+import { buildRecoveryText, buildTurnContext, engineIsFresh, formatToolActivityLine } from "./turn-context.ts";
 import { extractTurnImages } from "./turn-images.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import { TurnResources, workspaceResource, type TurnOwner } from "./turn-resources.ts";
@@ -4662,6 +4663,12 @@ bus.subscribe((event: RuntimeEvent) => {
       // dispatch moves it to working; turn.completed (which follows a setup
       // failure) is told to leave "dead" alone.
       if (event.setup && bot) store.setTaskActivity(bot.id, event.threadId, "dead");
+      // A quota/billing failure is terminal — the thread is dead on this
+      // engine until the person acts. Offer the other engines this
+      // workspace has configured instead of leaving them to notice, open
+      // settings, and switch by hand. maybeRaiseQuotaCard is the one place
+      // that decides whether this actually was a quota error.
+      if (bot) maybeRaiseQuotaCard(quotaSwitchBus, bot, event.threadId, event.message);
       break;
     case "thread.token-usage.updated":
       // running totals for the turn in flight; folded into the task's
@@ -7747,6 +7754,29 @@ const ROOM_POST_MAX_CHARS = 4_000;
 // them — its pending map lives in the module so the two respond endpoints
 // can call resolvePeerComms without holding a reference back to here.
 const approvalBus: ApprovalBus = { store, broadcast, notify, autoApply: fullAccessForSource };
+
+// quota-switch bus: same shape of wiring as approvalBus above — its pending
+// card map lives in the module, and this only supplies what it cannot reach
+// on its own. `dispatch` hands back to startTurn so the re-launched turn
+// gets the exact same admission and lifecycle bookkeeping any other message
+// does; a failure to relaunch becomes a visible chip rather than a silently
+// dropped turn (mirrors drainQueuedSends' own fallback below).
+const quotaSwitchBus: QuotaSwitchDeps = {
+  store,
+  instances: () => registry.instances(),
+  dispatch: (botId, threadId, text) => {
+    void startTurn(botId, text, { threadId }).catch((err) => {
+      store.appendMessage(threadId, {
+        role: "bot",
+        kind: "activity",
+        tool: {
+          name: `error: could not continue on the new engine — ${(err instanceof Error ? err.message : String(err)).slice(0, 120)}`,
+          ok: false,
+        },
+      });
+    });
+  },
+};
 
 // Approvals live only in memory, so any peer card still open on disk is one
 // whose resolver died with the previous process. Left alone it can never be
@@ -15369,6 +15399,13 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         resolvePeerComms(approvalBus, String(body.requestId), behavior)) {
         return json(res, 200, { ok: true, outcome: behavior === "allow" ? "allowed-once" : "rejected" });
       }
+      // quota-switch intercept (see peer-approval above): the card carries
+      // no `tool`, so the client answers it like a question — the chosen
+      // engine's name (or "Not now") arrives as `body.message`.
+      if (store.messagesFor(bot.threadId).some((message) => message.card?.requestId === String(body.requestId)) &&
+        resolveQuotaSwitch(quotaSwitchBus, String(body.requestId), typeof body.message === "string" ? body.message : undefined)) {
+        return json(res, 200, { ok: true, outcome: "answered" });
+      }
       const outcome = await answerRequest(bot.threadId, bot.modelSelection.instanceId, String(body.requestId), behavior, body.message, { id: bot.id, name: bot.name }, body.always === true);
       return json(res, 200, { ok: true, outcome });
     }
@@ -15445,6 +15482,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (store.messagesFor(threadId).some((message) => message.card?.requestId === requestId) &&
         resolvePeerComms(approvalBus, requestId, behavior)) {
         return json(res, 200, { ok: true, outcome: behavior === "allow" ? "allowed-once" : "rejected" });
+      }
+      // quota-switch intercept (see /api/bots/:id/respond above).
+      if (store.messagesFor(threadId).some((message) => message.card?.requestId === requestId) &&
+        resolveQuotaSwitch(quotaSwitchBus, requestId, typeof body.message === "string" ? body.message : undefined)) {
+        return json(res, 200, { ok: true, outcome: "answered" });
       }
       const group = store.groupByThread(threadId);
       // busyBotId is in-memory only, so an approval that outlives its turn — or
