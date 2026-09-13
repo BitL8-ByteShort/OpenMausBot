@@ -183,3 +183,94 @@ describe("patchTask", () => {
     expect(() => board.patchTask("no-such-id", { title: "x" })).toThrow(/no such task/);
   });
 });
+
+describe("claimTask and releaseClaim", () => {
+  beforeEach(() => board.openBoard(join(DATA, `c-${Math.random()}.db`)));
+
+  it("claims a ready task once, charging exactly one attempt", () => {
+    const task = board.createTask({ title: "one winner", assigneeBotId: "bot-1" });
+    board.setStatus(task.id, "ready");
+    const claimed = board.claimTask(task.id);
+    expect(claimed?.status).toBe("running");
+    expect(claimed?.attempts).toBe(1);
+    expect(claimed?.heartbeatAt).toBeGreaterThan(0);
+    // A second caller — another tick, or a second process over the same
+    // ~/.openmausbot — finds the row already out of "ready" and loses.
+    expect(board.claimTask(task.id)).toBeNull();
+    expect(board.getTask(task.id)?.attempts).toBe(1);
+  });
+
+  it("refuses to claim anything that is not ready", () => {
+    const task = board.createTask({ title: "still todo" });
+    expect(board.claimTask(task.id)).toBeNull();
+    expect(board.claimTask("no-such-task")).toBeNull();
+    expect(board.getTask(task.id)?.status).toBe("todo");
+  });
+
+  it("refunds the attempt of a claim whose turn never started", () => {
+    const task = board.createTask({ title: "never started", assigneeBotId: "bot-1" });
+    board.setStatus(task.id, "ready");
+    board.claimTask(task.id);
+    const released = board.releaseClaim(task.id);
+    expect(released.status).toBe("ready");
+    expect(released.attempts).toBe(0);
+    expect(released.heartbeatAt).toBeNull();
+  });
+
+  it("leaves a task that is no longer running exactly as it found it", () => {
+    const task = board.createTask({ title: "settled elsewhere", assigneeBotId: "bot-1" });
+    board.setStatus(task.id, "ready");
+    board.claimTask(task.id);
+    board.setStatus(task.id, "review");
+    const released = board.releaseClaim(task.id);
+    expect(released.status).toBe("review");
+    expect(released.attempts).toBe(1);
+    expect(() => board.releaseClaim("no-such-task")).toThrow(/no such task/);
+  });
+});
+
+describe("input caps", () => {
+  beforeEach(() => board.openBoard(join(DATA, `l-${Math.random()}.db`)));
+
+  it("clamps a title, a body and a comment to their caps rather than storing them whole", () => {
+    const task = board.createTask({ title: "t".repeat(500), body: "b".repeat(20_000) });
+    expect(task.title).toHaveLength(board.TASK_TITLE_MAX);
+    expect(task.body).toHaveLength(board.TASK_BODY_MAX);
+    const patched = board.patchTask(task.id, { title: "n".repeat(500) });
+    expect(patched.title).toHaveLength(board.TASK_TITLE_MAX);
+    const comment = board.addComment(task.id, null, "c".repeat(20_000));
+    expect(comment.text).toHaveLength(board.TASK_COMMENT_MAX);
+    expect(board.commentsOf(task.id)[0].text).toHaveLength(board.TASK_COMMENT_MAX);
+  });
+
+  it("returns the most recent page of comments, oldest-first, never the whole history", () => {
+    const task = board.createTask({ title: "chatty" });
+    for (let i = 0; i < 10; i++) board.addComment(task.id, null, `comment ${i}`);
+    const page = board.commentsOf(task.id, 3);
+    expect(page.map((comment) => comment.text)).toEqual(["comment 7", "comment 8", "comment 9"]);
+    expect(board.commentsOf(task.id)).toHaveLength(10);
+  });
+});
+
+describe("visibleTo", () => {
+  beforeEach(() => board.openBoard(join(DATA, `v-${Math.random()}.db`)));
+
+  it("hides another section's work while keeping a reader's own and the unowned", () => {
+    const mine = board.createTask({ title: "mine", assigneeBotId: "me" });
+    const filedForMe = board.createTask({ title: "filed for me", createdByBotId: "peer", assigneeBotId: "me" });
+    const peers = board.createTask({ title: "a peer's", assigneeBotId: "peer" });
+    const strangers = board.createTask({ title: "another section's", assigneeBotId: "stranger" });
+    const strangerFiled = board.createTask({ title: "filed by a stranger", createdByBotId: "stranger" });
+    const unowned = board.createTask({ title: "a human filed this" });
+
+    const reachable = new Set(["me", "peer"]);
+    const seen = board.visibleTo(board.listTasks(), (botId) => reachable.has(botId)).map((task) => task.id);
+
+    expect(seen).toContain(mine.id);
+    expect(seen).toContain(filedForMe.id);
+    expect(seen).toContain(peers.id);
+    expect(seen).toContain(unowned.id);
+    expect(seen).not.toContain(strangers.id);
+    expect(seen).not.toContain(strangerFiled.id);
+  });
+});

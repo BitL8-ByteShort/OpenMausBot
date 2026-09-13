@@ -35,6 +35,23 @@ export const BOARD_STATUSES: readonly BoardStatus[] = [
   "archived",
 ];
 
+/** Input caps, in step with the rest of the server (internal thread titles
+ * cap at 80, a room post at ROOM_POST_MAX_CHARS). Both bot-facing and
+ * human-facing write paths validate against these and answer 400; the
+ * writers below also clamp, so storage can never hold an unbounded row even
+ * if a future call site forgets to check. A looping bot would otherwise
+ * write rows of any size that GET /api/tasks reads back and SSE broadcasts. */
+export const TASK_TITLE_MAX = 200;
+export const TASK_BODY_MAX = 8_000;
+export const TASK_COMMENT_MAX = 4_000;
+
+/** How many comments a single read returns by default. Comments are loaded
+ * per task (GET /api/tasks/:id/comments), never all-of-every-task inside a
+ * list response. */
+export const TASK_COMMENT_PAGE = 100;
+
+const clamp = (text: string, max: number): string => (text.length > max ? text.slice(0, max) : text);
+
 export interface BoardTask {
   id: string;
   title: string;
@@ -224,8 +241,8 @@ export function createTask(input: CreateTaskInput): BoardTask {
     `)
     .run(
       id,
-      input.title,
-      input.body ?? "",
+      clamp(input.title, TASK_TITLE_MAX),
+      clamp(input.body ?? "", TASK_BODY_MAX),
       input.assigneeBotId ?? null,
       input.createdByBotId ?? null,
       input.priority ?? 0,
@@ -259,6 +276,27 @@ export function listTasks(filter: { status?: BoardStatus[]; assigneeBotId?: stri
     .prepare(`SELECT * FROM tasks ${where} ORDER BY priority DESC, created_at DESC`)
     .all(...params) as unknown as TaskRow[];
   return rows.map(rowToTask);
+}
+
+/** The tasks one reader may see, given who that reader can reach.
+ *
+ * The board is workspace-wide storage, but the fleet is not: sections and
+ * per-pair allow-lists bound which bots can reach which (server/peer-roster.ts),
+ * and task_create already enforces that boundary on an assignee. Reading has
+ * to honour the same rule, or any bot with the board tools mounted could read
+ * the titles, bodies, assignees and block reasons of every other section's
+ * work. A task with no bot on either side is workspace-level — a human filed
+ * it and left it unassigned — and stays visible to everyone; as soon as a bot
+ * is its creator or its assignee, being able to reach that bot is the rule.
+ *
+ * The reachability test is injected rather than imported so this module keeps
+ * knowing nothing about the roster. */
+export function visibleTo(tasks: readonly BoardTask[], canReach: (botId: string) => boolean): BoardTask[] {
+  return tasks.filter((task) => {
+    if (!task.assigneeBotId && !task.createdByBotId) return true;
+    return (task.assigneeBotId !== null && canReach(task.assigneeBotId)) ||
+      (task.createdByBotId !== null && canReach(task.createdByBotId));
+  });
 }
 
 export function setStatus(id: string, next: BoardStatus, patch: StatusPatch = {}): BoardTask {
@@ -304,6 +342,68 @@ export function setStatus(id: string, next: BoardStatus, patch: StatusPatch = {}
   return updated;
 }
 
+/** The claim, as one conditional write.
+ *
+ * setStatus(id, "running") reads the row and then writes it, which is safe
+ * for one server (the tick's own re-entrancy guard) but not for two: the
+ * documented OMB2 side-by-side setup shares ~/.openmausbot, so two processes
+ * ticking over one tasks.db could both read "ready" and both claim. This is
+ * the same transition — and the same attempts bump, which is what makes a
+ * claim an attempt — expressed as `UPDATE ... WHERE status = 'ready'`, so
+ * exactly one caller can win it. Returns null when the row was not in
+ * "ready" any more, i.e. somebody else got there first. */
+export function claimTask(id: string): BoardTask | null {
+  const now = Date.now();
+  const result = handle()
+    .prepare(`
+      UPDATE tasks SET
+        status = 'running',
+        attempts = attempts + 1,
+        updated_at = ?, started_at = ?, heartbeat_at = ?,
+        blocked_reason = NULL
+      WHERE id = ? AND status = 'ready'
+    `)
+    .run(now, now, now, id);
+  if (Number(result.changes) !== 1) return null;
+  return getTask(id);
+}
+
+/** Undo a claim that never became a turn.
+ *
+ * An attempt is a count of attempts STARTED — the give-up pass blocks a task
+ * once it hits the cap — so a claim that provably never started anything
+ * must not be charged one, or an undispatchable task (no assignee, assignee
+ * busy, the wiring's startTurn threw) walks itself to "blocked" without a
+ * single turn ever running. The dispatcher consults canDispatch BEFORE
+ * claiming so this stays the rare path, not the normal one; it is reached
+ * only when the world changed between the check and the claim.
+ *
+ * This weakens nothing: it is a strict inverse of claimTask, guarded on the
+ * row still being "running", and the caller only reaches it when no turn
+ * exists. staleRunning and the reclaim path are untouched — a task whose
+ * turn DID start still spends its attempt. */
+export function releaseClaim(id: string): BoardTask {
+  const task = getTask(id);
+  if (!task) throw new Error(`no such task: ${id}`);
+  const now = Date.now();
+  handle()
+    .prepare(`
+      UPDATE tasks SET
+        status = 'ready',
+        attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+        updated_at = ?, started_at = NULL, heartbeat_at = NULL,
+        blocked_reason = NULL
+      WHERE id = ? AND status = 'running'
+    `)
+    .run(now, id);
+  // changes === 0 means the row moved on under us (a human edited it, a
+  // stale sweep reclaimed it). That is not an error: there is no claim of
+  // ours left to release, so report whatever the row says now.
+  const updated = getTask(id);
+  if (!updated) throw new Error(`task vanished during update: ${id}`);
+  return updated;
+}
+
 /** Edit title, body, assignee, or priority without touching status or
  * attempts — the fields a human triages with, not the ones the state
  * machine owns. The only tri-state field is assigneeBotId: omitted leaves
@@ -324,8 +424,8 @@ export function patchTask(id: string, patch: TaskPatch): BoardTask {
       WHERE id = ?
     `)
     .run(
-      patch.title ?? null,
-      patch.body ?? null,
+      patch.title === undefined ? null : clamp(patch.title, TASK_TITLE_MAX),
+      patch.body === undefined ? null : clamp(patch.body, TASK_BODY_MAX),
       setAssignee ? 1 : 0,
       patch.assigneeBotId ?? null,
       patch.priority ?? null,
@@ -435,15 +535,19 @@ function rowToComment(row: CommentRow): BoardComment {
 
 export function addComment(taskId: string, botId: string | null, text: string): BoardComment {
   const at = Date.now();
+  const stored = clamp(text, TASK_COMMENT_MAX);
   const result = handle()
     .prepare("INSERT INTO task_comments (task_id, bot_id, text, at) VALUES (?, ?, ?, ?)")
-    .run(taskId, botId, text, at);
-  return { id: Number(result.lastInsertRowid), taskId, botId, text, at };
+    .run(taskId, botId, stored, at);
+  return { id: Number(result.lastInsertRowid), taskId, botId, text: stored, at };
 }
 
-export function commentsOf(taskId: string): BoardComment[] {
+/** The most recent `limit` comments on one task, oldest-first. Bounded on
+ * purpose: a task a bot keeps commenting on must not be able to make one
+ * HTTP response grow without limit. */
+export function commentsOf(taskId: string, limit: number = TASK_COMMENT_PAGE): BoardComment[] {
   const rows = handle()
-    .prepare("SELECT * FROM task_comments WHERE task_id = ? ORDER BY id ASC")
-    .all(taskId) as unknown as CommentRow[];
-  return rows.map(rowToComment);
+    .prepare("SELECT * FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?")
+    .all(taskId, Math.max(1, Math.floor(limit))) as unknown as CommentRow[];
+  return rows.reverse().map(rowToComment);
 }
