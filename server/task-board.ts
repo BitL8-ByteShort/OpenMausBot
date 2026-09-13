@@ -58,6 +58,24 @@ export interface CreateTaskInput {
   parentIds?: string[];
 }
 
+export interface StatusPatch {
+  result?: string;
+  blockedReason?: string;
+  threadId?: string;
+}
+
+/** The only legal moves. Everything else throws, including the ones that
+ * look harmless — "done → running" would silently re-run accepted work. */
+const TRANSITIONS: Record<BoardStatus, BoardStatus[]> = {
+  todo: ["ready", "archived"],
+  ready: ["running", "blocked", "archived"],
+  running: ["review", "blocked", "ready"],
+  blocked: ["ready", "archived"],
+  review: ["done", "ready", "archived"],
+  done: ["archived"],
+  archived: [],
+};
+
 let db: DatabaseSync | null = null;
 let file = "";
 
@@ -190,6 +208,7 @@ export function createTask(input: CreateTaskInput): BoardTask {
       now,
       now,
     );
+  for (const parentId of input.parentIds ?? []) linkTasks(parentId, id);
   const created = getTask(id);
   if (!created) throw new Error(`task vanished right after creation: ${id}`);
   return created;
@@ -216,4 +235,110 @@ export function listTasks(filter: { status?: BoardStatus[]; assigneeBotId?: stri
     .prepare(`SELECT * FROM tasks ${where} ORDER BY priority DESC, created_at DESC`)
     .all(...params) as unknown as TaskRow[];
   return rows.map(rowToTask);
+}
+
+export function setStatus(id: string, next: BoardStatus, patch: StatusPatch = {}): BoardTask {
+  const task = getTask(id);
+  if (!task) throw new Error(`no such task: ${id}`);
+  if (!TRANSITIONS[task.status].includes(next)) {
+    throw new Error(`illegal transition ${task.status} → ${next}`);
+  }
+  const now = Date.now();
+  // Every claim is an attempt, including a reclaim after a dead heartbeat.
+  // Without this a bot that crashes on one task retries it forever.
+  const attempts = next === "running" ? task.attempts + 1 : task.attempts;
+  handle()
+    .prepare(`
+      UPDATE tasks SET
+        status = ?, attempts = ?, updated_at = ?,
+        started_at   = CASE WHEN ? = 'running' THEN ? ELSE started_at END,
+        heartbeat_at = CASE WHEN ? = 'running' THEN ? ELSE heartbeat_at END,
+        finished_at  = CASE WHEN ? IN ('review','done') THEN ? ELSE finished_at END,
+        thread_id      = COALESCE(?, thread_id),
+        result         = COALESCE(?, result),
+        blocked_reason = CASE WHEN ? = 'blocked' THEN ? ELSE NULL END
+      WHERE id = ?
+    `)
+    .run(
+      next,
+      attempts,
+      now,
+      next,
+      now,
+      next,
+      now,
+      next,
+      now,
+      patch.threadId ?? null,
+      patch.result ?? null,
+      next,
+      patch.blockedReason ?? null,
+      id,
+    );
+  const updated = getTask(id);
+  if (!updated) throw new Error(`task vanished during update: ${id}`);
+  return updated;
+}
+
+/** todo tasks with nothing left to wait for. An archived parent counts as
+ * satisfied: abandoning a branch must not wedge everything downstream of
+ * it, which is the failure mode of treating archive as "still pending". */
+export function promotable(): BoardTask[] {
+  const rows = handle()
+    .prepare(`
+      SELECT t.* FROM tasks t
+      WHERE t.status = 'todo'
+        AND NOT EXISTS (
+          SELECT 1 FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+          WHERE l.child_id = t.id AND p.status NOT IN ('done', 'archived')
+        )
+      ORDER BY t.priority DESC, t.created_at ASC
+    `)
+    .all() as unknown as TaskRow[];
+  return rows.map(rowToTask);
+}
+
+export function linkTasks(parentId: string, childId: string): void {
+  handle()
+    .prepare("INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)")
+    .run(parentId, childId);
+}
+
+export function parentsOf(id: string): BoardTask[] {
+  const rows = handle()
+    .prepare(`
+      SELECT p.* FROM tasks p
+      JOIN task_links l ON l.parent_id = p.id
+      WHERE l.child_id = ?
+    `)
+    .all(id) as unknown as TaskRow[];
+  return rows.map(rowToTask);
+}
+
+interface CommentRow {
+  id: number;
+  task_id: string;
+  bot_id: string | null;
+  text: string;
+  at: number;
+}
+
+function rowToComment(row: CommentRow): BoardComment {
+  return { id: row.id, taskId: row.task_id, botId: row.bot_id, text: row.text, at: row.at };
+}
+
+export function addComment(taskId: string, botId: string | null, text: string): BoardComment {
+  const at = Date.now();
+  const result = handle()
+    .prepare("INSERT INTO task_comments (task_id, bot_id, text, at) VALUES (?, ?, ?, ?)")
+    .run(taskId, botId, text, at);
+  return { id: Number(result.lastInsertRowid), taskId, botId, text, at };
+}
+
+export function commentsOf(taskId: string): BoardComment[] {
+  const rows = handle()
+    .prepare("SELECT * FROM task_comments WHERE task_id = ? ORDER BY id ASC")
+    .all(taskId) as unknown as CommentRow[];
+  return rows.map(rowToComment);
 }
