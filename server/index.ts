@@ -137,6 +137,8 @@ import {
   skillAuthoringEnabled,
   sharedComputersEnabled,
   builtInBrowserEnabled,
+  boardEnabled,
+  boardMaxRunning,
   browserProfileReplacementConflict,
   browserProfilePartitionTarget,
   syncCredentialEnv,
@@ -348,6 +350,21 @@ import { redactSecretsInText } from "./redact.ts";
 import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import { CalendarCallManager, type CalendarCall } from "./calendar-calls.ts";
+import {
+  addComment,
+  BOARD_STATUSES,
+  commentsOf,
+  createTask as createBoardTask,
+  getTask as getBoardTask,
+  listTasks as listBoardTasks,
+  openBoard,
+  patchTask as patchBoardTask,
+  setStatus as setBoardTaskStatus,
+  type BoardStatus,
+  type BoardTask,
+  type TaskPatch as BoardTaskPatch,
+} from "./task-board.ts";
+import { createDispatcher as createBoardDispatcher } from "./task-dispatcher.ts";
 import { BUILT_IN_BROWSER_SYSTEM_PROMPT } from "./browser-engine.ts";
 import { BrowserRuntime } from "./browser-runtime.ts";
 import { BrowserLive } from "./browser-live.ts";
@@ -867,6 +884,12 @@ const phoneProxyPath = SPAWNED_PROXIES.phone;
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
+/** Narrow an untrusted status string (an HTTP PATCH body, a tool argument)
+ * before it reaches a typed BoardStatus parameter. */
+function isBoardStatus(value: unknown): value is BoardStatus {
+  return typeof value === "string" && (BOARD_STATUSES as readonly string[]).includes(value);
+}
+
 function agentsIntegration(
   botId: string,
   threadId: string,
@@ -876,6 +899,7 @@ function agentsIntegration(
   roomHandoffId?: string,
   roomCoordination = false,
   ownThreadCreation = false,
+  boardToolsEnabled = false,
 ) {
   const token = mintInternalCapability({
     botId,
@@ -908,6 +932,7 @@ function agentsIntegration(
       // The shared-computer tools are advertised only while the workspace
       // gate is on; the routes behind them refuse regardless.
       OMB_SHARED_COMPUTERS_ENABLED: sharedComputersEnabled(cfg) ? "1" : "0",
+      OMB_BOARD_ENABLED: boardToolsEnabled ? "1" : "0",
     },
   };
 }
@@ -6253,7 +6278,7 @@ async function startTurn(
           ? store.activePath(threadId).findLast(message => message.role === "user" && message.kind === "text")
           : userMessage;
         const ownThreadCreation = boundedCoordination && !opts?.coordination && Boolean(origin && !origin.peerAsk);
-        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, skillAuthoring, dispatchClaimId, opts?.coordination?.id, boundedCoordination, ownThreadCreation);
+        integrations.agents = agentsIntegration(bot.id, threadId, commsDepth, skillAuthoring, dispatchClaimId, opts?.coordination?.id, boundedCoordination, ownThreadCreation, boardEnabled(cfg));
       }
       if (instance.adapter.capabilities.hooks === true && hooksEnabled()) {
         integrations.hooks = hooksIntegration(bot.id, threadId, dispatchClaimId);
@@ -6881,6 +6906,70 @@ calendarCalls = new CalendarCallManager({
   botExists: (botId) => Boolean(store.bot(botId)),
   onDue: deliverCalendarCall,
 });
+
+// ── the durable task board's dispatcher tick ─────────────────────────────
+// Storage always opens (0600, same as messages.db) and the tick always
+// runs — but createDispatcher's own tick() is a pure no-op the instant
+// boardEnabled(cfg) reads false, below, so an existing install that never
+// turns features.board on gets no reclaim, no promote, no claim, and no
+// bot ever dispatched. Both this closure and the /api/tasks* routes read
+// the same live `cfg` object (mutated in place on every config write), so
+// flipping the flag with PATCH /api/config takes effect on the very next
+// tick — no restart needed either way.
+openBoard();
+/** What a board-dispatched turn actually sees. There is no task_complete
+ * or task_block tool in this scope yet — a bot cannot report progress on
+ * a board task from inside its own turn — so this is deliberately honest
+ * about that instead of promising a tool that is not wired up. */
+function boardTaskPrompt(task: BoardTask): string {
+  const detail = task.body.trim() ? `\n\n${task.body.trim()}` : "";
+  return `A task was filed on the shared task board: "${task.title}"${detail}`;
+}
+const boardDispatcher = createBoardDispatcher({
+  maxRunning: boardMaxRunning(cfg),
+  emit: (payload) => broadcast(payload),
+  dispatch: async (task) => {
+    if (!boardEnabled(cfg)) return null;
+    // Unassigned work waits for a human to assign it (PATCH /api/tasks/:id);
+    // the dispatcher never guesses a recipient.
+    if (!task.assigneeBotId) return null;
+    const bot = store.bot(task.assigneeBotId);
+    if (!bot || bot.busy || bot.hidden) return null;
+    // The capability rule: this dispatch happens with nobody at the
+    // keyboard, so only a bot whose resolved approval mode is "auto" — the
+    // one mode built to keep working instead of stopping to ask, see
+    // BotRecord.autoApprove in store.ts — may take it. Ask, Edits, Full,
+    // Custom, a pending approvalGrant, or a driver that cannot even offer
+    // Auto (supportsApprovalMode) all resolve to something other than
+    // "auto" here, and all of them would leave the task stuck on its first
+    // permission card with nobody able to answer it.
+    if (approvalModeForTurn(bot) !== "auto") return null;
+    const runThread = store.createTask(bot.id, task.title, false);
+    if (!runThread) return null;
+    try {
+      await startTurn(bot.id, boardTaskPrompt(task), { threadId: runThread.threadId, unattended: true });
+    } catch (error) {
+      // Busy, budget, thread-limit, a mid-reload fleet — try again next
+      // tick rather than taking the whole tick down.
+      console.error(`board: could not start bot ${bot.id} on task ${task.id}:`, error);
+      return null;
+    }
+    // Every dispatch is a decision, audited fire-and-forget exactly like
+    // any other unattended approval (server/decision-log.ts).
+    appendDecision(DATA_DIR, {
+      threadId: runThread.threadId,
+      botId: bot.id,
+      botName: bot.name,
+      tool: "board.dispatch",
+      summary: task.title,
+      decision: "auto-approved",
+      source: "board",
+      unattended: true,
+    });
+    return { threadId: runThread.threadId };
+  },
+});
+
 const recoveryOwners = routines.routineRequestReceiptOwners();
 if (recoveryOwners.length > 0) {
   // A normal launch has no crash-gap receipts, so it must not eagerly load
@@ -7702,7 +7791,7 @@ async function runGroupMemberTurn(
     !cardContinuation &&
     instance.adapter.capabilities.agentsMcp === true;
   if ((hop < MAX_COMMS_DEPTH || orchestration?.roomHandoffId) && instance.adapter.capabilities.agentsMcp === true) {
-    integrations.agents = agentsIntegration(bot.id, threadId, hop, skillAuthoring, internalGeneration, orchestration?.roomHandoffId, !orchestration || Boolean(orchestration.roomHandoffId));
+    integrations.agents = agentsIntegration(bot.id, threadId, hop, skillAuthoring, internalGeneration, orchestration?.roomHandoffId, !orchestration || Boolean(orchestration.roomHandoffId), boardEnabled(cfg));
   }
   if (instance.adapter.capabilities.hooks === true && hooksEnabled()) {
     integrations.hooks = hooksIntegration(bot.id, threadId, internalGeneration);
@@ -10785,6 +10874,55 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const result = appendMemoryLog(internalSender.id, body.text, { source: memorySource() });
         return json(res, result.ok ? 200 : 400, result);
       }
+      // ── the durable task board — task_create / task_list ────────────────
+      // Off by default; see boardEnabled in config.ts. The dispatcher that
+      // actually runs a claimed task lives in the boot wiring, not here —
+      // these two tools only file work and read it back.
+      if (method === "POST" && path === "/api/internal/task-create") {
+        if (!boardEnabled(cfg)) return json(res, 404, { error: "the task board is not enabled" });
+        const body = await readInternalBody();
+        const title = typeof body.title === "string" ? body.title.trim() : "";
+        if (!title) return json(res, 400, { error: "title is required" });
+        const assigneeBotId = typeof body.assigneeBotId === "string" && body.assigneeBotId.trim()
+          ? body.assigneeBotId.trim()
+          : undefined;
+        if (assigneeBotId) {
+          const target = store.bot(assigneeBotId);
+          if (!target) {
+            return json(res, 404, { error: "no bot with that id — call list_bots and copy the exact id from the result" });
+          }
+          if (!canReachPeer(internalSender, target)) {
+            return json(res, 403, { error: "that bot belongs to a different section" });
+          }
+        }
+        const parentIds = Array.isArray(body.parentTaskIds)
+          ? body.parentTaskIds.filter((id: unknown): id is string => typeof id === "string")
+          : undefined;
+        for (const parentId of parentIds ?? []) {
+          if (!getBoardTask(parentId)) return json(res, 404, { error: `no board task with id ${parentId} — check the id and try again` });
+        }
+        const task = createBoardTask({
+          title,
+          body: typeof body.body === "string" ? body.body : undefined,
+          assigneeBotId,
+          createdByBotId: internalSender.id,
+          parentIds,
+        });
+        return json(res, 201, { task });
+      }
+      if (method === "POST" && path === "/api/internal/task-list") {
+        if (!boardEnabled(cfg)) return json(res, 404, { error: "the task board is not enabled" });
+        const body = await readInternalBody();
+        const requestedStatus = Array.isArray(body.status) ? body.status.filter(isBoardStatus) : undefined;
+        const status = requestedStatus?.length
+          ? requestedStatus
+          : BOARD_STATUSES.filter((value) => value !== "archived");
+        const tasks = listBoardTasks({
+          status,
+          ...(body.mineOnly === true ? { assigneeBotId: internalSender.id } : {}),
+        });
+        return json(res, 200, { tasks });
+      }
       if (method === "POST" && path === "/api/internal/browser/mcp") {
         const body = await readInternalBody();
         const bot = store.bot(internalCapability.botId);
@@ -12287,6 +12425,88 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         return [{ sourceBotId, targetBotId: watch.toBotId, threadId, groupId: channel?.id }];
       });
       return json(res, 200, { collaborations, queued, running });
+    }
+
+    // ── durable task board (server/task-board.ts + task-dispatcher.ts) ────
+    // Off by default (config.ts boardEnabled) — every route here answers 404
+    // until the workspace turns features.board on, so an existing install
+    // sees no new surface. A dispatch out of this board is still a decision
+    // with nobody at the keyboard, so the boot wiring below audits every one
+    // through appendDecision exactly like any other unattended approval.
+    if (path === "/api/tasks" && method === "GET") {
+      if (!boardEnabled(cfg)) return json(res, 404, { error: "the task board is not enabled" });
+      const statusParam = url.searchParams.get("status");
+      const requestedStatus = statusParam
+        ? statusParam.split(",").map((value) => value.trim()).filter(isBoardStatus)
+        : undefined;
+      const assigneeBotId = url.searchParams.get("assigneeBotId") ?? undefined;
+      const tasks = listBoardTasks({ status: requestedStatus, assigneeBotId });
+      const comments: Record<string, ReturnType<typeof commentsOf>> = {};
+      for (const task of tasks) comments[task.id] = commentsOf(task.id);
+      return json(res, 200, { tasks, comments });
+    }
+    if (path === "/api/tasks" && method === "POST") {
+      if (!boardEnabled(cfg)) return json(res, 404, { error: "the task board is not enabled" });
+      const body = await readBody(req);
+      const title = typeof body?.title === "string" ? body.title.trim() : "";
+      if (!title) return json(res, 400, { error: "title is required" });
+      const assigneeBotId = typeof body?.assigneeBotId === "string" ? body.assigneeBotId : undefined;
+      if (assigneeBotId && !store.bot(assigneeBotId)) return json(res, 404, { error: "no such bot" });
+      const parentIds = Array.isArray(body?.parentIds)
+        ? body.parentIds.filter((id: unknown): id is string => typeof id === "string")
+        : undefined;
+      for (const parentId of parentIds ?? []) {
+        if (!getBoardTask(parentId)) return json(res, 404, { error: `no board task with id ${parentId}` });
+      }
+      const task = createBoardTask({
+        title,
+        body: typeof body?.body === "string" ? body.body : undefined,
+        assigneeBotId,
+        priority: typeof body?.priority === "number" ? body.priority : undefined,
+        parentIds,
+      });
+      return json(res, 201, { task });
+    }
+    const taskMatch = path.match(/^\/api\/tasks\/([\w-]+)$/);
+    if (taskMatch && method === "PATCH") {
+      if (!boardEnabled(cfg)) return json(res, 404, { error: "the task board is not enabled" });
+      const existing = getBoardTask(taskMatch[1]);
+      if (!existing) return json(res, 404, { error: "no such task" });
+      const body = await readBody(req);
+      if (body?.assigneeBotId !== undefined && body.assigneeBotId !== null && !store.bot(body.assigneeBotId)) {
+        return json(res, 404, { error: "no such bot" });
+      }
+      try {
+        let updated = existing;
+        if (body?.status !== undefined) {
+          if (!isBoardStatus(body.status)) {
+            return json(res, 400, { error: `status must be one of ${BOARD_STATUSES.join(", ")}` });
+          }
+          updated = setBoardTaskStatus(updated.id, body.status);
+        }
+        const patch: BoardTaskPatch = {};
+        if (typeof body?.title === "string") patch.title = body.title;
+        if (typeof body?.body === "string") patch.body = body.body;
+        if (typeof body?.priority === "number") patch.priority = body.priority;
+        if (body?.assigneeBotId !== undefined) patch.assigneeBotId = body.assigneeBotId;
+        if (Object.keys(patch).length > 0) updated = patchBoardTask(updated.id, patch);
+        return json(res, 200, { task: updated });
+      } catch (error) {
+        // setStatus throws on an illegal transition — that is a client
+        // mistake (a stale board view, a bad request), never a server fault.
+        return json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    const taskCommentMatch = path.match(/^\/api\/tasks\/([\w-]+)\/comments$/);
+    if (taskCommentMatch && method === "POST") {
+      if (!boardEnabled(cfg)) return json(res, 404, { error: "the task board is not enabled" });
+      if (!getBoardTask(taskCommentMatch[1])) return json(res, 404, { error: "no such task" });
+      const body = await readBody(req);
+      const text = typeof body?.text === "string" ? body.text.trim() : "";
+      if (!text) return json(res, 400, { error: "text is required" });
+      const botId = typeof body?.botId === "string" ? body.botId : null;
+      const comment = addComment(taskCommentMatch[1], botId, text);
+      return json(res, 201, { comment });
     }
 
     // ── routines calendar ────────────────────────────────────────────────
@@ -17179,6 +17399,7 @@ server.listen(PORT, "127.0.0.1", () => {
   // ordinary chat. Start only once every registry is initialized and the
   // endpoint is listening; earlier dispatch can hit uninitialized bindings.
   routines!.start();
+  boardDispatcher.start();
   const leftover = pendingThreads();
   if (leftover.length) console.log(`delegations: ${leftover.length} thread(s) with queued handoffs from a previous run — draining`);
   for (const threadId of leftover) {
