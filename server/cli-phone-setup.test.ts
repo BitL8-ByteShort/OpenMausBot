@@ -236,10 +236,15 @@ describe("phone pairing instructions", () => {
     expect(text).not.toMatch(/apps\.apple|testflight|play\.google/);
   });
 
-  it("describes Android web pairing, not native app compatibility", () => {
+  it("sends an Android phone to the app first, and still offers the browser", () => {
     const text = phonePairingInstructions("android", { origin: "https://maus.example", ready: true }).join("\n");
-    expect(text).toContain("web browser");
-    expect(text).toContain("not the Android native pairing scanner");
+    // The QR beside these lines is the openmausbot:// invite, so the app's
+    // own scanner is now the primary route rather than a dead end.
+    expect(text).toContain("open the OpenMausBot app and scan the QR with its pairing scanner");
+    expect(text).toContain("web app instead");
+    // The line that told people the link was useless to the native scanner
+    // described a limitation that no longer exists.
+    expect(text).not.toContain("not the Android native pairing scanner");
     expect(text).toContain("five minutes");
   });
 });
