@@ -55,10 +55,10 @@ it("keeps routing and secrets per instance and uses separate device-scoped Claud
   const value = connection(), map = companyInstanceConfigs(value, "/fixture/company-runtime");
   const claude = map[companyInstanceId(value, "anthropic")], codex = map[companyInstanceId(value, "openai")], router = map[companyInstanceId(value, "openrouter")];
   expect(claude.environment).toMatchObject({ ANTHROPIC_BASE_URL: `${value.portalOrigin}/api/desktop/gateway/anthropic`, ANTHROPIC_API_KEY: value.token });
-  expect((claude.config as { configDir: string }).configDir).toContain("/fixture/company-runtime/company.");
+  expect((claude.config as { configDir: string }).configDir).toContain(join("/fixture/company-runtime", "company."));
   expect(claude.config).toMatchObject({ managed: true });
   expect(codex.environment).toMatchObject({ OPENMAUSBOT_COMPANY_API_KEY: value.token });
-  expect(codex.environment?.CODEX_HOME).toContain("/fixture/company-runtime/company.");
+  expect(codex.environment?.CODEX_HOME).toContain(join("/fixture/company-runtime", "company."));
   expect(codex.config).toEqual({ managed: { url: `${value.portalOrigin}/api/desktop/gateway/openai/v1`, models: ["gpt-fixture"] } });
   expect(router.config).toMatchObject({ url: `${value.portalOrigin}/api/desktop/gateway/openrouter/v1`, provider: "", apiKeyEnv: "OPENMAUSBOT_COMPANY_API_KEY" });
   expect(router.environment).not.toHaveProperty("ANTHROPIC_API_KEY");

@@ -3,7 +3,7 @@
 ## Execution status
 
 The final real-Electron run, including the state/list-failure UI fix, has a passing
-[receipt](/var/folders/91/pdc4mdh53xs59x0r4z7_0qzc0000gn/T/omb-company-backup-ui-ReLYEv/receipt.json).
+`receipt.json` in the printed evidence directory.
 It transferred a 96,316-byte encrypted archive, made two create requests, one
 confirmed cloud deletion, and one typed **REPLACE** request. The receipt records
 the exact owned runtime restart, restored snapshot IDs, removal of a later
@@ -13,7 +13,7 @@ company-backup preload bridge on a remote-origin page.
 The run also checked native Escape dismissal, allowlisted client-state input,
 absence of the password from local storage, and the recovery marker inside the
 fixture IPC handler before committing replacement. The
-[cleanup receipt](/var/folders/91/pdc4mdh53xs59x0r4z7_0qzc0000gn/T/omb-company-backup-ui-ReLYEv/cleanup.json)
+`cleanup.json` in the printed evidence directory
 confirms removal of the owned fixture and profile.
 
 Screenshot review is complete: desktop upload confirmation, progress and list;

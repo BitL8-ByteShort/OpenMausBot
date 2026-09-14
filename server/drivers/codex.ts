@@ -29,7 +29,7 @@ import { newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath, splitCliString } from "../env-path.ts";
-import { classifyError, computeBackoff, RETRY_MAX_ATTEMPTS } from "./retry.ts";
+import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { appendNative } from "./native.ts";
 import { commandSummary, toolDetailPreview } from "../tool-summary.ts";
 import { codexDeveloperInstructions, syncCodexInstructions } from "./codex-instructions.ts";
@@ -572,6 +572,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       let stopRequested = false;
       let promptSubmitted = false;
       let recoveredMissingSession = false;
+      // Wakes a retry backoff the moment Stop arrives, so the turn settles
+      // now rather than after the full wait.
+      const stopSignal = new AbortController();
       const { threadId } = turn;
       // Direct adapter callers predating the per-bot selector retain the
       // instance's legacy fullAuto setting. Harness turns always send an
@@ -706,6 +709,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       let completeStoppedTurn: (() => void) | undefined;
       const stop = async () => {
         stopRequested = true;
+        stopSignal.abort();
         const stopped = await terminate();
         if (stopped) completeStoppedTurn?.();
         return stopped;
@@ -1241,10 +1245,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             void settle(false, "shutdown_timeout");
             return;
           }
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, Math.max(1, Math.round(delayMs * retryScale)));
-            timer.unref?.();
-          });
+          await interruptibleDelay(Math.max(1, Math.round(delayMs * retryScale)), stopSignal.signal).promise;
           if (!stopRequested) {
             void launchAttempt(attempt).catch(() => {});
           } else {
