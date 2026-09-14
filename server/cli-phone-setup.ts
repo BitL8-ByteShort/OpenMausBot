@@ -129,7 +129,7 @@ export function phonePairingInstructions(
   return [
     phone === "ios"
       ? "On iPhone or iPad, scan the QR with Camera to open Safari. If you already have the OpenMausBot iOS app, use its pairing scanner or paste the full pairing link there."
-      : "On Android, scan the QR with Camera and open it in your web browser. This link is for the web app, not the Android native pairing scanner.",
+      : "On Android, open the OpenMausBot app and scan the QR with its pairing scanner. To use the web app instead, scan with Camera and open the link in your browser.",
     `Or open ${origin}/pair on your phone and enter the code.`,
     "Choose Connect on the phone. Scanning a QR does not mean the phone is paired.",
     "The code works once and expires after five minutes. This phone receives client access: chat and approvals, not settings or pairing administration.",

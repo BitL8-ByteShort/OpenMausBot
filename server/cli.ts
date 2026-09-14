@@ -398,18 +398,39 @@ async function showPhonePairing(options: CliOptions, origin: string | undefined,
     return false;
   }
   for (const line of phonePairingInstructions(options.phone ?? "ios", { origin: origin!, ready })) log(line);
-  log(await mintPairing(options.port, { client: true, label: options.label ?? (options.phone === "android" ? "Android" : "iPhone / iPad"), publicUrl: origin }));
+  log(await mintPairing(options.port, { client: true, label: options.label ?? (options.phone === "android" ? "Android" : "iPhone / iPad"), publicUrl: origin, phone: options.phone }));
   log("Waiting for you to connect on the phone. Keep this terminal and the code private.");
   return true;
 }
 
-/** The pairing link a device opens, rendered as text and a QR code. */
-export function pairingBlock(input: { code: string; url: string | null; expiresAt: number; hint?: string | null }): string {
+/** The pairing link a device opens, rendered as text and a QR code.
+ *
+ * One window has two links. `url` opens the web app and is what a browser and
+ * the iOS app read. `inviteUrl` is the openmausbot:// scheme the native
+ * companion scanners accept, and it is the ONLY thing an Android app can
+ * scan — its parser rejects any https QR outright. Which one becomes the QR
+ * therefore depends on which app is about to scan it; the other is still
+ * printed as text so neither route is hidden. */
+export function pairingBlock(input: {
+  code: string;
+  url: string | null;
+  inviteUrl?: string | null;
+  expiresAt: number;
+  hint?: string | null;
+  phone?: "ios" | "android";
+}): string {
   const lines = [`pairing code:  ${input.code}`, `expires:       ${new Date(input.expiresAt).toLocaleTimeString()} (single use)`];
+  const nativeQr = input.phone === "android" && input.inviteUrl;
   if (input.url) {
     lines.push(`open or scan:  ${input.url}`);
+    if (input.inviteUrl && !nativeQr) lines.push(`native app:    scan the QR in the app, or paste this link into it`);
     lines.push("");
-    lines.push(qrToString(input.url));
+    lines.push(qrToString(nativeQr ? input.inviteUrl! : input.url));
+    if (nativeQr) {
+      lines.push("");
+      lines.push(`scan the QR above in the OpenMausBot app. For the web app instead,`);
+      lines.push(`open ${input.url} and type the code.`);
+    }
   } else {
     lines.push(`open:          /pair on the address you use for this server, and type the code`);
     if (input.hint) lines.push(`               (${input.hint})`);
@@ -425,14 +446,19 @@ export function qrToString(text: string): string {
   return out;
 }
 
-async function mintPairing(port: number, options: { label?: string; client?: boolean; publicUrl?: string }): Promise<string> {
+async function mintPairing(port: number, options: { label?: string; client?: boolean; publicUrl?: string; phone?: "ios" | "android" }): Promise<string> {
   const request: { label?: string; scopes?: string[] } = {};
   if (options.label) request.label = options.label;
   if (options.client) request.scopes = ["client"];
   const { status, body } = await api(port, "/api/auth/pairing", { method: "POST", body: JSON.stringify(request) });
   if (status !== 200) throw new Error(`server refused to mint a pairing code: ${typeof body?.error === "string" ? body.error : status}`);
   const url = options.publicUrl ? `${options.publicUrl}/pair#code=${body.code}` : typeof body.url === "string" ? body.url : null;
-  return pairingBlock({ code: body.code, url, expiresAt: body.expiresAt, hint: typeof body.hint === "string" ? body.hint : null });
+  // A server too old to mint a credential simply has no invite: the web link
+  // still works, so an upgrade is never required to pair a browser.
+  const invite = typeof body.inviteUrl === "string" && options.publicUrl && typeof body.credential === "string"
+    ? `openmausbot://pair?address=${encodeURIComponent(options.publicUrl)}&token=${encodeURIComponent(body.credential)}${typeof body.serverName === "string" ? `&name=${encodeURIComponent(body.serverName)}` : ""}`
+    : typeof body.inviteUrl === "string" ? body.inviteUrl : null;
+  return pairingBlock({ code: body.code, url, inviteUrl: invite, expiresAt: body.expiresAt, hint: typeof body.hint === "string" ? body.hint : null, phone: options.phone });
 }
 
 // ── commands ───────────────────────────────────────────────────────────
@@ -464,7 +490,7 @@ export async function runPair(options: CliOptions): Promise<number> {
     }
     const ui = defaultSetupIo();
     try {
-      const selected = await ui.choose("Which phone are you connecting?", ["iPhone / iPad — app or Safari", "Android — web browser", "Cancel"], 0);
+      const selected = await ui.choose("Which phone are you connecting?", ["iPhone / iPad — app or Safari", "Android — app or browser", "Cancel"], 0);
       if (selected === 2) return 0;
       launch = { ...launch, phone: selected === 0 ? "ios" : "android" };
       return await showPhonePairing(launch, origin, ui.log) ? 0 : 1;
