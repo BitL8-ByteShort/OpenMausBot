@@ -31,6 +31,8 @@ export interface ApprovalBus {
   /** Where a "blocked on you" frame goes. Optional: the boot-time cleanup
    * and the settle paths only ever answer cards, and never raise one. */
   notify?: (notification: Notification | null) => void;
+  /** Effective server-resolved Full Access for this exact source thread. */
+  autoApply?: (botId: string, threadId: string) => boolean;
 }
 
 /** A peer request must never gain authority: `"too_many"` is refused the
@@ -163,9 +165,10 @@ function announceCard(bus: ApprovalBus, from: BotRecord, card: Message, sourceTh
 }
 
 /** Ask the user (in the source task thread) whether `from` may `action` `target`.
- * Resolves with `"allow"`, `"deny"`, or `"too_many"`. If `from.alwaysAllow`
+ * Resolves with `"allow"`, `"deny"`, or `"too_many"`. If the thread has
+ * server-resolved Full Access (`bus.autoApply`) or `from.alwaysAllow`
  * already covers the (action, target) pair, returns `"allow"` immediately
- * without a card — a standing grant never asks the user, so it never
+ * without a card — neither standing grant ever asks the user, so neither
  * counts against either cap.
  *
  * Otherwise, before any card is raised, checks the per-bot and workspace
@@ -181,7 +184,7 @@ export function requestPeerApproval(
   action: PeerAction,
   sourceThreadId = from.threadId,
 ): Promise<PeerApprovalVerdict> {
-  if (allowKeyAllowed(from, peerAllowKey(action, target.id))) {
+  if (bus.autoApply?.(from.id, sourceThreadId) || allowKeyAllowed(from, peerAllowKey(action, target.id))) {
     return Promise.resolve("allow");
   }
   let pendingForBot = 0;
