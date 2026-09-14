@@ -150,6 +150,14 @@ export function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env):
       }
       else if (arg === "--tunnel") options.tunnel = true;
       else if (arg === "--client") options.client = true;
+      // Which phone is about to scan, for a run with nobody at the keyboard.
+      // `docker compose exec … pair` and any scripted pairing never reach the
+      // interactive chooser, and only an Android phone needs a different QR.
+      else if (arg === "--phone") {
+        const kind = value().toLowerCase();
+        if (kind !== "ios" && kind !== "android") return { error: "--phone takes ios or android" };
+        options.phone = kind;
+      }
       else if (arg === "--no-pair") options.pair = false;
       else if (arg === "--no-open") options.open = false;
       else if (arg === "--local") options.local = true;
@@ -210,7 +218,8 @@ export const USAGE = `openmausbot — your team of AI bots, ready in a few steps
   openmausbot start [the same options as serve]
   openmausbot serve [--port 8799] [--data-dir DIR] [--label NAME]
                     [--public-url https://host] [--tailscale | --tunnel | --domain HOST] [--no-pair]
-  openmausbot pair  [--label NAME] [--client] [--public-url https://host]
+  openmausbot pair  [--label NAME] [--client] [--phone ios|android]
+                    [--public-url https://host]
   openmausbot sessions [revoke ID]
   openmausbot status
   openmausbot login [--email you@example.com]
@@ -540,7 +549,7 @@ export async function runPair(options: CliOptions): Promise<number> {
       return 130;
     }
   }
-  console.log(await mintPairing(options.port, { label: options.label, client: options.client, publicUrl: options.publicUrl }));
+  console.log(await mintPairing(options.port, { label: options.label, client: options.client, publicUrl: options.publicUrl, phone: options.phone }));
   if (options.client) console.log("(client scope: chat and approvals only; cannot change settings or pair others)");
   return 0;
 }

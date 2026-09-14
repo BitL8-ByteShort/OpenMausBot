@@ -63,6 +63,14 @@ describe("openmausbot command line", () => {
     expect(parseArgs(["serve", "--domain", "maus.example.com", "--tunnel"], {})).toEqual({ error: expect.stringContaining("--domain already gives") });
   });
 
+  it("takes the phone kind non-interactively, because a scripted pair never sees the chooser", () => {
+    // `docker compose exec … pair` and any piped run skip the interactive
+    // chooser, and an Android phone is the one that needs a different QR.
+    expect(parseArgs(["pair", "--phone", "android"], {})).toMatchObject({ command: "pair", phone: "android" });
+    expect(parseArgs(["pair", "--phone", "iOS"], {})).toMatchObject({ phone: "ios" });
+    expect(parseArgs(["pair", "--phone", "blackberry"], {})).toEqual({ error: expect.stringContaining("ios or android") });
+  });
+
   it("prints a scannable block with the link, or says where to type the code", () => {
     const block = pairingBlock({ code: "ABCD-EFGH-JKLM", url: "https://mini.example/pair#code=ABCD-EFGH-JKLM", expiresAt: Date.now() + 60_000 });
     expect(block).toContain("pairing code:  ABCD-EFGH-JKLM");
