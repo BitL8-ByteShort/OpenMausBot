@@ -4442,15 +4442,16 @@ describe("harness HTTP API", () => {
       const identity = ${JSON.stringify(PHONE_SECRET_TEST_IDENTITY)};
       const gate = ${JSON.stringify(isolatedGate)};
       const release = ${JSON.stringify(releaseFile)};
-      let listener;
+      const { EventEmitter } = await import("node:events");
+      const messages = new EventEmitter();
       let saves = Promise.resolve();
       const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
       Object.defineProperty(process, "parentPort", {
         value: {
           on(event, callback) {
             if (event !== "message") return;
-            listener = callback;
-            queueMicrotask(() => listener?.({ data: identity }));
+            messages.on(event, callback);
+            queueMicrotask(() => callback({ data: identity }));
           },
           postMessage(message) {
             if (message?.type !== "openmausbot:phone-secret-save") return;
@@ -4472,13 +4473,13 @@ describe("harness HTTP API", () => {
                 );
                 const body = await response.json().catch(() => null);
                 if (!response.ok) throw new Error(body?.error || "credential config failed");
-                listener?.({ data: {
+                messages.emit("message", { data: {
                   type: "openmausbot:phone-secret-save-result",
                   requestId: message.requestId,
                   ok: true,
                 } });
               } catch (error) {
-                listener?.({ data: {
+                messages.emit("message", { data: {
                   type: "openmausbot:phone-secret-save-result",
                   requestId: message.requestId,
                   ok: false,
@@ -6442,13 +6443,14 @@ describe("harness HTTP API", () => {
     }]));
 
     const ackDesktopPrelude = `data:text/javascript,${encodeURIComponent(`
-      let listener;
+      const { EventEmitter } = await import("node:events");
+      const messages = new EventEmitter();
       Object.defineProperty(process, "parentPort", {
         value: {
-          on(event, callback) { if (event === "message") listener = callback; },
+          on(event, callback) { messages.on(event, callback); },
           postMessage(message) {
             if (message?.requestId && /browser-(?:bot|profile)-deleted/.test(message.type ?? "")) {
-              queueMicrotask(() => listener?.({ data: {
+              queueMicrotask(() => messages.emit("message", { data: {
                 type: "openmausbot:browser-lifecycle-result",
                 requestId: message.requestId,
                 ok: true,
