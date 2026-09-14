@@ -231,7 +231,10 @@ describe("CLI startup lifecycle", () => {
       if (address === `http://127.0.0.1:${options.port}/api/auth/pairing`) {
         expect(init?.method).toBe("POST");
         expect(JSON.parse(String(init?.body))).toEqual({ label: "Android", scopes: ["client"] });
-        return Response.json({ code, url: pairingUrl, expiresAt, credential, inviteUrl, serverName: "fixture" });
+        // A server started without OMB_PUBLIC_URL: it mints the credential but
+        // cannot name itself, so it returns no links at all. The CLI was told
+        // the public address with --public-url and must build both from that.
+        return Response.json({ code, url: null, expiresAt, credential, serverName: "fixture", hint: "set OMB_PUBLIC_URL" });
       }
       expect(address).toMatch(/\/\.well-known\/openmausbot\/environment$/);
       expect(init?.method).not.toBe("POST");
@@ -250,7 +253,7 @@ describe("CLI startup lifecycle", () => {
     const output = log.mock.calls.map(([line]) => line).join("\n");
     expect(output).toContain(`pairing code:  ${code}`);
     expect(output).toContain(`expires:       ${new Date(expiresAt).toLocaleTimeString()} (single use)`);
-    expect(output).toContain(`open or scan:  ${pairingUrl}`);
+    expect(output).toContain(`web browser:   ${pairingUrl}`);
     expect(output).toMatch(/[▀▄█]/);
     expect(output).toContain(`Or open ${origin}/pair on your phone and enter the code.`);
     expect(output).toContain("On Android, open the OpenMausBot app and scan the QR with its pairing scanner.");

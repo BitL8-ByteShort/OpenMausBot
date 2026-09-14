@@ -420,22 +420,53 @@ export function pairingBlock(input: {
   phone?: "ios" | "android";
 }): string {
   const lines = [`pairing code:  ${input.code}`, `expires:       ${new Date(input.expiresAt).toLocaleTimeString()} (single use)`];
-  const nativeQr = input.phone === "android" && input.inviteUrl;
-  if (input.url) {
-    lines.push(`open or scan:  ${input.url}`);
-    if (input.inviteUrl && !nativeQr) lines.push(`native app:    scan the QR in the app, or paste this link into it`);
-    lines.push("");
-    lines.push(qrToString(nativeQr ? input.inviteUrl! : input.url));
-    if (nativeQr) {
-      lines.push("");
-      lines.push(`scan the QR above in the OpenMausBot app. For the web app instead,`);
-      lines.push(`open ${input.url} and type the code.`);
-    }
-  } else {
+  if (!input.url && !input.inviteUrl) {
     lines.push(`open:          /pair on the address you use for this server, and type the code`);
     if (input.hint) lines.push(`               (${input.hint})`);
+    return lines.join("\n");
+  }
+  // One QR, and it belongs to whichever app is about to scan it. Android's
+  // scanner rejects an https payload outright, so an Android phone gets the
+  // app-scheme invite; everyone else gets the web link, which Camera opens
+  // and which the iOS app also accepts.
+  const scanInvite = input.phone === "android" && !!input.inviteUrl;
+  // Print every link this window has, and label them by what the QR below
+  // actually encodes: "scan" belongs only to the link it is a picture of. A
+  // link that is named but never shown is worse than one that is absent —
+  // the iOS app takes a pasted invite, so the text form is the fallback when
+  // a QR cannot be scanned off a terminal.
+  if (input.url) lines.push(scanInvite ? `web browser:   ${input.url}` : `open or scan:  ${input.url}`);
+  if (input.inviteUrl) lines.push(`phone app:     ${input.inviteUrl}`);
+  const target = scanInvite ? input.inviteUrl! : input.url;
+  if (target) {
+    lines.push("");
+    lines.push(qrToString(target));
+    lines.push("");
+    if (scanInvite) {
+      lines.push(`Scan that in the OpenMausBot app. For a browser instead, open the web`);
+      lines.push(`address above and type the code.`);
+    } else if (input.phone === "android") {
+      // Android asked for an app invite this server cannot build. Say so,
+      // rather than leave a QR its scanner will reject under instructions
+      // telling someone to scan it.
+      lines.push(`That QR opens the web app. The Android app needs the phone-app link,`);
+      lines.push(`which this server cannot build without a public address: set`);
+      lines.push(`OMB_PUBLIC_URL, or open the web address above and type the code.`);
+    } else if (input.inviteUrl) {
+      lines.push(`Scan that with Camera for the browser, or paste the phone-app link`);
+      lines.push(`above into the OpenMausBot app.`);
+    }
   }
   return lines.join("\n");
+}
+
+/** The scheme and host of a link, or null if it is not one we can dial. */
+function originOf(link: string): string | null {
+  try {
+    return new URL(link).origin;
+  } catch {
+    return null;
+  }
 }
 
 export function qrToString(text: string): string {
@@ -455,8 +486,17 @@ async function mintPairing(port: number, options: { label?: string; client?: boo
   const url = options.publicUrl ? `${options.publicUrl}/pair#code=${body.code}` : typeof body.url === "string" ? body.url : null;
   // A server too old to mint a credential simply has no invite: the web link
   // still works, so an upgrade is never required to pair a browser.
-  const invite = typeof body.inviteUrl === "string" && options.publicUrl && typeof body.credential === "string"
-    ? `openmausbot://pair?address=${encodeURIComponent(options.publicUrl)}&token=${encodeURIComponent(body.credential)}${typeof body.serverName === "string" ? `&name=${encodeURIComponent(body.serverName)}` : ""}`
+  // The address the phone will dial. `--public-url` wins, exactly as it does
+  // for the web link above: a server behind someone else's proxy often does
+  // not know its own public name, which is what that flag is for. Gate on the
+  // credential, never on the server's own invite — a server started without
+  // OMB_PUBLIC_URL returns a credential and no invite, and gating on the
+  // invite would throw away a secret the CLI has every part it needs to use.
+  const address = options.publicUrl ?? (typeof body.url === "string" ? originOf(body.url) : null);
+  // A server too old to mint a credential simply has no invite: the web link
+  // still works, so an upgrade is never required to pair a browser.
+  const invite = typeof body.credential === "string" && address
+    ? `openmausbot://pair?address=${encodeURIComponent(address)}&token=${encodeURIComponent(body.credential)}${typeof body.serverName === "string" ? `&name=${encodeURIComponent(body.serverName)}` : ""}`
     : typeof body.inviteUrl === "string" ? body.inviteUrl : null;
   return pairingBlock({ code: body.code, url, inviteUrl: invite, expiresAt: body.expiresAt, hint: typeof body.hint === "string" ? body.hint : null, phone: options.phone });
 }
