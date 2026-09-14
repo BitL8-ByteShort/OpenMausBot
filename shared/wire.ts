@@ -281,7 +281,14 @@ export interface WireMessage {
   /** Terminal receipt for a bounded multi-bot channel goal. */
   goalRun?: GroupGoalRunCardData;
   /** activity messages: tool name + outcome. */
-  tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean; terminal?: boolean; summary?: string; input?: string; output?: string };
+  tool?: {
+    name: string; ok?: boolean; spoken?: string; setup?: boolean; terminal?: boolean; summary?: string; input?: string; output?: string;
+    /** Provider item identity, scoped to the owning turn. */
+    itemId?: string;
+    /** Full redacted result captured by the harness, when available. */
+    outputPath?: string;
+    fullResult?: boolean;
+  };
   /** user messages sent INTO a running turn (capabilities.queueing). */
   steered?: boolean;
   /** A user-role message that arrived through the server's HTTP API. */
