@@ -133,7 +133,6 @@ import {
   customMcpServers,
 } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
-import { MAX_REMOTE_COMMAND_LENGTH } from "./remote-computer.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
 import { registerEnginesBinDir } from "./engine-install.ts";
 import { appendUsage, parseUsageRange, readUsage, summarizeUsage, usageCsv, USAGE_GROUPINGS, flushUsageLedger, type UsageGroupBy, type UsageTrigger } from "./usage-ledger.ts";
@@ -979,7 +978,9 @@ async function interruptDirectThread(botId: string, threadId: string): Promise<v
   const generation = directTurnGenerationByThread.get(threadId);
   cancelDirectTurnDispatch(botId, threadId);
   revokeInternalCapabilitiesForThread(threadId);
-  await (owner ? registry.get(owner.modelSelection.instanceId) : undefined)?.adapter.interruptTurn(threadId);
+  // Main routes Stop to the engine that started the turn; keep this branch's
+  // generation fence so a replacement turn's approvals are never closed here.
+  await (owner ? runningTurnInstance(owner, threadId) : null)?.adapter.interruptTurn(threadId);
   if (directTurnGenerationByThread.get(threadId) === generation) closeOpenApprovals(threadId);
 }
 
@@ -3270,9 +3271,9 @@ const watchdog = new TurnWatchdog({
     repeats.settle(turn.threadId);
     const bot = botForThread(turn.botId, turn.threadId);
     const routineRun = activeRoutineRunForThread(turn.threadId);
-    const instance = routineRun?.runOn === "cloud"
-      ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent")
-      : bot ? registry.get(bot.modelSelection.instanceId) : null;
+    const instance = bot
+      ? runningTurnInstance(bot, turn.threadId, routineRun?.runOn)
+      : routineRun?.runOn === "cloud" ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") : null;
     void instance?.adapter.interruptTurn(turn.threadId).catch(() => {});
     const minutes = Math.round(TURN_STALL_MS / 60_000);
     if (routineRun?.target === "bot") {
@@ -3366,7 +3367,10 @@ bus.subscribe((event: RuntimeEvent) => {
 // failures and never reaches the fold below.
 bus.subscribe((event: RuntimeEvent) => {
   if (shouldIgnoreProviderEvent(event)) return;
-  if (event.type === "turn.completed" || event.type === "session.exited") endMemoryTurn(event.threadId);
+  if (event.type === "turn.completed" || event.type === "session.exited") {
+    runningTurnEngines.delete(event.threadId);
+    endMemoryTurn(event.threadId);
+  }
 });
 
 // Bots currently working with nobody at the keyboard — a webhook turn, or a
@@ -3629,6 +3633,25 @@ function turnProvider(bot: NonNullable<ReturnType<typeof store.bot>>, runOn?: Ro
   if (inheritedTeamComputer(bot)) return "box";
   if (bot.computer !== undefined && bot.computer !== "cloud") return null;
   return bot.cloudBackend === "vps" ? "vps" : "box";
+}
+
+/** A turn on the cloud computer runs ON the cloud computer: the Box runs the
+ * bot's own harness there with the computer tools built in, so nothing on this
+ * machine relays clicks and screenshots. Every start/interrupt of a turn asks
+ * here which engine owns it. */
+function turnInstance(bot: NonNullable<ReturnType<typeof store.bot>>, runOn?: RoutineRunOn): ReturnType<typeof registry.get> {
+  const onBox = runOn === "cloud"
+    || turnProvider(bot, runOn) === "box" && (bot.computer === "cloud" || inheritedTeamComputer(bot) !== undefined);
+  return onBox
+    ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
+    : registry.get(bot.modelSelection.instanceId);
+}
+
+/** The engine that dispatched each live turn. A bot's settings may change
+ * mid-turn; an interrupt or steer must reach the engine actually running. */
+const runningTurnEngines = new Map<string, NonNullable<ReturnType<typeof registry.get>>>();
+function runningTurnInstance(bot: NonNullable<ReturnType<typeof store.bot>>, threadId: string, runOn?: RoutineRunOn): ReturnType<typeof registry.get> {
+  return runningTurnEngines.get(threadId) ?? turnInstance(bot, runOn);
 }
 
 function providerTransitionForTurn(
@@ -5121,13 +5144,11 @@ async function startTurn(
   }
   const task = store.taskByThread(bot.id, threadId);
   if (!task) throw Object.assign(new Error("no such task"), { status: 404 });
-  const instance = opts?.runOn === "cloud"
-    ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-    : registry.get(bot.modelSelection.instanceId);
+  const instance = turnInstance(bot, opts?.runOn);
   if (!instance) {
     throw Object.assign(
       new Error(
-        opts?.runOn === "cloud"
+        opts?.runOn === "cloud" || bot.computer === "cloud" || inheritedTeamComputer(bot)
           ? "the Cloud VM runner is unavailable — configure Box in App Settings"
           : `provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`,
       ),
@@ -5760,6 +5781,7 @@ async function startTurn(
         { id: "webhook", label: "Webhook provenance", text: opts?.automationSource === "webhook" ? WEBHOOK_PROMPT : "" },
         { id: "mentions", label: "Mentions", text: boundedCoordination && tagged.length ? `The user named these existing teammates: ${tagged.map(b => `${peerName(b.name)} (${b.id})`).join(", ")}. Use coordinate_bots when their contribution is needed; do not substitute native helper agents for these bots.` : mentionPrompt(tagged) },
       ]);
+      runningTurnEngines.set(threadId, instance);
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: bot.id,
@@ -6044,7 +6066,7 @@ async function interruptRoutineGroupGoal(
   const bot = speaker ? store.bot(speaker.botId) : undefined;
   cancelGroupTurnOperations(groupId, threadId, outcome);
   revokeInternalCapabilitiesForThread(threadId);
-  await (bot ? registry.get(bot.modelSelection.instanceId) : undefined)
+  await (bot ? runningTurnInstance(bot, threadId) : null)
     ?.adapter.interruptTurn(threadId)
     .catch(() => {});
   closeOpenApprovals(threadId);
@@ -6080,7 +6102,7 @@ async function stopBotForEmergencyApprovalDowngrade(botId: string): Promise<void
     cancelGroupTurnOperations(groupTurn.group.id, groupTurn.threadId);
     const results = await Promise.allSettled([
       directStop,
-      registry.get(bot.modelSelection.instanceId)?.adapter.interruptTurn(groupTurn.threadId),
+      runningTurnInstance(bot, groupTurn.threadId)?.adapter.interruptTurn(groupTurn.threadId),
     ]);
     closeOpenApprovals(groupTurn.threadId);
     const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -6162,11 +6184,9 @@ routines = new RoutineManager({
     discardDelegations(commsBus, threadId);
     cancelDirectTurnDispatch(botId, threadId);
     revokeInternalCapabilitiesForThread(threadId);
-    const instance = runOn === "cloud"
-      ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null
-      : bot
-        ? registry.get(bot.modelSelection.instanceId)
-        : null;
+    const instance = bot
+      ? runningTurnInstance(bot, threadId, runOn)
+      : runOn === "cloud" ? registry.instances().find((candidate) => candidate.driverKind === "boxAgent") ?? null : null;
     try {
       await instance?.adapter.interruptTurn(threadId);
     } finally {
@@ -6936,7 +6956,7 @@ async function runGroupMemberTurn(
   const preparedApprovalMode = approvalModeForTurn(bot, Boolean(orchestration?.roomHandoffId));
   const preparedSelection = { ...bot.modelSelection };
   const preparedComposio = bot.composio;
-  const instance = registry.get(bot.modelSelection.instanceId);
+  const instance = turnInstance(bot);
   const userName = cfg.profile?.name?.trim() || "User";
   if (providerInstancesChanging.has(bot.modelSelection.instanceId)) {
     onDispatchError?.(`${bot.name}'s provider account is being updated — try again shortly`);
@@ -7071,7 +7091,7 @@ async function runGroupMemberTurn(
     : Boolean(readyGroup && store.groupTaskByThread(readyGroup.id, threadId));
   if (!readyGroup || !stillOwnsThread || !readyGroup.memberIds.includes(readyBot.id)) return false;
   const setupChanged =
-    registry.get(preparedSelection.instanceId) !== instance ||
+    turnInstance(readyBot) !== instance ||
     approvalModeForTurn(readyBot, Boolean(orchestration?.roomHandoffId)) !== preparedApprovalMode ||
     readyBot.modelSelection.instanceId !== preparedSelection.instanceId ||
     readyBot.modelSelection.model !== preparedSelection.model ||
@@ -7410,6 +7430,7 @@ async function runGroupMemberTurn(
     watchdog.watch(threadId, bot.id);
     onProviderHandshakeStarted?.();
     providerDispatched = true;
+    runningTurnEngines.set(threadId, instance);
     guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: readyBot.id,
@@ -9350,7 +9371,7 @@ async function stopCompanyInstances(ids: string[]) {
     const owner = turnResourceOwners.get(threadId);
     if (group) cancelGroupTurnOperations(group.id, threadId);
     revokeInternalCapabilitiesForThread(threadId);
-    await registry.get(bot.modelSelection.instanceId)?.adapter.interruptTurn(threadId);
+    await runningTurnInstance(bot, threadId)?.adapter.interruptTurn(threadId);
     const stillOwned = groupSpeakers.get(threadId) === speaker &&
       turnResourceOwners.get(threadId)?.generation === owner?.generation;
     releaseTurnResources(owner);
@@ -12814,7 +12835,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             : undefined;
         return {
           threadId,
-          instance: busy ? registry.get(busy.modelSelection.instanceId) : undefined,
+          instance: busy ? runningTurnInstance(busy, threadId) : undefined,
         };
       });
       // Abort every queued operation before the first provider round trip;
@@ -13447,7 +13468,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (groupTurn) {
           cancelGroupTurnOperations(groupTurn.group.id, groupTurn.threadId);
           revokeInternalCapabilitiesForThread(groupTurn.threadId);
-          await registry.get(existingBot.modelSelection.instanceId)?.adapter.interruptTurn(groupTurn.threadId).catch(() => {});
+          await runningTurnInstance(existingBot, groupTurn.threadId)?.adapter.interruptTurn(groupTurn.threadId).catch(() => {});
           closeOpenApprovals(groupTurn.threadId);
         }
       }
@@ -13540,12 +13561,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               }
               await routines!.cancelRun(routineRun.id);
             }
-            const instance = registry.get(bot.modelSelection.instanceId);
             const groupTurn = activeGroupTurnForBot(bot.id);
             if (groupTurn) {
               cancelGroupTurnOperations(groupTurn.group.id, groupTurn.threadId);
               revokeInternalCapabilitiesForThread(groupTurn.threadId);
-              await instance?.adapter.interruptTurn(groupTurn.threadId).catch(() => {});
+              await runningTurnInstance(bot, groupTurn.threadId)?.adapter.interruptTurn(groupTurn.threadId).catch(() => {});
               closeOpenApprovals(groupTurn.threadId);
             }
           }),
@@ -14045,7 +14065,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           // loses a race with turn settlement, or the engine cannot steer, the
           // existing server-side queue records it atomically for the next turn.
           if (currentAtStart.busy) {
-            const instance = registry.get(currentAtStart.modelSelection.instanceId);
+            const instance = runningTurnInstance(currentAtStart, threadId);
             let steered = false;
             // A live text steer has no image side channel. Keep an attachment
             // message intact for the next ordinary turn, where central image
@@ -16149,9 +16169,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (m[2] === "exec") {
         const body = await readBody(req);
         boxCommand = String(body?.command ?? "");
-        if (boxCommand.length > MAX_REMOTE_COMMAND_LENGTH) {
+        if (boxCommand.length > box.MAX_REMOTE_COMMAND_LENGTH) {
           return json(res, 400, {
-            error: `command is too long (maximum ${MAX_REMOTE_COMMAND_LENGTH} characters)`,
+            error: `command is too long (maximum ${box.MAX_REMOTE_COMMAND_LENGTH} characters)`,
           });
         }
       }

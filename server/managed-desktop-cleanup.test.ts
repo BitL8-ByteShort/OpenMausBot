@@ -75,6 +75,7 @@ function fixture(kind: "direct" | "group", threadIds = ["first"]) {
     finalizeDelegationWatch() {}, routines: { failThread() {} },
     settleDirectFollowup: (generation: string) => settled.push(generation),
   });
+  context.runningTurnInstance = (bot: Bot) => context.registry.get(bot.modelSelection.instanceId);
   vm.runInContext(code, context, { filename: "index.ts (Company cleanup ownership fixture)" });
   return {
     bots, tasks, groups, owners, directBots, speakers, vmLeases, approvals, screens, watched,
