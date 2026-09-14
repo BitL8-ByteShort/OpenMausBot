@@ -357,6 +357,14 @@ export interface TaskClosedBy {
   at: number;
 }
 
+/** Phase 2 part 2: what the harness did when the engine failed. */
+export interface TaskFallback {
+  from: ModelSelection;
+  to: ModelSelection;
+  reason: string;
+  at: number;
+}
+
 export interface TaskRecord {
   threadId: ThreadId;
   title: string;
@@ -387,6 +395,9 @@ export interface TaskRecord {
    * dispatch starts a fresh engine session with a budgeted replay instead of
    * resuming. Cleared, with the resume cursors, once that turn dispatches. */
   contextReset?: boolean;
+  /** Phase 2 part 2 (decision 12): the engine switch the harness made on
+   * a provider failure, so a fallback never reads as a success. */
+  fallback?: TaskFallback;
   /** The context reading of the first turn after the last harness
    * compaction: the floor the thread cannot go under. The next compaction
    * waits for the context to regrow past it (context-budget.ts). */
@@ -419,7 +430,7 @@ export interface TaskRecord {
 
 const TASK_PATCH_FIELDS = [
   "title", "projectId", "modelSelection", "approvalMode", "autoApprove", "alwaysAllow",
-  "unread", "rewound", "contextReset", "contextFloor", "archivedAt", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
+  "unread", "rewound", "contextReset", "contextFloor", "fallback", "archivedAt", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
   "routineRunId", "surface",
 ] as const satisfies readonly (keyof TaskRecord)[];
 export type TaskPatch = Partial<Pick<TaskRecord, typeof TASK_PATCH_FIELDS[number]>>;
@@ -683,6 +694,10 @@ export interface BotRecord {
   unread: boolean;
   /** Default for new tasks; navigating tasks never changes this value. */
   modelSelection: ModelSelection;
+  /** Phase 2 part 2 (decision 12): the engine a direct turn continues on
+   * when this one fails on a provider error, silently and recorded on the
+   * task. Absent = no silent fallback; the quota card still offers a choice. */
+  fallback?: { alternate?: ModelSelection };
   /** provider-native continuation per instance (e.g. claude session id) */
   resumeCursors: Record<string, unknown>;
   /** where the bot works ("Works on"): its cloud box, the Local VM, this

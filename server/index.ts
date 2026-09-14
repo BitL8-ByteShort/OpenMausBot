@@ -2,7 +2,7 @@
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, rmSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, unlinkSync, mkdirSync, writeFileSync, readdirSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join } from "node:path";
 
@@ -253,11 +253,10 @@ import {
   type GroupDefaultResponder,
   type GroupRecord,
   type Message,
-  type TaskRecord,
-} from "./store.ts";
+  type TaskRecord, type TaskFallback } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
-import { buildRecoveryText, buildTurnContext, engineIsFresh, formatToolActivityLine } from "./turn-context.ts";
+import { buildRecoveryText, buildTurnContext, engineIsFresh } from "./turn-context.ts";
 import { extractTurnImages } from "./turn-images.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import { TurnResources, workspaceResource, type TurnOwner } from "./turn-resources.ts";
@@ -3529,6 +3528,8 @@ const liveTurnByThread = new Map<string, string>();
 const filteredCommandsByThread = new Map<string, number>();
 
 const TOOL_RESULTS_DIR = join(DATA_DIR, "tool-results");
+/** One slice of a saved tool result, as tool_result_read returns it (Phase 2 part 2). */
+const TOOL_RESULT_READ_CHARS = 16_000;
 const TOOL_RESULT_SPILL_MAX = 512 * 1024;
 
 // ── Compaction (Phase 0 item 0.7 record; Phase 1 automatic) ─────────────
@@ -4674,7 +4675,12 @@ bus.subscribe((event: RuntimeEvent) => {
         // "the last user message" once the card is answered could catch a
         // message sent afterward instead of the one that actually failed.
         const failedUserMessage = [...store.activePath(event.threadId)].reverse().find((m) => m.role === "user");
-        void maybeRaiseQuotaCard(quotaSwitchBus, bot, event.threadId, event.message, failedUserMessage?.id);
+        // Phase 2 part 2 (decision 12): the silent rung first — continue on
+        // the alternate the person named, recorded on the task — and only
+        // when it does not apply, the card that asks them.
+        if (!fallBackToAlternate(bot, event.threadId, event.message, liveTurnId, failedUserMessage)) {
+          void maybeRaiseQuotaCard(quotaSwitchBus, bot, event.threadId, event.message, failedUserMessage?.id);
+        }
       }
       break;
     case "thread.token-usage.updated":
@@ -4824,6 +4830,7 @@ bus.subscribe((event: RuntimeEvent) => {
         });
         noteSpend(DATA_DIR, event.cost ?? null);
         bookBoardSpend(event.threadId, event.cost ?? null);
+        runFallbackRedispatch(event.threadId);
         if (completedTurnId) {
           scheduleTurnDigest({
             botId: bot.id,
@@ -4904,6 +4911,7 @@ bus.subscribe((event: RuntimeEvent) => {
         });
         noteSpend(DATA_DIR, event.cost ?? null);
         bookBoardSpend(event.threadId, event.cost ?? null);
+        runFallbackRedispatch(event.threadId);
       }
       if (speaker && group?.busyBotId === speaker.botId) {
         releaseTurnResources(turnResourceOwners.get(event.threadId));
@@ -7768,6 +7776,50 @@ const approvalBus: ApprovalBus = { store, broadcast, notify, autoApply: fullAcce
 // gets the exact same admission and lifecycle bookkeeping any other message
 // does; a failure to relaunch becomes a visible chip rather than a silently
 // dropped turn (mirrors drainQueuedSends' own fallback below).
+/** Decision 12's silent rung. Returns true when the harness switched the
+ * task to the bot's named alternate and re-dispatched the failed message.
+ * Declines — and the card or the error chip takes over — when: the error
+ * is not a terminal provider failure, no alternate is named or it is the
+ * engine that failed, the task already fell back once, the failed turn
+ * had a side effect (a real tool call on this turn), or there is no user
+ * message to resend. */
+function fallBackToAlternate(bot: BotRecord, threadId: string, message: string, turnId: string | undefined, failedUserMessage: Message | undefined): boolean {
+  const alternate = bot.fallback?.alternate;
+  if (!alternate) return false;
+  const verdict = classifyError({ text: message });
+  if (verdict.transient || verdict.reason === "interrupted" || verdict.reason === "provider_safety" || verdict.reason === "invalid_request") return false;
+  const task = store.taskByThread(bot.id, threadId);
+  if (!task || task.fallback) return false;
+  const current = task.modelSelection ?? bot.modelSelection;
+  if (current.instanceId === alternate.instanceId && current.model === alternate.model) return false;
+  if (!registry.get(alternate.instanceId)) return false;
+  if (!failedUserMessage?.text) return false;
+  const sideEffects = store.messagesFor(threadId).some((m) => m.kind === "activity" && m.tool?.itemId && (!turnId || m.turnId === turnId));
+  if (sideEffects) return false;
+  const record: TaskFallback = { from: current, to: alternate, reason: verdict.reason, at: Date.now() };
+  store.patchTask(bot.id, threadId, { modelSelection: alternate, fallback: record });
+  const label = registry.get(alternate.instanceId)?.displayName ?? alternate.instanceId;
+  store.appendMessage(threadId, {
+    role: "bot",
+    kind: "activity",
+    tool: { name: `continuing on ${label} (${alternate.model}) after ${verdict.reason.replace(/_/g, " ")} on ${current.instanceId}`, ok: true },
+  });
+  console.error(`[omb-fallback] bot=${bot.id} thread=${threadId} ${current.instanceId}/${current.model} → ${alternate.instanceId}/${alternate.model} after ${verdict.reason}`);
+  // runtime.error arrives while the failed turn is still winding down;
+  // the re-dispatch waits for its turn.completed (see the fold below)
+  fallbackRedispatch.set(threadId, { botId: bot.id, text: failedUserMessage.text });
+  return true;
+}
+/** threadId → the message to resend on the alternate once the failed turn has settled. */
+const fallbackRedispatch = new Map<string, { botId: string; text: string }>();
+function runFallbackRedispatch(threadId: string): void {
+  const pending = fallbackRedispatch.get(threadId);
+  if (!pending) return;
+  fallbackRedispatch.delete(threadId);
+  const t = setTimeout(() => quotaSwitchBus.dispatch(pending.botId, threadId, pending.text), 50);
+  t.unref?.();
+}
+
 const quotaSwitchBus: QuotaSwitchDeps = {
   store,
   instances: () => registry.instances(),
@@ -10999,6 +11051,38 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (method === "POST" && path === "/api/internal/hook") {
         const body = await readInternalBody();
         return json(res, 200, ingestEngineHook(internalCapability, body));
+      }
+      // Phase 2 part 2: a long tool result is kept here by the agents proxy
+      // (head to the model, whole text on disk under the thread's
+      // tool-results folder, 0600, redacted) and read back in slices.
+      if (method === "POST" && path === "/api/internal/tool-result") {
+        const body = await readInternalBody();
+        const text = typeof body.text === "string" ? body.text : "";
+        if (!text) return json(res, 400, { error: "text is required" });
+        const tool = typeof body.tool === "string" ? body.tool.replace(/[^\w.-]/g, "_").slice(0, 60) : "tool";
+        const dir = join(TOOL_RESULTS_DIR, internalCapability.threadId.replace(/[^\w.-]/g, "_"));
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const id = `r-${randomUUID().slice(0, 8)}`;
+        const redacted = redactSecretsInText(text);
+        const bounded = redacted.length > TOOL_RESULT_SPILL_MAX ? `${redacted.slice(0, TOOL_RESULT_SPILL_MAX)}\n[… ${redacted.length - TOOL_RESULT_SPILL_MAX} more characters omitted]` : redacted;
+        writeFileSync(join(dir, `${id}-${tool}.txt`), bounded, { mode: 0o600 });
+        return json(res, 201, { id, length: bounded.length });
+      }
+      if (method === "GET" && path === "/api/internal/tool-result") {
+        const id = String(url.searchParams.get("id") ?? "").trim();
+        if (!/^r-[0-9a-f]{8}$/.test(id)) return json(res, 400, { error: "id must be a saved result id like r-3f2a9c1d" });
+        const dir = join(TOOL_RESULTS_DIR, internalCapability.threadId.replace(/[^\w.-]/g, "_"));
+        let file: string | undefined;
+        try {
+          file = readdirSync(dir).find((name: string) => name.startsWith(`${id}-`));
+        } catch {
+          file = undefined;
+        }
+        if (!file) return json(res, 404, { error: "no saved result with that id in this conversation" });
+        const whole = readFileSync(join(dir, file), "utf8");
+        const rawOffset = Number(url.searchParams.get("offset"));
+        const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.min(Math.trunc(rawOffset), whole.length) : 0;
+        return json(res, 200, { id, length: whole.length, offset, text: whole.slice(offset, offset + TOOL_RESULT_READ_CHARS) });
       }
       if (method === "POST" && path === "/api/internal/memory") {
         const body = await readInternalBody();
@@ -14428,6 +14512,23 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const checked = validateBotCwd(body.cwd);
         if (!checked.ok) return json(res, 400, { error: checked.error });
         patch.cwd = checked.cwd ?? undefined;
+      }
+      // Phase 2 part 2 (decision 12): the engine a failed direct turn
+      // continues on. null clears it; the alternate is checked like any
+      // model selection but need not be available right now.
+      if (body.fallback !== undefined) {
+        if (body.fallback === null) {
+          patch.fallback = undefined;
+        } else if (!body.fallback || typeof body.fallback !== "object" || Array.isArray(body.fallback)) {
+          return json(res, 400, { error: "fallback must be { alternate: modelSelection } or null" });
+        } else if (body.fallback.alternate === null || body.fallback.alternate === undefined) {
+          patch.fallback = undefined;
+        } else {
+          const checked = checkedModelSelection(body.fallback.alternate);
+          if (!checked.ok) return json(res, checked.status, { error: `fallback.alternate: ${checked.error}` });
+          if (!registry.get(checked.selection.instanceId)) return json(res, 400, { error: `fallback.alternate names an engine this workspace does not have: ${checked.selection.instanceId}` });
+          patch.fallback = { alternate: checked.selection };
+        }
       }
       if (body.hidden === true && existingBot?.chiefOfStaff && body.chiefOfStaff !== false) {
         return json(res, 400, { error: "choose another Chief of Staff before hiding this bot" });
