@@ -112,9 +112,17 @@ working folder is a git checkout with a long history, one with
 flags in this folder, then tell me the subject line of the newest commit.*
 Compare "in" between the two; the script prints both.
 
+**T10 — a standing rule across a compaction (Phase 1 part 4).** New bot. Send
+T5's growing-file message twelve times, but start the first one with *For
+this whole conversation, begin every reply with the word LANTERN. Then:*.
+Correct when every reply starts with LANTERN and gives 100 × n. On the branch
+the turn after the "context compacted" chip carries a restated first request
+(no chip; it is in the turn text), so the rule survives the compaction.
+`context.recite: false` turns it off, for comparison.
+
 ## Doing it unattended
 
-The script runs the tasks above (T6 unless `--skip-recall`; T7–T9 unless `--skip-prefix`, with `--repo DIR` for T9) and prints the same table:
+The script runs the tasks above (T6 unless `--skip-recall`; T7–T9 unless `--skip-prefix`, with `--repo DIR` for T9; T10 with `--only-goal`) and prints the same table:
 
 ```sh
 # 1. start the build's harness standalone on its own port and data folder
