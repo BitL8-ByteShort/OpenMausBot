@@ -122,13 +122,13 @@ posixOnly("harness recall on every fake engine", () => {
         ? (second.messages as Msg[]).filter((m) => m.role === "bot" && m.kind === "text").at(-1)!.text!
         : null;
     if (prompt) {
-      expect(prompt).toContain("[Recalled by the harness");
+      expect(prompt).toContain("[Your own notes and earlier conversations");
       expect(prompt).toContain("[1] MEMORY.md");
       expect(prompt).toContain("moonbase");
       expect(prompt).toContain("[2] chat");
       expect(prompt).toContain("blue-falcon-42");
-      expect(prompt).toContain("[end of recalled material]");
-      expect(prompt.indexOf("[end of recalled material]")).toBeLessThan(prompt.indexOf("What is the deploy password hint"));
+      expect(prompt).toContain("[end of recalled material — the user's message follows]");
+      expect(prompt.indexOf("[end of recalled material")).toBeLessThan(prompt.indexOf("What is the deploy password hint"));
     }
     // the stored user message is the person's text alone: the block never replays
     const userRows = (second.messages as Msg[]).filter((m) => m.role === "user" && m.kind === "text");
@@ -178,6 +178,6 @@ posixOnly("harness recall stays out of the way when switched off", () => {
     expect(chips(second.messages as Msg[])).toHaveLength(0);
     expect(h.ledger(opened.threadId).at(-1)?.recall).toBeUndefined();
     const reply = (second.messages as Msg[]).filter((m) => m.role === "bot" && m.kind === "text").at(-1)!.text!;
-    expect(reply).not.toContain("[Recalled by the harness");
+    expect(reply).not.toContain("[Your own notes and earlier conversations");
   }, 60_000);
 });
