@@ -381,5 +381,8 @@ describe("any-term recall (Phase 1 part 2)", () => {
     // the first sixteen terms are searched; the thirtieth is not
     expect(hits.map((hit) => hit.messageId)).toEqual(["m2"]);
     expect(recallMessages("ab of at", ["own-a"], 12, { mode: "any" })).toEqual([]);
+    // how-to-answer words are not terms either
+    insertMessage("own-a", msg("m3", "please reply in one short line"));
+    expect(recallMessages("Reply in one short line, number only", ["own-a"], 12, { mode: "any" })).toEqual([]);
   });
 });

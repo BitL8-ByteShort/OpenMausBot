@@ -4,7 +4,7 @@
 // it as the recall block. No model call; every source is a lookup the
 // harness already owns. A source that fails is empty, never an error.
 import { digestPromptLine } from "./digest.ts";
-import { recallMessages } from "./message-db.ts";
+import { recallMessages, recallTerms } from "./message-db.ts";
 import { renderRecallBlock, type RecallBlock, type RecallPassage, type RecentItem } from "./recall-block.ts";
 import type { Store } from "./store.ts";
 import type { SupamausClient } from "./supamaus.ts";
@@ -36,12 +36,13 @@ const plain = (snippet: string) => snippet.replace(/\[([^[\]]+)\]/g, "$1");
 /** How many distinct query terms a snippet matched (the bracketed ones). */
 const matchedTerms = (snippet: string) => new Set([...snippet.matchAll(/\[([^[\]]+)\]/g)].map((m) => m[1]!.toLowerCase())).size;
 
-/** A question of several words that shares only one with a note is a
- * coincidence ("reply", "file"), not recall: from three query terms on, a
- * hit must match at least two. Mirrors the capture rule in supamaus.ts. */
+/** A long question that shares only one word with a note is usually a
+ * coincidence, a short one usually is not: from MIN_TERMS_FOR_TWO content
+ * terms on (filler already dropped by recallTerms), a hit must match two.
+ * Mirrors the capture rule in supamaus.ts. */
+export const MIN_TERMS_FOR_TWO = 5;
 function enoughMatches(query: string, snippet: string): boolean {
-  const terms = query.split(/\s+/).filter((t) => t.replace(/[^\p{L}\p{N}]/gu, "").length >= 3).length;
-  return terms < 3 || matchedTerms(snippet) >= 2;
+  return recallTerms(query).length < MIN_TERMS_FOR_TWO || matchedTerms(snippet) >= 2;
 }
 
 const MEMORY_HITS = 4;

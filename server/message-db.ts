@@ -585,6 +585,32 @@ export interface RecallQueryOptions {
  * of three letters or more, in message order. */
 const ANY_QUERY_TERMS = 16;
 
+/** Words that say how to answer, not what about: they are in nearly every
+ * message a person sends a bot and in nearly every note, so a match on one
+ * of them is a coincidence. Dropped from any-mode queries (and from capture
+ * matching in supamaus.ts) before the recall rules count terms. */
+export const RECALL_INSTRUCTION_WORDS: ReadonlySet<string> = new Set((
+  "reply replies answer answers respond response line lines short brief briefly sentence sentences word words " +
+  "tool tools running run without exactly please just only one two three number numbers format plain text " +
+  "tell say give list show write explain describe summarise summarize note notes remember later again now " +
+  "thanks thank hello hi okay yes sure"
+).split(" "));
+
+/** Content terms of an any-mode query, in order, after the filler. */
+export function recallTerms(query: string): string[] {
+  const seen = new Set<string>();
+  const terms: string[] = [];
+  for (const token of query.split(/\s+/)) {
+    const word = token.replace(/"/g, "").replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+    const key = word.toLowerCase();
+    if (word.length < 3 || STOP_WORDS.has(key) || RECALL_INSTRUCTION_WORDS.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    terms.push(word);
+    if (terms.length >= ANY_QUERY_TERMS) break;
+  }
+  return terms;
+}
+
 function ftsQuery(query: string, mode: "all" | "any" = "all"): string | null {
   const tokens = query
     .split(/\s+/)
@@ -593,16 +619,7 @@ function ftsQuery(query: string, mode: "all" | "any" = "all"): string | null {
   if (!tokens.length) return null;
   const content = tokens.filter((token) => !STOP_WORDS.has(token.toLowerCase()));
   if (mode === "any") {
-    const seen = new Set<string>();
-    const terms: string[] = [];
-    for (const token of content) {
-      const word = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
-      const key = word.toLowerCase();
-      if (word.length < 3 || seen.has(key)) continue;
-      seen.add(key);
-      terms.push(word);
-      if (terms.length >= ANY_QUERY_TERMS) break;
-    }
+    const terms = recallTerms(query);
     return terms.length ? terms.map((term) => `"${term}"`).join(" OR ") : null;
   }
   return (content.length ? content : tokens).map((token) => `"${token}"`).join(" ");

@@ -61,8 +61,9 @@ describe("supamausClient", () => {
     expect(await client.search("deploy password")).toMatchObject([{ id: "B" }]);
     // short query words are not terms
     expect(await client.search("a of")).toEqual([]);
-    // one shared common word out of a long question is not a match
-    expect(await client.search("Create a file and reply in one short sentence about the dashboard")).toEqual([]);
+    // filler words are not terms, and one shared word out of a long question is not a match
+    expect(await client.search("Reply in one short line, please, with the number only")).toEqual([]);
+    expect(await client.search("Create a text file called notes.txt in the working folder with three lines and print it, then report its dashboard")).toEqual([]);
   });
 
   it("serves a second read from the cache and lists recent captures newest first", async () => {
