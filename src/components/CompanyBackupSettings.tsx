@@ -161,7 +161,7 @@ export function ConnectedCompanyBackupSettings({ connection, bridge }: { connect
     }
   };
   const prepare = () => {
-    if (dialog?.kind !== "restore" || (dialog.entry.passwordRequired !== false && (!password || password.length > 1024))) return;
+    if (dialog?.kind !== "restore" || (dialog.entry.passwordRequired !== false && (password.length < 12 || password.length > 1024))) return;
     void perform("prepare", async (isCurrent) => {
       const secret = password;
       setPassword(""); setPreview(null); setConfirmation("");
@@ -254,8 +254,8 @@ export function ConnectedCompanyBackupSettings({ connection, bridge }: { connect
         </form>}
         {dialog.kind === "restore" && (!preview ? <form className="flex flex-col gap-3" onSubmit={(event) => { event.preventDefault(); prepare(); }}>
           <p className="text-[13px] text-ink-secondary">{t("companyBackup.previewHelp")}</p>
-          {dialog.entry.passwordRequired !== false && <label className="text-[13px]">{t("backup.importPassword")}<input type="password" autoComplete="off" required maxLength={1024} disabled={disabled} value={password} onChange={(event) => setPassword(event.target.value)} className={inputClass} /></label>}
-          <button type="submit" className="ui-button" disabled={disabled || (dialog.entry.passwordRequired !== false && !password)}>{t("backup.validate")}</button>
+          {dialog.entry.passwordRequired !== false && <label className="text-[13px]">{t("backup.importPassword")}<input type="password" autoComplete="off" required minLength={12} maxLength={1024} disabled={disabled} value={password} onChange={(event) => setPassword(event.target.value)} className={inputClass} /></label>}
+          <button type="submit" className="ui-button" disabled={disabled || (dialog.entry.passwordRequired !== false && (password.length < 12 || password.length > 1024))}>{t("backup.validate")}</button>
         </form> : <>
           <WorkspaceBackupSummaryView summary={preview.summary} />
           <p className="text-[13px] text-danger">{t("backup.replaceWarning")}</p><p className="text-[13px] text-danger">{t("backup.trustWarning")}</p>

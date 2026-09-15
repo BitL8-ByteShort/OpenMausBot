@@ -291,6 +291,14 @@ describe("optional Company cloud backup settings", () => {
     expect(bridge.restore).not.toHaveBeenCalled();
   });
 
+  it("rejects a short legacy password before calling the native preview", async () => {
+    await ready(); button("Restore this backup").props.onClick!();
+    change(passwords()[0], "short");
+    expect(button("Validate backup").props.disabled).toBe(true);
+    submit(form()); await flush();
+    expect(bridge.prepareRestore).not.toHaveBeenCalled();
+  });
+
   it("requires an explicit backup dialog without passwords, then exports only allowlisted local preferences", async () => {
     await ready();
     storage.set("omb-drafts", "private fixture draft"); storage.set("omb-skin", "fixture-theme");
