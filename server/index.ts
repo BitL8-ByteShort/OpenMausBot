@@ -12,6 +12,7 @@ import { SharedComputerControl } from "./shared-computer-control.ts";
 import { RoomHandoffs, type RoomHandoff } from "./room-handoffs.ts";
 import { botAvatarUrlFromStoredPath } from "../shared/bot-avatar.ts";
 import { BOT_PROFILE_LIMITS } from "../shared/bot-profile.ts";
+import { CLOUD_COMPUTER_BUSY_ERROR } from "../shared/computer-contention.ts";
 import {
   approvalModeFor,
   supportsApprovalMode,
@@ -14482,7 +14483,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (!body || typeof body !== "object" || Array.isArray(body)) return json(res, 400, { error: "body must be a JSON object" });
       const current = store.projectBotForTask(m[1], m[2]);
       if (!current) return json(res, 404, { error: "no such task" });
-      const allowed = new Set(["title", "projectId", "modelSelection", "updateBotDefault", "resetApprovalToAsk", "approvalMode", "autoApprove", "requireAvailableModel", "pinnedMessageId", "acknowledgeLocalAuto"]);
+      const allowed = new Set(["title", "projectId", "modelSelection", "updateBotDefault", "resetApprovalToAsk", "approvalMode", "autoApprove", "requireAvailableModel", "pinnedMessageId", "acknowledgeLocalAuto", "archivedAt"]);
       if (Object.keys(body).some((key) => !allowed.has(key))) return json(res, 400, { error: "unsupported thread setting" });
       for (const key of ["requireAvailableModel", "acknowledgeLocalAuto", "updateBotDefault", "resetApprovalToAsk"] as const) {
         if (body[key] !== undefined && typeof body[key] !== "boolean") return json(res, 400, { error: `${key} must be a boolean` });
@@ -14502,6 +14503,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (body.title !== undefined) {
         if (typeof body.title !== "string") return json(res, 400, { error: "title must be a string" });
         patch.title = body.title;
+      }
+      if (body.archivedAt !== undefined) {
+        if (body.archivedAt === null) patch.archivedAt = undefined;
+        else if (typeof body.archivedAt === "number" && Number.isFinite(body.archivedAt) && body.archivedAt >= 0) patch.archivedAt = body.archivedAt;
+        else return json(res, 400, { error: "archivedAt must be a timestamp, or null to unarchive" });
       }
       if (body.pinnedMessageId !== undefined) {
         if (body.pinnedMessageId === null || body.pinnedMessageId === "") patch.pinnedMessageId = undefined;
@@ -16162,7 +16168,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       const activeBoxTurn = botHasActiveTurn(botId);
       if (["provision", "sleep"].includes(m[2]) && activeBoxTurn) {
         return json(res, 409, {
-          error: "this bot's cloud computer is being used by an active turn — interrupt it first",
+          error: CLOUD_COMPUTER_BUSY_ERROR,
         });
       }
       // Input validity is independent of destination authorization. Preserve
