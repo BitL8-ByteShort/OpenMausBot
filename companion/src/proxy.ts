@@ -21,7 +21,7 @@ import {
   MAX_COMPANION_ENDPOINTS,
   type CompanionEndpoint,
 } from "./endpoints.ts";
-import { denyReason, isCloudDesktopAccess, isMessageFileDownload } from "./routes.ts";
+import { denyReason, isCloudDesktopAccess, isMessageFileDownload, isVoiceConfigWrite, voiceConfigDenial } from "./routes.ts";
 import { CompanionViewerRelay } from "./viewer-relay.ts";
 import { createSseScrubber, isJson, scrub } from "./wire.ts";
 
@@ -342,6 +342,14 @@ export function createProxyHandler(options: ProxyOptions) {
     const mutationToken = device ? options.mutationToken?.() : undefined;
     if (device && options.mutationToken && !mutationToken) {
       return sendJson(res, 503, { error: "The desktop connection is starting. Please try again shortly." });
+    // The one route whose body the sidecar reads before forwarding: a voice
+    // config write. Everything else streams straight through. `payload` is
+    // that re-serialised body; absent, the request is piped as it arrived.
+    const forward = (payload?: Buffer): void => {
+    const headers = forwardHeaders(req, device?.id, mutationToken ?? undefined);
+    if (payload) {
+      headers["content-type"] = "application/json";
+      headers["content-length"] = String(payload.length);
     }
     const upstream = httpRequest(
       {
@@ -349,7 +357,7 @@ export function createProxyHandler(options: ProxyOptions) {
         port: options.harnessPort,
         path: req.url,
         method,
-        headers: forwardHeaders(req, device?.id, mutationToken ?? undefined),
+        headers,
       },
       (harness) => {
         clearTimeout(headersDeadline);
@@ -631,7 +639,22 @@ export function createProxyHandler(options: ProxyOptions) {
           : { error: "OpenMausBot is not running on this computer" },
       );
     });
-    req.pipe(upstream);
+    if (payload) upstream.end(payload);
+    else req.pipe(upstream);
+    };
+
+    if (isVoiceConfigWrite(method, path)) {
+      readJson(req).then(
+        (body) => {
+          const denial = voiceConfigDenial(body);
+          if (denial) return sendJson(res, 403, { error: denial });
+          forward(Buffer.from(JSON.stringify(body)));
+        },
+        (error: Error) => sendJson(res, 400, { error: error.message }),
+      );
+      return;
+    }
+    forward();
   };
 
   handle.upgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
