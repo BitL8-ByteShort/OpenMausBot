@@ -46,6 +46,24 @@ is 6% of tokens and it grows with length.
 
 Under budget, nothing changed.
 
+## After rebasing onto main's context reading (same day, later)
+
+Main gained `usage.context.tokens` (what filled the window on the last model call) while this
+was being built; the budget now reads that instead of its own field. Re-measured on the
+reconciled branch (`docs/plans/2026-09-15-phase-1.md`, F9):
+
+| Setting | Compactions | Input at turn 10 | Total over ten turns | Correct |
+| --- | --- | --- | --- | --- |
+| main (no compaction) | — | 145,846 | 1,116,143 | 10 / 10 |
+| Phase 1, default budget (60% of 200k) | turn 9 | 105,881 (−27%) | 1,037,864 (−7%) | 10 / 10 |
+| Phase 1, budget 30% (60k), before the floor guard | every turn from 4 to 10 | 94,325 | 927,537 (−17%), but 17–30 s per turn | 10 / 10 |
+| Phase 1, budget 30% (60k), with the floor guard | turns 4 and 9 | 105,187 | 997,704 (−11%) | 10 / 10 |
+
+The third row is why the floor guard exists: a budget below what the system prompt plus the
+kept exchanges cost (about 90k here) would otherwise compact on every turn, paying the model
+summary and a cache write each time. With the guard the next compaction waits until the
+context has regrown a quarter past the first post-compaction reading.
+
 ## Two bugs this run found, both fixed on the branch before the PR
 
 1. **The fresh session was not fresh (Claude).** The first branch run compacted at turns 9 and
