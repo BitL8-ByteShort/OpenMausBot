@@ -1315,6 +1315,39 @@ struct MessageRow: View {
         AttachedMessageContent.parse(message.text ?? "")
     }
 
+    /// The controls behind the bubble's "…" handle — the same set the
+    /// long-press menu offers minus reactions, which want the bigger targets.
+    /// Empty for a bubble with nothing to copy or retry, and then no handle
+    /// is drawn: a handle that opens nothing is a broken button.
+    private var trayActions: [MessageAction] {
+        var actions: [MessageAction] = []
+        let visibleText = attachedContent.text
+        if !visibleText.isEmpty {
+            actions.append(MessageAction(id: "copy", label: "Copy", symbol: "doc.on.doc") {
+                PlatformBridge.copyToPasteboard(visibleText)
+            })
+            actions.append(MessageAction(id: "select", label: "Select Text", symbol: "selection.pin.in.out") {
+                selecting = SelectableText(text: visibleText)
+            })
+        }
+        // Same gate as the menu: an attachment edit cannot reconstruct the upload.
+        if message.role == .user,
+           message.kind == .text,
+           attachedContent.attachments.isEmpty,
+           case let .bot(bot) = chat {
+            actions.append(MessageAction(id: "edit", label: "Edit and retry", symbol: "pencil", disabled: bot.busy == true) {
+                editingText = message.text ?? ""
+                showingEdit = true
+            })
+        }
+        return actions
+    }
+
+    private var tray: MessageActionTray? {
+        let actions = trayActions
+        return actions.isEmpty ? nil : MessageActionTray(mirrored: message.role == .user, actions: actions)
+    }
+
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 6) {
             content
@@ -1415,7 +1448,7 @@ struct MessageRow: View {
     private var content: some View {
         switch message.kind {
         case .text:
-            TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink)
+            TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink, actions: tray)
         case .options:
             // A structured ask draws its own card: its answers are the
             // model's questions, not an allow/deny a tap could stand for.
@@ -1428,7 +1461,7 @@ struct MessageRow: View {
             if let secret = message.secret {
                 CredentialRequestCardView(chat: chat, message: message, secret: secret)
             } else if let text = message.text, !text.isEmpty {
-                TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink)
+                TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink, actions: tray)
             }
         case .activity:
             ActivityChip(tool: message.tool, threadRef: message.threadRef, openThread: openThread)
@@ -1441,7 +1474,7 @@ struct MessageRow: View {
             // When there is nothing to show, show nothing — a placeholder
             // saying "unsupported" is a worse gap than the gap.
             if let text = message.text, !text.isEmpty {
-                TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink)
+                TextBubble(message: message, chat: chat, tailed: endsRun, openLink: openLink, actions: tray)
             }
         }
     }
@@ -1450,6 +1483,82 @@ struct MessageRow: View {
         Dictionary(grouping: reactions, by: \.emoji)
             .map { (emoji: $0.key, count: $0.value.count, mine: $0.value.contains { $0.by == "user" }) }
             .sorted { $0.emoji < $1.emoji }
+    }
+}
+
+/// One control in a bubble's tray.
+struct MessageAction: Identifiable {
+    let id: String
+    let label: String
+    let symbol: String
+    var disabled = false
+    let run: () -> Void
+
+    init(id: String, label: String, symbol: String, disabled: Bool = false, run: @escaping () -> Void) {
+        self.id = id
+        self.label = label
+        self.symbol = symbol
+        self.disabled = disabled
+        self.run = run
+    }
+}
+
+/// One "…" handle beside a bubble. Tapping it slides the controls out
+/// sideways, away from the bubble — the phone's version of the desktop tray,
+/// where hover does the opening. `mirrored` puts the handle nearest the
+/// bubble on your own side, so the first control stays next to it on both.
+/// Long-press still opens the full menu; this is the discoverable route.
+struct MessageActionTray: View {
+    let mirrored: Bool
+    let actions: [MessageAction]
+    @State private var open = false
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 2) {
+            if mirrored { controls; handle } else { handle; controls }
+        }
+        .padding(.horizontal, 2)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var handle: some View {
+        Button {
+            Haptics.selection()
+            withAnimation(.easeOut(duration: 0.2)) { open.toggle() }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Color.secondary.opacity(open ? 1 : 0.5))
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(open ? Color.secondary.opacity(0.18) : .clear))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Message actions")
+        .accessibilityAddTraits(open ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private var controls: some View {
+        if open {
+            HStack(spacing: 0) {
+                ForEach(actions) { action in
+                    Button {
+                        Haptics.selection()
+                        action.run()
+                    } label: {
+                        Image(systemName: action.symbol)
+                            .font(.system(size: 14))
+                            .foregroundStyle(Color.secondary)
+                            .frame(width: 28, height: 28)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(action.disabled)
+                    .opacity(action.disabled ? 0.4 : 1)
+                    .accessibilityLabel(action.label)
+                }
+            }
+            .transition(.move(edge: mirrored ? .trailing : .leading).combined(with: .opacity))
+        }
     }
 }
 
@@ -1479,6 +1588,8 @@ struct TextBubble: View {
     let chat: Chat
     var tailed = true
     let openLink: (URL, Message) -> OpenURLAction.Result
+    /// The "…" handle and its tray, drawn in the gutter beside the bubble.
+    var actions: MessageActionTray? = nil
 
     private var attachedContent: AttachedMessageContent {
         AttachedMessageContent.parse(message.text ?? "")
@@ -1563,8 +1674,11 @@ struct TextBubble: View {
         let speaker = message.from
         // No face beside the bubble: the bot's face is in the header, and in
         // a room the name line says who spoke. The bubble sits at the edge.
+        let tailInset: CGFloat = !customCard && tailed ? SpeechBubble.tailDrop() : 0
         HStack(alignment: .bottom, spacing: 0) {
             if mine { Spacer(minLength: 56) }
+            // The tray sits on the bubble's chin, clear of the tail below it.
+            if mine, let actions { actions.padding(.bottom, tailInset) }
 
             VStack(alignment: .leading, spacing: 4) {
                 if let speaker, !mine {
@@ -1615,8 +1729,9 @@ struct TextBubble: View {
                 }
             )
             // leave room for the tail below, so the next row does not sit on it
-            .padding(.bottom, !customCard && tailed ? SpeechBubble.tailDrop() : 0)
+            .padding(.bottom, tailInset)
 
+            if !mine, let actions { actions.padding(.bottom, tailInset) }
             if !mine { Spacer(minLength: 44) }
         }
     }
