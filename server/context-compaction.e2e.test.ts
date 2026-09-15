@@ -124,13 +124,11 @@ posixOnly("harness-owned compaction (every fake engine, window forced to 100k)",
     // measured: the usage row of turn 3 says it followed a compaction
     const metrics = (await h.api("GET", "/api/metrics?from=2026-01-01&to=2026-12-31")).body;
     expect(metrics.bots.find((b: any) => b.botId === bot.id)?.compactions).toBe(1);
-    // the fake keeps reporting 200k (a real engine would report a smaller
-    // context after the fresh start), so the next turn folds one more
-    // exchange behind a second record that keeps the last two again
+    // the fake keeps reporting 200k after the fresh start (a real engine
+    // would report less), so the thread sits over budget forever; the
+    // regrowth floor keeps the harness from compacting on every turn
     const again = await h.turn(bot.id, "fifth: and now?");
-    const twice = (again.messages as Msg[]).filter((m) => m.kind === "compaction");
-    expect(twice).toHaveLength(2);
-    expect((again.messages as Msg[]).find((m) => m.id === twice[1]!.compaction!.firstKeptId)?.text).toBe("third: remember the codeword FIG");
+    expect((again.messages as Msg[]).filter((m) => m.kind === "compaction")).toHaveLength(1);
   }, 90_000);
 });
 

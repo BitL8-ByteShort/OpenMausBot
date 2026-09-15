@@ -3553,7 +3553,7 @@ function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: Mo
   // several calls and its sum overstates the window by that factor
   const contextTokens = task.usage?.context?.tokens;
   const lastTurnInput = task.usage?.lastTurn?.input;
-  if (!shouldCompact({ contextTokens, lastTurnInput, estimatedTokens: estimated, budget })) return null;
+  if (!shouldCompact({ contextTokens, lastTurnInput, estimatedTokens: estimated, budget, floor: task.contextFloor })) return null;
   // the message that starts THIS turn is already in the transcript; it is
   // not an exchange to keep, so fold the history before it
   const history = since.at(-1)?.role === "user" ? since.slice(0, -1) : since;
@@ -4668,10 +4668,17 @@ bus.subscribe((event: RuntimeEvent) => {
         const settledDriverKind = registry.get(selection.instanceId)?.driverKind;
         const filteredCommands = filteredCommandsByThread.get(event.threadId) ?? 0;
         filteredCommandsByThread.delete(event.threadId);
+        const compacted = compactedThreads.delete(event.threadId);
+        // the first reading after a compaction is the thread's floor: the
+        // next compaction waits for the context to regrow past it
+        if (compacted) {
+          const floor = lastContext?.tokens || tokens?.input;
+          if (floor) store.patchTask(bot.id, event.threadId, { contextFloor: floor });
+        }
         appendUsage(DATA_DIR, {
           ...(completedTurnId ? { turnId: completedTurnId } : {}),
           ...(filteredCommands ? { filteredCommands } : {}),
-          ...(compactedThreads.delete(event.threadId) ? { compacted: true } : {}),
+          ...(compacted ? { compacted: true } : {}),
           ...(startedAt ? { durationMs: Math.max(0, Date.now() - startedAt) } : {}),
           ...(completedTurnId ? { hookCoverage: coverageForDriver(settledDriverKind, toolEvidence(store.messagesFor(event.threadId), completedTurnId)) } : {}),
           ...(shape ? { promptShape: { stableBytes: shape.stableBytes, volatileBytes: shape.volatileBytes, totalBytes: shape.totalBytes, replayed: shape.replayed, replayBytes: shape.replayBytes, ...(shape.stableChanged?.length ? { stableChanged: shape.stableChanged } : {}) } } : {}),

@@ -56,9 +56,17 @@ export function estimateTokens(bytes: number): number {
  * message. `lastTurnInput` (the last turn's summed input) stands in where a
  * driver reports no context reading; the byte estimate only where it
  * reports no usage at all. */
-export function shouldCompact(input: { contextTokens?: number; lastTurnInput?: number; estimatedTokens: number; budget: number }): boolean {
+/** After a compaction the thread's context has a floor: the system prompt
+ * and the kept exchanges. A budget below that floor would compact on every
+ * turn for nothing, so a second compaction waits until the context has
+ * grown this much past the first reading after the last one. */
+export const REGROWTH_FACTOR = 1.25;
+
+export function shouldCompact(input: { contextTokens?: number; lastTurnInput?: number; estimatedTokens: number; budget: number; floor?: number }): boolean {
   const size = input.contextTokens && input.contextTokens > 0 ? input.contextTokens
     : input.lastTurnInput && input.lastTurnInput > 0 ? input.lastTurnInput
     : input.estimatedTokens;
-  return size >= input.budget;
+  if (size < input.budget) return false;
+  if (input.floor && input.floor > 0 && size < input.floor * REGROWTH_FACTOR) return false;
+  return true;
 }

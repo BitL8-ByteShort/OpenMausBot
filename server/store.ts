@@ -382,6 +382,10 @@ export interface TaskRecord {
    * dispatch starts a fresh engine session with a budgeted replay instead of
    * resuming. Cleared, with the resume cursors, once that turn dispatches. */
   contextReset?: boolean;
+  /** The context reading of the first turn after the last harness
+   * compaction: the floor the thread cannot go under. The next compaction
+   * waits for the context to regrow past it (context-budget.ts). */
+  contextFloor?: number;
   pinnedMessageId?: string;
   /** Runtime-only state, reset on load and never written to bots.json. */
   activity?: BotActivity;
@@ -410,7 +414,7 @@ export interface TaskRecord {
 
 const TASK_PATCH_FIELDS = [
   "title", "projectId", "modelSelection", "approvalMode", "autoApprove", "alwaysAllow",
-  "unread", "rewound", "contextReset", "archivedAt", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
+  "unread", "rewound", "contextReset", "contextFloor", "archivedAt", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
   "routineRunId", "surface",
 ] as const satisfies readonly (keyof TaskRecord)[];
 export type TaskPatch = Partial<Pick<TaskRecord, typeof TASK_PATCH_FIELDS[number]>>;

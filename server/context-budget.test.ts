@@ -43,6 +43,13 @@ describe("shouldCompact", () => {
     expect(shouldCompact({ estimatedTokens: 130_000, budget: 120_000 })).toBe(true);
     expect(shouldCompact({ contextTokens: 0, lastTurnInput: 0, estimatedTokens: 100, budget: 120_000 })).toBe(false);
   });
+
+  it("does not compact again until the context has regrown a quarter past the floor left by the last compaction", () => {
+    // budget 60k, but the system prompt plus the kept exchanges cost 90k: over budget forever
+    expect(shouldCompact({ contextTokens: 91_000, estimatedTokens: 0, budget: 60_000, floor: 90_000 })).toBe(false);
+    expect(shouldCompact({ contextTokens: 112_000, estimatedTokens: 0, budget: 60_000, floor: 90_000 })).toBe(false);
+    expect(shouldCompact({ contextTokens: 113_000, estimatedTokens: 0, budget: 60_000, floor: 90_000 })).toBe(true);
+  });
 });
 
 describe("estimateTokens", () => {
