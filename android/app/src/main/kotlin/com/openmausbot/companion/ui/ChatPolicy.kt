@@ -490,6 +490,13 @@ object MessageActions {
         if (AttachedMessageContent.parse(raw).attachments.isNotEmpty()) return null
         return raw
     }
+
+    /**
+     * Whether a bubble earns a "…" handle: only when the tray behind it would
+     * hold at least one control. A handle that opens nothing is a broken button.
+     */
+    fun showsTray(message: Message): Boolean =
+        copyableText(message) != null || editableText(message) != null
 }
 
 /** Reactions, grouped for display. `by == "user"` is yours. */
