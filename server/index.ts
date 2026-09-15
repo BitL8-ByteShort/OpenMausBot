@@ -202,6 +202,7 @@ import { runHarnessCall, type HarnessCallResult } from "./harness-calls.ts";
 import { buildRecall } from "./recall.ts";
 import { recallChipLabel, recallQuery, recallRefsText, splitSourcesLine, type RecallBlock } from "./recall-block.ts";
 import { supamausClient } from "./supamaus.ts";
+import { projectInstructionsPrompt } from "./project-instructions.ts";
 
 /** A session_read answer competes with the transcript for the context
  * window; a computer-use turn's output can run to hundreds of KB. */
@@ -268,8 +269,7 @@ import {
   memorySourceLabel,
   searchMemoryFiles,
   SESSION_SEARCH_SYSTEM_PROMPT,
-  workspaceDir,
-} from "./workspace.ts";
+  workspaceDir, currentFolderPrompt } from "./workspace.ts";
 import { readMemoryTopic } from "./workspace.ts";
 import {
   MEMORY_INDEX,
@@ -1724,6 +1724,7 @@ function previewSystemPrompt(bot: BotRecord) {
     { id: "routine", label: "Routines", text: agentsMounted ? ROUTINE_PROMPT : "" },
     { id: "profile", label: "Profile changes", text: agentsMounted ? PROFILE_PROMPT : "" },
     { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
+    { id: "project", label: "Project instructions (AGENTS.md)", text: projectInstructionsPrompt(bot.cwd, instance?.driverKind) },
     { id: "memory", label: "Memory", text: memorySystemPrompt(bot.id, { managedWrites: agentsMounted, fileTools: Boolean(privateWorkspace) }) },
     { id: "skills", label: "Skills index", text: privateWorkspace ? skillsSystemPrompt(bot.id) : "" },
   ]);
@@ -5805,6 +5806,20 @@ async function startTurn(
   // must not be steered into — or told about — tools it cannot call.
   const agentsMounted = (commsDepth < MAX_COMMS_DEPTH || Boolean(opts?.coordination)) && instance.adapter.capabilities.agentsMcp === true;
   const skillAuthoring = skillAuthoringEnabled(cfg) && agentsMounted;
+  // Phase 1 part 3 (F3): bundled skills are chosen by trigger term here,
+  // ahead of the turn text, and their bodies ride IN that text — never in
+  // the stable prompt half, so a trigger term cannot relaunch the CLI.
+  const selectedSkills = selectBundledSkills(
+    providerText,
+    [
+      ...(instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : []),
+      ...(skillAuthoring ? ["skillAuthoring"] : []),
+    ],
+    availableSkills(),
+  );
+  const skillInstructions = renderSkillInstructions(selectedSkills, {
+    includeRoot: supportsWorkspaceFiles(instance.driverKind) && opts?.runOn !== "cloud",
+  });
   // Setup mode's turn-text rewrite (parseSetupCommand/expandSetupTurnText)
   // must not run ahead of a system prompt that can't explain it: a driver
   // without agent tools sees the user's literal "/setup ..." message. The
@@ -5837,7 +5852,7 @@ async function startTurn(
   recallByThread.delete(threadId);
   if (recall) beginRecall(threadId, recall);
   const { turnText, resume } = buildTurnContext({
-    text: `${recall ? `${recall.text}\n\n` : ""}${promptWithReply(
+    text: `${recall ? `${recall.text}\n\n` : ""}${skillInstructions ? `${skillInstructions.trim()}\n\n` : ""}${promptWithReply(
       skillAuthoring ? expandLearnTurnText(setupText) : setupText,
       opts?.replyTo,
       cfg.profile?.name?.trim() || "User",
@@ -5913,14 +5928,6 @@ async function startTurn(
     try {
       const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
       let browser: Awaited<ReturnType<typeof browserIntegration>> = null;
-      const selectedSkills = selectBundledSkills(
-        providerText,
-        [
-          ...(instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : []),
-          ...(skillAuthoring ? ["skillAuthoring"] : []),
-        ],
-        availableSkills(),
-      );
       if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
         if (!claimTurnResource(resourceOwner, "computer:phone")) throw new Error("another thread is using the phone — wait for it to finish");
         integrations.phone = phoneIntegration();
@@ -5951,9 +5958,6 @@ async function startTurn(
         beginMemoryTurn(bot.id, threadId);
       }
       const privateWorkspace = worksInWorkspace ? ensureTaskWorkspace(bot.id, threadId) : undefined;
-      const skillInstructions = renderSkillInstructions(selectedSkills, {
-        includeRoot: worksInWorkspace && opts?.runOn !== "cloud",
-      });
       const packagePlaybooks = installedPlaybookInstructions(providerText, bot.playbooks);
       // An explicit working folder wins for new tasks; otherwise they use
       // the private bot workspace. A legacy task with an existing provider
@@ -6363,6 +6367,11 @@ async function startTurn(
         // false when they are not — see agentsMounted above)
         { id: "setup", label: "Setup", text: setupSystemPrompt(setupMode, { skills: skillAuthoring, cwd: liveBot?.cwd ?? bot.cwd }) },
         { id: "files", label: "File locations", text: worksInWorkspace && opts?.runOn !== "cloud" ? workspaceLocationsPrompt(bot.id, cwd, liveBot?.cwd ?? bot.cwd) : "" },
+        // per thread, volatile: the one path that differs between a bot's
+        // threads must not break the stable prefix (Phase 1 part 3)
+        { id: "folder", label: "Working folder", text: worksInWorkspace && opts?.runOn !== "cloud" ? currentFolderPrompt(cwd) : "" },
+        // the project's own AGENTS.md, for engines that do not read it themselves
+        { id: "project", label: "Project instructions (AGENTS.md)", text: opts?.runOn !== "cloud" ? projectInstructionsPrompt(cwd, instance.driverKind) : "" },
         { id: "computer", label: "Computer", text: computerPrompt(computerPromptKind) },
         { id: "team-computer", label: "Team computer", text: teamComputerPrompt(teamComputer) },
         { id: "plan", label: "Surface", text: surfacePrompt({ computer: mountedComputer, browser: Boolean(integrations.browser) }, { pinned: plan.pinned, note: plan.note }) },
@@ -6383,7 +6392,9 @@ async function startTurn(
         { id: "section-context", label: "Section context", text: sectionContextSystemPrompt(bot.section) },
         { id: "memory", label: "Memory", text: memorySystemPrompt(bot.id, { managedWrites: Boolean(integrations.agents), fileTools: worksInWorkspace }) },
         { id: "skills", label: "Skills index", text: privateWorkspace ? skillsSystemPrompt(bot.id) : "" },
-        { id: "skill-instructions", label: "Skill instructions", text: skillInstructions },
+        // skill bodies ride in the turn text (Phase 1 part 3, F3): a trigger
+        // term must not change the stable half and relaunch the CLI
+        { id: "skill-instructions", label: "Skill instructions", text: "" },
         { id: "playbooks", label: "Playbooks", text: packagePlaybooks },
         { id: "webhook", label: "Webhook provenance", text: opts?.automationSource === "webhook" ? WEBHOOK_PROMPT : "" },
         { id: "mentions", label: "Mentions", text: boundedCoordination && tagged.length ? `The user named these existing teammates: ${tagged.map(b => `${peerName(b.name)} (${b.id})`).join(", ")}. Use coordinate_bots when their contribution is needed; do not substitute native helper agents for these bots.` : mentionPrompt(tagged) },
@@ -7995,7 +8006,9 @@ async function runGroupMemberTurn(
   }
   recallByThread.delete(threadId);
   if (roomRecall) beginRecall(threadId, roomRecall, { botId: bot.id, name: bot.name, color: bot.color });
-  const text = `${roomRecall ? `${roomRecall.text}\n\n` : ""}${roomContext}\n\n(Reply to the conversation above as ${bot.name}.)${learnBlock}${cardContinuation ? `\n\n${cardContinuation}` : ""}${coordinationReminder}`;
+  // skill bodies ride in the turn text here too (Phase 1 part 3, F3)
+  const roomSkillBlock = renderSkillInstructions(selectedSkills, { includeRoot: supportsWorkspaceFiles(instance.driverKind) });
+  const text = `${roomRecall ? `${roomRecall.text}\n\n` : ""}${roomSkillBlock ? `${roomSkillBlock.trim()}\n\n` : ""}${roomContext}\n\n(Reply to the conversation above as ${bot.name}.)${learnBlock}${cardContinuation ? `\n\n${cardContinuation}` : ""}${coordinationReminder}`;
   // a typed turn carries its schema instruction in the turn text itself,
   // which is what makes it work the same on every engine
   const turnText = orchestration?.outputSchema ? withStructuredInstruction(text, orchestration.outputSchema) : text;
@@ -8020,6 +8033,8 @@ async function runGroupMemberTurn(
   const roomMemory = memorySystemPrompt(bot.id, { managedWrites: Boolean(integrations.agents), fileTools: worksInWorkspace });
   const roomSystem = buildSystemPrompt(system, store.bot(bot.id)?.soul ?? bot.soul ?? "", [
     { id: "files", label: "File locations", text: workspace ? workspaceLocationsPrompt(bot.id, cwd, readyBot.cwd) : "" },
+    { id: "folder", label: "Working folder", text: workspace ? currentFolderPrompt(cwd) : "" },
+    { id: "project", label: "Project instructions (AGENTS.md)", text: projectInstructionsPrompt(cwd, instance.driverKind) },
     { id: "mcp", label: "MCP servers", text: customMcpPrompt(Object.keys(integrations.custom ?? {})) },
     { id: "computer", label: "Computer", text: computerPrompt(roomTeamComputer ? instance.driverKind === "boxAgent" ? "box-agent" : "box" : roomVmTarget ? localVmMode(cfg) === "per-bot" ? "vm-private" : "vm-shared" : null) },
     { id: "team-computer", label: "Team computer", text: teamComputerPrompt(roomTeamComputer) },
@@ -8034,7 +8049,7 @@ async function runGroupMemberTurn(
     // agents server, so a room turn with it must be told to use it too.
     { id: "memory", label: "Memory", text: roomMemory ? `\n${roomMemory.trim()}` : "" },
     { id: "skills", label: "Skills index", text: workspace ? skillsSystemPrompt(bot.id) : "" },
-    { id: "skill-instructions", label: "Skill instructions", text: renderSkillInstructions(selectedSkills, { includeRoot: Boolean(workspace) }) },
+    { id: "skill-instructions", label: "Skill instructions", text: "" },
     { id: "playbooks", label: "Playbooks", text: installedPlaybookInstructions(text, bot.playbooks) },
   ]);
 

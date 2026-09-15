@@ -92,14 +92,34 @@ Correct when the reply says `blue-falcon-42`. On the branch a chip
 tool steps; on main the bot has to think of `session_search` itself. The
 fuller measure is the recall set (`docs/verification/recall.md`).
 
+**T7 — a bundled skill (Phase 1 part 3, F3).** Start the harness with
+`OMB_SKILLS_DIR=server/testing/skills` (a fixture skill whose trigger word is
+`zorblat`). New bot. Send *Please zorblat: what is 2 + 2? Reply in one short
+line.* Correct when the reply begins with `quantum-elk`. Then send *And 3 + 3?
+One short line.* On the branch the second turn keeps the live Claude process
+(the skill body travelled in the turn text, not the system prompt); the
+scorecard's "stable prompt sections that changed" line must say none.
+
+**T8 — a project's AGENTS.md.** Make a folder holding an `AGENTS.md` that
+says "End every reply with the word ZEBRA." and set it as the bot's working
+folder. Send *Say hello in one short line.* Correct when the reply ends with
+ZEBRA, on every engine (Codex reads the file itself; the harness hands it
+to the others).
+
+**T9 — the command filter, off and on (closes F5's gate).** Two bots whose
+working folder is a git checkout with a long history, one with
+`commandFilters: false`, one with `true`. Send *Run exactly `git log` with no
+flags in this folder, then tell me the subject line of the newest commit.*
+Compare "in" between the two; the script prints both.
+
 ## Doing it unattended
 
-The script runs the tasks above (T6 included unless `--skip-recall`) and prints the same table:
+The script runs the tasks above (T6 unless `--skip-recall`; T7–T9 unless `--skip-prefix`, with `--repo DIR` for T9) and prints the same table:
 
 ```sh
 # 1. start the build's harness standalone on its own port and data folder
 #    (the desktop app refuses scripted sends, on purpose)
-OMB_DATA_DIR=$HOME/.openmausbot-score OMB_PORT=28801 \
+OMB_DATA_DIR=$HOME/.openmausbot-score OMB_PORT=28801 OMB_SKILLS_DIR=server/testing/skills \
   node --experimental-strip-types server/index.ts &
 
 # 2. run the scorecard (Claude for T1–T3, Codex takes over for T4)

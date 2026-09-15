@@ -69,14 +69,24 @@ export function workspaceDir(botId: string): string {
  * independent working directories; the same bot can find its earlier output
  * without assuming that a file absent from the current directory was lost. */
 export function workspaceLocationsPrompt(botId: string, cwd: string | undefined, botCwd?: string): string {
+  // The current working folder is per thread, so it is NOT here: this
+  // section is the same bytes on every thread of a bot (Phase 1 part 3); the
+  // folder rides in the volatile `folder` section (currentFolderPrompt).
   return "\n\nFile locations for this bot (absolute paths): " + JSON.stringify({
-    currentWorkingFolder: cwd ?? "Provider default; inspect the working directory before using relative paths",
     sharedBotFolder: workspaceDir(botId),
     otherThreadFiles: join(TASK_WORKSPACES_DIR, botId),
     ...(botCwd ? { configuredProjectFolder: botCwd } : {}),
   }) + ". Different conversations can have different working folders. For an existing file, use the exact path from the conversation; if missing here, check this bot's listed folders before saying it is gone or recreating it." +
     " Follow an explicitly requested destination. Otherwise put new task output in the current working folder and report its absolute path so another thread or room can use it." +
-    " Do not move old files, edit another active thread's work, or read another bot's private folders without authorization. These paths do not grant additional access.";
+    " Do not move old files, edit another active thread's work, or read another bot's private folders without authorization. These paths do not grant additional access." +
+    (cwd === undefined ? " There is no pinned working folder for this conversation: inspect the working directory before using relative paths." : "");
+}
+
+/** The one path that differs between threads, on its own so the stable
+ * half of the prompt stays stable (Phase 1 part 3). Empty when the
+ * conversation has no pinned folder (the locations block says so). */
+export function currentFolderPrompt(cwd: string | undefined): string {
+  return cwd ? `\n\nCurrent working folder for this conversation (absolute path): ${JSON.stringify(cwd)}.` : "";
 }
 
 /** Lines as a person counts them: a file that ends in a newline has no
