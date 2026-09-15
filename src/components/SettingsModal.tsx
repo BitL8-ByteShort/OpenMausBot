@@ -16,7 +16,7 @@ import { useUpdaterState } from "@/lib/updater";
 import { EnginesSettings } from "./EnginesSettings";
 import { LocalComputerSection } from "./LocalComputerSection";
 import { CompanionSection } from "./CompanionSection";
-import { ServerPairingCard } from "./ServerPairingCard";
+import { offersServerPairing, ServerPairingCard } from "./ServerPairingCard";
 import { PeopleSection } from "./PeopleSection";
 import { CustomDomainSettings } from "./CustomDomainSettings";
 import { BrowserProfilesManager } from "./BrowserProfilesManager";
@@ -708,8 +708,10 @@ export function SettingsModal() {
               <>
                 <RemoteComputerSection />
                 {!remoteActive && <CustomDomainSettings />}
-                {/* a hosted server reached from a browser: pair phones and see devices here; the desktop app has its own companion flow */}
-                {!window.ogb && <ServerPairingCard />}
+                {/* a hosted server reached from a browser, or from the desktop app connected to a hosted
+                    workspace: pair phones and see devices here. The desktop app's own server keeps its
+                    companion flow below instead. */}
+                {offersServerPairing({ desktopBridge: Boolean(window.ogb), remoteWorkspace: remoteActive }) && <ServerPairingCard />}
                 {!remoteActive && <CompanionSection profileEmail={state.config?.profile?.email} />}
               </>
             )}
