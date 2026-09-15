@@ -31,15 +31,6 @@ export function canPairDevices(state: SessionState | null): boolean {
   return state.kind === "loopback" || (state.kind === "session" && state.scopes.includes("admin"));
 }
 
-/** Where the server's own pairing card belongs. A browser on a hosted server
- * always gets it. The desktop app has its own companion flow for the server
- * it runs itself — but once it is connected to a hosted workspace, that
- * server's devices can only be paired here, so the card comes back
- * (MOCA-84: a NAS-hosted server reached from the Mac app showed nothing). */
-export function offersServerPairing(env: { desktopBridge: boolean; remoteWorkspace: boolean }): boolean {
-  return !env.desktopBridge || env.remoteWorkspace;
-}
-
 /** A session that may see the card but not act: say why, instead of showing
  * nothing at all. Only a paired session can be chat-only; loopback is the
  * owner, and the unauthenticated case never reaches Settings. */
@@ -62,10 +53,14 @@ export function lastSeen(lastSeenAt: number, now = Date.now()): string {
 const button = "rounded-md bg-accent px-3 py-1.5 text-[13px] font-medium text-accent-ink disabled:opacity-50";
 const quiet = "rounded-md border border-line px-3 py-1.5 text-[13px] text-ink hover:bg-surface";
 
-/** Settings → Remote access on a hosted server: mint a one-time pairing
- * code with a QR for the phone app, and see or sign out the devices that
- * hold a session. The desktop app has its own companion flow and never
- * shows this. */
+/** Settings → Remote access: mint a one-time pairing code with a QR for
+ * the phone app (or for a non-phone client — MCP, `openmausbot pair`, a
+ * second desktop app), and see or sign out the devices that hold a
+ * session. Shown for every client of a server: a hosted server reached
+ * from a browser, the desktop app's own local server (#950), and the
+ * desktop app connected to a hosted workspace, whose requests reach that
+ * server with the paired session — the only place its phones can be
+ * paired from (MOCA-84). `canPairDevices` decides who may act. */
 export function ServerPairingCard({ initialSession = null }: { initialSession?: SessionState | null }) {
   const [session, setSession] = useState<SessionState | null>(initialSession);
   const [scope, setScope] = useState<"admin" | "client">("admin");

@@ -2,7 +2,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { canPairDevices, lastSeen, minutesLeft, offersServerPairing, pairingBlockedReason, ServerPairingCard } from "./ServerPairingCard";
+import { canPairDevices, lastSeen, minutesLeft, pairingBlockedReason, ServerPairingCard } from "./ServerPairingCard";
 
 describe("pairing devices from a hosted server's settings", () => {
   it("is offered to the owner on the box and to admin sessions, never to chat-only sessions", () => {
@@ -25,13 +25,6 @@ describe("pairing devices from a hosted server's settings", () => {
 
   it("renders nothing until it knows who is asking", () => {
     expect(renderToStaticMarkup(createElement(ServerPairingCard))).toBe("");
-  });
-
-  it("belongs on a hosted server's page and in the desktop app once it is connected to a hosted workspace", () => {
-    expect(offersServerPairing({ desktopBridge: false, remoteWorkspace: false })).toBe(true);
-    expect(offersServerPairing({ desktopBridge: true, remoteWorkspace: true })).toBe(true);
-    // the desktop app's own server pairs phones through its companion flow instead
-    expect(offersServerPairing({ desktopBridge: true, remoteWorkspace: false })).toBe(false);
   });
 
   it("explains a chat-only connection instead of showing nothing", () => {

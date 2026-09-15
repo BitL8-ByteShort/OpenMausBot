@@ -16,7 +16,7 @@ import { useUpdaterState } from "@/lib/updater";
 import { EnginesSettings } from "./EnginesSettings";
 import { LocalComputerSection } from "./LocalComputerSection";
 import { CompanionSection } from "./CompanionSection";
-import { offersServerPairing, ServerPairingCard } from "./ServerPairingCard";
+import { ServerPairingCard } from "./ServerPairingCard";
 import { PeopleSection } from "./PeopleSection";
 import { CustomDomainSettings } from "./CustomDomainSettings";
 import { BrowserProfilesManager } from "./BrowserProfilesManager";
@@ -708,10 +708,13 @@ export function SettingsModal() {
               <>
                 <RemoteComputerSection />
                 {!remoteActive && <CustomDomainSettings />}
-                {/* a hosted server reached from a browser, or from the desktop app connected to a hosted
-                    workspace: pair phones and see devices here. The desktop app's own server keeps its
-                    companion flow below instead. */}
-                {offersServerPairing({ desktopBridge: Boolean(window.ogb), remoteWorkspace: remoteActive }) && <ServerPairingCard />}
+                {/* mints an admin/client session token for anything that isn't the phone companion
+                    flow (MCP clients, `openmausbot pair`, a second desktop app), and pairs phones to a
+                    hosted server. Shown for the desktop app's own server (#950) AND when this desktop is
+                    a remote client of a hosted workspace: its requests carry that server's session, and
+                    Settings there is the only place that server's phones can be paired from (MOCA-84).
+                    The server decides who may act — an owner or an admin session — not this gate. */}
+                <ServerPairingCard />
                 {!remoteActive && <CompanionSection profileEmail={state.config?.profile?.email} />}
               </>
             )}

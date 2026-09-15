@@ -24,10 +24,6 @@ vi.mock("@/lib/thread-preferences", () => ({
   useShowThreads: () => fixture.showThreads,
   setShowThreads: fixture.setShowThreads,
 }));
-vi.mock("./ServerPairingCard", async (importOriginal) => ({
-  ...await importOriginal<typeof import("./ServerPairingCard")>(),
-  ServerPairingCard: () => createElement("div", { "data-server-pairing-card": "" }),
-}));
 vi.mock("@/lib/analytics", () => ({ analyticsEnabled: () => false, setAnalyticsEnabled: vi.fn() }));
 vi.mock("./SettingsPrimitives", async (importOriginal) => {
   const original = await importOriginal<typeof import("./SettingsPrimitives")>();
@@ -107,16 +103,6 @@ describe("Settings → Appearance", () => {
     expect(html).toContain("Midnight");
     expect(html).toContain('aria-label="Show threads"');
     expect(html).not.toContain('aria-label="Show tool calls in chat"');
-  });
-
-  it("pairs phones for a hosted workspace from the desktop app, but not for the app's own server", () => {
-    fixture.section = "companion";
-    vi.stubGlobal("window", { ogb: { remoteClient: { active: true } } });
-    expect(render()).toContain("data-server-pairing-card");
-    vi.stubGlobal("window", { ogb: {} });
-    expect(render()).not.toContain("data-server-pairing-card");
-    vi.stubGlobal("window", {});
-    expect(render()).toContain("data-server-pairing-card");
   });
 
   it("offers full backups in local Settings", () => {
