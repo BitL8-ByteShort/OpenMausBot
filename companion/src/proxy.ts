@@ -342,6 +342,7 @@ export function createProxyHandler(options: ProxyOptions) {
     const mutationToken = device ? options.mutationToken?.() : undefined;
     if (device && options.mutationToken && !mutationToken) {
       return sendJson(res, 503, { error: "The desktop connection is starting. Please try again shortly." });
+    }
     // The one route whose body the sidecar reads before forwarding: a voice
     // config write. Everything else streams straight through. `payload` is
     // that re-serialised body; absent, the request is piped as it arrived.
