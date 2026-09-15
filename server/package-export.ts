@@ -162,7 +162,7 @@ export function createBotPackageExport(input: {
       appearance,
       // the engine preference travels as setup intent (Phase 2 part 4,
       // §16c), the way connected-app labels do; credentials never do
-      engine: { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model },
+      ...(bot.modelSelection ? { engine: { instanceId: bot.modelSelection.instanceId, model: bot.modelSelection.model } } : {}),
     };
     const assigned = agentPlaybooks.get(bot.id);
     if (assigned?.length) agent.playbooks = assigned;
