@@ -52,6 +52,9 @@ export interface UsageRow {
   /** True when the harness compacted the thread right before this turn
    * (Phase 1): the turn started a fresh session on a budgeted replay. */
   compacted?: boolean;
+  /** True when the harness restated the conversation's first request in
+   * front of this turn (Phase 1 part 4: after a compaction, every tenth turn). */
+  recited?: boolean;
   /** Harness calls only: the idempotent key the call was booked under. */
   fingerprint?: string;
   /** What the harness recalled ahead of this turn (Phase 1 part 2), and how

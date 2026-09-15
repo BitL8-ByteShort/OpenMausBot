@@ -126,6 +126,11 @@ posixOnly("harness-owned compaction (every fake engine, window forced to 100k)",
     if (engine.id === "claude") {
       const dump = JSON.parse(readFileSync(join(h.home(), "claude.dump.json"), "utf8"));
       expect(JSON.stringify(dump.prompt)).toContain("[Summary of the conversation before this point");
+      // Phase 1 part 4: the turn after a compaction restates where the
+      // conversation began, in the turn text
+      expect(JSON.stringify(dump.prompt)).toContain("[Where this conversation stands, kept by OpenMausBot:");
+      expect(JSON.stringify(dump.prompt)).toContain("first: remember the codeword PLUM");
+      expect(ledger.at(-1)).toMatchObject({ recited: true });
     }
     // measured: the usage row of turn 3 says it followed a compaction
     const metrics = (await h.api("GET", "/api/metrics?from=2026-01-01&to=2026-12-31")).body;
@@ -135,6 +140,11 @@ posixOnly("harness-owned compaction (every fake engine, window forced to 100k)",
     // regrowth floor keeps the harness from compacting on every turn
     const again = await h.turn(bot.id, "fifth: and now?");
     expect((again.messages as Msg[]).filter((m) => m.kind === "compaction")).toHaveLength(1);
+    // and the recitation was for the compaction turn only, not every turn
+    if (engine.id === "claude") {
+      const dump = JSON.parse(readFileSync(join(h.home(), "claude.dump.json"), "utf8"));
+      expect(JSON.stringify(dump.prompt)).not.toContain("[Where this conversation stands");
+    }
   }, 90_000);
 });
 

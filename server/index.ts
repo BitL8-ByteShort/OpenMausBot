@@ -147,7 +147,7 @@ import {
   DATA_DIR,
   EVENTS_DIR,
   NATIVE_DIR,
-  customMcpServers, recallAuto, recallCaptures, recallMaxChars } from "./config.ts";
+  customMcpServers, recallAuto, recallCaptures, recallMaxChars, contextRecite } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
 import { registerEnginesBinDir } from "./engine-install.ts";
@@ -200,6 +200,7 @@ import { readMessageText, recallMessages, searchMessages, closeMessageDb, chatFo
 import { claimRecallCrossings, recallCrossingLabel } from "./recall-disclosure.ts";
 import { runHarnessCall, type HarnessCallResult } from "./harness-calls.ts";
 import { buildRecall } from "./recall.ts";
+import { progressNote } from "./progress.ts";
 import { recallChipLabel, recallQuery, recallRefsText, splitSourcesLine, type RecallBlock } from "./recall-block.ts";
 import { supamausClient } from "./supamaus.ts";
 import { projectInstructionsPrompt } from "./project-instructions.ts";
@@ -3530,6 +3531,8 @@ const compactedThreads = new Set<string>();
 const supamaus = supamausClient();
 interface PendingRecall { chipId: string; block: RecallBlock; used?: number[] }
 const recallByThread = new Map<string, PendingRecall>();
+/** Threads whose current turn carries a recitation (Phase 1 part 4). */
+const recitedThreads = new Set<string>();
 
 /** Post the chip that says what was recalled; the reply's Sources line
  * finishes it. In a room the chip speaks as the bot. */
@@ -4740,6 +4743,7 @@ bus.subscribe((event: RuntimeEvent) => {
         filteredCommandsByThread.delete(event.threadId);
         const compacted = compactedThreads.delete(event.threadId);
         const recallRow = takeRecall(event.threadId);
+        const recited = recitedThreads.delete(event.threadId);
         // the first reading after a compaction is the thread's floor: the
         // next compaction waits for the context to regrow past it
         if (compacted) {
@@ -4751,6 +4755,7 @@ bus.subscribe((event: RuntimeEvent) => {
           ...(filteredCommands ? { filteredCommands } : {}),
           ...(compacted ? { compacted: true } : {}),
           ...(recallRow ? { recall: recallRow } : {}),
+          ...(recited ? { recited: true } : {}),
           ...(startedAt ? { durationMs: Math.max(0, Date.now() - startedAt) } : {}),
           ...(completedTurnId ? { hookCoverage: coverageForDriver(settledDriverKind, toolEvidence(store.messagesFor(event.threadId), completedTurnId)) } : {}),
           ...(shape ? { promptShape: { stableBytes: shape.stableBytes, volatileBytes: shape.volatileBytes, totalBytes: shape.totalBytes, replayed: shape.replayed, replayBytes: shape.replayBytes, ...(shape.stableChanged?.length ? { stableChanged: shape.stableChanged } : {}) } } : {}),
@@ -5851,8 +5856,16 @@ async function startTurn(
   }
   recallByThread.delete(threadId);
   if (recall) beginRecall(threadId, recall);
+  // Phase 1 part 4: after a compaction and every tenth turn, restate where
+  // the conversation began, so a standing instruction from turn one is not
+  // lost at the far end of a long context. No model call; every engine.
+  const recited = contextRecite(cfg) && !opts?.cardContinuation
+    ? progressNote({ messages: activeMessages.filter((m) => m.id !== userMessage.id), botName: bot.name, afterCompaction: contextReset })
+    : null;
+  if (recited) recitedThreads.add(threadId);
+  else recitedThreads.delete(threadId);
   const { turnText, resume } = buildTurnContext({
-    text: `${recall ? `${recall.text}\n\n` : ""}${skillInstructions ? `${skillInstructions.trim()}\n\n` : ""}${promptWithReply(
+    text: `${recall ? `${recall.text}\n\n` : ""}${recited ? `${recited}\n\n` : ""}${skillInstructions ? `${skillInstructions.trim()}\n\n` : ""}${promptWithReply(
       skillAuthoring ? expandLearnTurnText(setupText) : setupText,
       opts?.replyTo,
       cfg.profile?.name?.trim() || "User",

@@ -8,7 +8,7 @@
 //   node --experimental-strip-types scripts/bench/scorecard.ts \
 //     --url http://127.0.0.1:PORT --data-dir DIR --label phase0 \
 //     [--engine claude] [--switch-to codex] [--out FILE.json] [--skip-long | --only-long]
-//     [--skip-recall | --only-recall] [--skip-prefix | --only-prefix] [--repo DIR]
+//     [--skip-recall | --only-recall] [--skip-prefix | --only-prefix] [--repo DIR] [--only-goal]
 //
 // Point it at a harness started standalone (`OMB_DATA_DIR=DIR OMB_PORT=PORT
 // node --experimental-strip-types server/index.ts`): the packaged desktop
@@ -17,7 +17,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-interface Args { url: string; dataDir: string; label: string; engine: string; switchTo?: string; out?: string; skipLong?: boolean; onlyLong?: boolean; skipRecall?: boolean; onlyRecall?: boolean; skipPrefix?: boolean; onlyPrefix?: boolean; repo?: string }
+interface Args { url: string; dataDir: string; label: string; engine: string; switchTo?: string; out?: string; skipLong?: boolean; onlyLong?: boolean; skipRecall?: boolean; onlyRecall?: boolean; skipPrefix?: boolean; onlyPrefix?: boolean; repo?: string; onlyGoal?: boolean }
 
 function parseArgs(argv: string[]): Args {
   const a: Partial<Args> = { engine: "claude", label: "run" };
@@ -36,6 +36,7 @@ function parseArgs(argv: string[]): Args {
       case "--only-recall": a.onlyRecall = true; break;
       case "--skip-prefix": a.skipPrefix = true; break;
       case "--only-prefix": a.onlyPrefix = true; break;
+      case "--only-goal": a.onlyGoal = true; break;
       case "--repo": a.repo = v!; i += 1; break;
       default: throw new Error(`unknown argument ${argv[i]}`);
     }
@@ -164,6 +165,19 @@ async function prefixTasks(engine: string) {
   }
 }
 
+// T10 (Phase 1 part 4): a standing rule given at turn one must still hold at
+// turn twelve, across the compaction the growing log file forces (T5's
+// growth). Correct when every reply starts with the word and gives the count.
+async function goalTask(engine: string) {
+  const t10 = await bot(`Score T10 ${args.label}`, engine);
+  const grow = "Append 100 lines of the form 'entry N' (N continuing from where the file ends, starting at 1 if it does not exist) to log.txt with one shell loop, then print the whole file with cat, then reply with only the total number of lines in the file.";
+  for (let n = 1; n <= 12; n += 1) {
+    await turn("T10 standing-rule", n, t10, engine,
+      n === 1 ? `For this whole conversation, begin every reply with the word LANTERN. Then: ${grow}` : grow,
+      (reply) => /^\W*lantern\b/i.test(reply.trim()) && reply.includes(String(100 * n)));
+  }
+}
+
 // a fact that is not credential-shaped, on purpose: a model may refuse to
 // repeat a password on policy, which would measure refusal, not recall
 async function recallTask(engine: string) {
@@ -199,6 +213,11 @@ async function main() {
     report();
     return;
   }
+  if (args.onlyGoal) {
+    await goalTask(engine);
+    report();
+    return;
+  }
   // T1 — one turn that writes a file and runs a command (tool use, evidence)
   const t1 = await bot(`Score T1 ${args.label}`, engine);
   await turn("T1 file-task", 1, t1, engine,
@@ -229,6 +248,7 @@ async function main() {
   // this answerable on the branch; on main the bot has session_search only
   if (!args.skipRecall) await recallTask(engine);
   if (!args.skipPrefix) await prefixTasks(engine);
+  if (args.onlyGoal) { await goalTask(engine); report(); return; }
   // T4 — a different engine takes over T1's thread and must know what happened
   if (args.switchTo) {
     const catalog = (await api("GET", "/api/instances")).instances.find((i: any) => i.instanceId === args.switchTo);
@@ -256,6 +276,8 @@ function report() {
   if (filterOff && filterOn) console.log(`\nT9: input with the command filter off ${fmt(filterOff.input)}, on ${fmt(filterOn.input)}; both correct: ${filterOff.correct && filterOn.correct ? "yes" : "no"}`);
   const changed = results.filter((r) => r.stableChanged?.length);
   console.log(`\nstable prompt sections that changed between turns: ${changed.length ? changed.map((r) => `${r.task} #${r.turn} ${r.stableChanged!.join("+")}`).join("; ") : "none"}`);
+  const goal = results.filter((r) => r.task === "T10 standing-rule");
+  if (goal.length) console.log(`\nT10: replies that kept the standing rule ${goal.filter((r) => r.correct).length}/${goal.length}`);
   const recall = results.filter((r) => r.task === "T6 recall");
   if (recall.length) console.log(`\nT6: recalled correctly ${recall.filter((r) => r.turn === 2 && r.correct).length}/${recall.filter((r) => r.turn === 2).length}; steps on the asking turn ${recall.find((r) => r.turn === 2)?.steps ?? "—"}`);
   const long = results.filter((r) => r.task === "T5 long-thread");
