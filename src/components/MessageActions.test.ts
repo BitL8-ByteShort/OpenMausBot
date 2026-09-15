@@ -3,14 +3,18 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { MessageActions } from "./MessageActions";
 
-const render = (props: Partial<Parameters<typeof MessageActions>[0]> = {}) =>
+type Props = Parameters<typeof MessageActions>[0];
+
+const render = (props: Partial<Omit<Props, "children">> = {}) =>
   renderToStaticMarkup(
-    createElement(
-      MessageActions,
-      { side: "bot", ...props },
-      createElement("button", { type: "button" }, "copy"),
-      createElement("button", { type: "button" }, "reply"),
-    ),
+    createElement(MessageActions, {
+      side: "bot",
+      ...props,
+      children: [
+        createElement("button", { type: "button", key: "copy" }, "copy"),
+        createElement("button", { type: "button", key: "reply" }, "reply"),
+      ],
+    }),
   );
 
 describe("MessageActions", () => {
