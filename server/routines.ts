@@ -255,6 +255,9 @@ export interface RoutineManagerOptions {
     triggerSource: RoutineRunTrigger,
     onDispatchError: (message: string) => void,
   ) => Promise<void>;
+  /** Phase 2 part 4: expand `@name [[omb:type:id]]` tokens in the routine's
+   * instructions into one resolved line each, at run time. */
+  resolveMentions?: (text: string) => string;
   startGoal?: (
     groupId: string,
     threadId: string,
@@ -1469,7 +1472,7 @@ export class RoutineManager {
             await this.options.startTurn(
               run.botId,
               task.threadId,
-              composeExecutionPrompt(prompt, run.attachments, this.continuityCarry(run)),
+              composeExecutionPrompt(this.options.resolveMentions?.(prompt) ?? prompt, run.attachments, this.continuityCarry(run)),
               run.runOn ?? "maus",
               triggerSource,
               (message) => this.failThread(task.threadId, message),

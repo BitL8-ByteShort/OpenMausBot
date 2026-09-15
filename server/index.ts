@@ -203,6 +203,7 @@ import { readMessageText, recallMessages, searchMessages, closeMessageDb, chatFo
 import { claimRecallCrossings, recallCrossingLabel } from "./recall-disclosure.ts";
 import { runHarnessCall, type HarnessCallResult } from "./harness-calls.ts";
 import { buildRecall } from "./recall.ts";
+import { resolveMentions, type MentionResolver } from "./mentions.ts";
 import { progressNote } from "./progress.ts";
 import { recallChipLabel, recallQuery, recallRefsText, splitSourcesLine, type RecallBlock } from "./recall-block.ts";
 import { supamausClient } from "./supamaus.ts";
@@ -6818,7 +6819,37 @@ async function stopBotForEmergencyApprovalDowngrade(botId: string): Promise<void
 const commsBus: CommsBus = { store, broadcast, threadSlotFree: (botId) => !botAtThreadCapacity(botId) };
 _loadPending();
 
+/** Phase 2 part 4: one line per mentioned entity, from what the harness
+ * knows now. Unknown ids resolve to null and the token is left as written. */
+const mentionResolver: MentionResolver = ({ type, id }) => {
+  switch (type) {
+    case "bot": {
+      const bot = store.bot(id);
+      return bot ? `${bot.name}${bot.title ? ` — ${bot.title}` : ""}${bot.busy ? " (busy)" : ""}` : null;
+    }
+    case "room": {
+      const room = store.group(id);
+      return room ? `${room.name} — ${room.memberIds.length} member${room.memberIds.length === 1 ? "" : "s"}` : null;
+    }
+    case "task": {
+      if (!boardReady()) return null;
+      const task = getBoardTask(id);
+      return task ? `${task.title} — ${task.status}${task.owner ? `, owner ${task.owner}` : ""}${task.dueAt ? `, due ${new Date(task.dueAt).toISOString().slice(0, 10)}` : ""}` : null;
+    }
+    case "routine": {
+      const routine = routines?.listRoutines().find((r) => r.id === id);
+      return routine ? `${routine.name} — ${routine.schedule.type}${routine.enabled ? "" : ", paused"}` : null;
+    }
+    case "file":
+      return existsSync(id) ? `${id} — a file on this computer` : null;
+    default:
+      return null;
+  }
+};
+const resolveMentionText = (text: string): string => resolveMentions(text, mentionResolver).text;
+
 routines = new RoutineManager({
+  resolveMentions: resolveMentionText,
   emit: broadcast,
   hasPendingDelegations: (threadId) => pendingThreads().includes(threadId) ||
     [...delegationWatch.values()].some((watch) => watch.sourceThreadId === threadId) ||
@@ -11898,7 +11929,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (method === "POST" && path === "/api/internal/delegate-bot") {
         const body = await readInternalBody();
         const toBotId = String(body.toBotId ?? "");
-        const message = String(body.message ?? "").trim();
+        // a brief may carry mention tokens (Phase 2 part 4): resolved here,
+        // so the delegate acts on ids, not on names it would have to search
+        const message = resolveMentionText(String(body.message ?? "").trim());
         const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : undefined;
         if (
           body.depth !== undefined &&
