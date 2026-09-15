@@ -1962,11 +1962,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
      * summaries can contain paths, commands, or secrets, so the generic
      * `claude -p "prompt"` shape is not safe for review. No tools or MCP
      * servers are mounted in this isolated process. */
-    const generateReview = (prompt: string, signal?: AbortSignal, opts?: { cwd?: string }): Promise<string> =>
+    const generateReview = (prompt: string, signal?: AbortSignal, opts?: { cwd?: string; format?: "text" | "json" }): Promise<string> =>
       new Promise((resolve, reject) => {
         const child = spawnCli(
           config.cli,
-          ["-p", "--model", "claude-haiku-4-5", "--output-format", "text"],
+          ["-p", "--model", "claude-haiku-4-5", "--output-format", opts?.format ?? "text"],
           {
             stdio: ["pipe", "pipe", "pipe"],
             env: environment("claude-haiku-4-5"),
@@ -2076,6 +2076,28 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         },
       },
       generateText: (prompt, opts) => generateReview(prompt, undefined, opts),
+      // the json result carries the call's usage and cost, which the harness
+      // books (Phase 1 part 2); a result that is not the expected object is
+      // returned as text so a CLI change degrades to "unpriced", not "lost"
+      generate: async (prompt, opts) => {
+        const raw = await generateReview(prompt, undefined, { ...opts, format: "json" });
+        try {
+          const parsed = JSON.parse(raw) as { result?: unknown; usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number }; total_cost_usd?: unknown };
+          if (parsed && typeof parsed === "object" && typeof parsed.result === "string") {
+            const usage = parsed.usage ?? {};
+            return {
+              text: parsed.result,
+              ...(typeof usage.input_tokens === "number" ? { input: usage.input_tokens + (usage.cache_read_input_tokens ?? 0) } : {}),
+              ...(typeof usage.output_tokens === "number" ? { output: usage.output_tokens } : {}),
+              ...(typeof usage.cache_read_input_tokens === "number" ? { cachedInput: usage.cache_read_input_tokens } : {}),
+              costUsd: typeof parsed.total_cost_usd === "number" ? parsed.total_cost_usd : null,
+            };
+          }
+        } catch {
+          // not json: fall through
+        }
+        return { text: raw, costUsd: null };
+      },
       reviewPermission: generateReview,
       dispose: async () => {
         try {

@@ -95,6 +95,12 @@ posixOnly("harness-owned compaction (every fake engine, window forced to 100k)",
     const ledger = readFileSync(join(h.home(), ".openmausbot", "usage", `${new Date().toISOString().slice(0, 7)}.jsonl`), "utf8")
       .split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.threadId === bot.threadId);
     expect(ledger.at(-1)).toMatchObject({ compacted: true, promptShape: { replayed: true } });
+    // the model summary is a harness call: booked once, under a fingerprint
+    // (only the Claude fake offers a one-shot; the others draft none)
+    const harnessRows = ledger.filter((r) => r.trigger?.kind === "harness");
+    expect(harnessRows).toHaveLength(engine.id === "claude" ? 1 : 0);
+    if (engine.id === "claude") expect(harnessRows[0]).toMatchObject({ trigger: { call: "compaction-summary" }, costUsd: 0.0012, input: 120 });
+    if (engine.id === "claude") expect(harnessRows[0].fingerprint).toMatch(/^[a-f0-9]{64}$/);
     // Claude keeps one process per thread; a reset must not land on the one
     // that still holds the whole thread
     if (engine.id === "claude") {

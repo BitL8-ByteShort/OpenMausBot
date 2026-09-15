@@ -2403,6 +2403,11 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     for (const name of names) expect(seen.env[name]).toBeUndefined();
   });
 
+  it("generate returns the one-shot's text with its usage and cost from the json result", async () => {
+    await create();
+    await expect(instance.generate?.("summarize")).resolves.toEqual({ text: "fake generated text", input: 120, output: 30, cachedInput: 20, costUsd: 0.0012 });
+  });
+
   it("declares safe same-provider permission review", async () => {
     await create();
     await expect(instance.reviewPermission?.("review this request")).resolves.toBe("fake generated text");

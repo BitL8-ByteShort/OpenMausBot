@@ -45,7 +45,7 @@ import * as checkpoints from "./checkpoints.ts";
 import { runCommand } from "./commands.ts";
 import { selectReplay, type ReplayEntry } from "./context-rebuild.ts";
 import { compactBudget, contextWindowFor, estimateTokens, shouldCompact } from "./context-budget.ts";
-import type { ModelCatalog } from "./contracts.ts";
+import type { ModelCatalog, ProviderInstance } from "./contracts.ts";
 import { composeSummary, deterministicSummary, foldPoint, MODEL_SUMMARY_PROMPT } from "./compaction-summary.ts";
 import { promptShape, stableSectionChanges, summarizeMetrics, type PromptShape } from "./metrics.ts";
 import { writeTurnToken } from "./turn-token.ts";
@@ -199,6 +199,7 @@ import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type CommsBus } from "./comms-visibility.ts";
 import { readMessageText, recallMessages, searchMessages, closeMessageDb, chatFollowups, cancelledChatFollowup, settleChatFollowups } from "./message-db.ts";
 import { claimRecallCrossings, recallCrossingLabel } from "./recall-disclosure.ts";
+import { runHarnessCall, type HarnessCallResult } from "./harness-calls.ts";
 
 /** A session_read answer competes with the transcript for the context
  * window; a computer-use turn's output can run to hundreds of KB. */
@@ -3525,10 +3526,13 @@ const compactedThreads = new Set<string>();
  * failure here never fails the turn (it runs on the old session instead).
  * The deterministic summary exists on every engine; a model summary is
  * added where the engine can draft one, bounded by a timeout. */
+type HarnessGenerate = (prompt: string, opts?: { cwd?: string }) => Promise<HarnessCallResult>;
 interface CompactionPlan {
   bot: BotRecord;
   task: TaskRecord;
-  generateText?: (prompt: string, opts?: { cwd?: string }) => Promise<string>;
+  generate?: HarnessGenerate;
+  selection: ModelSelection;
+  driverKind: string;
   fold: ReturnType<typeof foldPoint> & object;
   tokensBefore: number;
   budget: number;
@@ -3538,7 +3542,14 @@ interface CompactionPlan {
 /** Decide synchronously — the common case is "nothing to do" and must not
  * yield the event loop, because startTurn's ordering up to dispatch is what
  * thread capacity and queued threads rely on. */
-function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: (prompt: string, opts?: { cwd?: string }) => Promise<string> }): CompactionPlan | null {
+/** The one-shot an instance offers, with cost where it reports one. */
+function harnessGenerateFor(instance: { generateText?: ProviderInstance["generateText"]; generate?: ProviderInstance["generate"] }): HarnessGenerate | undefined {
+  if (instance.generate) return instance.generate.bind(instance);
+  const plain = instance.generateText?.bind(instance);
+  return plain ? async (prompt, opts) => ({ text: await plain(prompt, opts) }) : undefined;
+}
+
+function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: ProviderInstance["generateText"]; generate?: ProviderInstance["generate"] }): CompactionPlan | null {
   if (!contextAutoCompact(cfg)) return null;
   const selection = task.modelSelection ?? bot.modelSelection;
   const { contextWindow } = contextWindowFor(selection.model, instance.models, task.usage?.context?.window);
@@ -3559,7 +3570,7 @@ function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: Mo
   const history = since.at(-1)?.role === "user" ? since.slice(0, -1) : since;
   const fold = foldPoint(history);
   if (!fold) return null;
-  return { bot, task, generateText: instance.generateText?.bind(instance), fold, tokensBefore: contextTokens || lastTurnInput || estimated, budget, contextWindow };
+  return { bot, task, generate: harnessGenerateFor(instance), selection, driverKind: registry.get(selection.instanceId)?.driverKind ?? "unknown", fold, tokensBefore: contextTokens || lastTurnInput || estimated, budget, contextWindow };
 }
 
 /** Write the record and mark the task; the only awaited part is the
@@ -3568,11 +3579,26 @@ async function performCompaction(plan: CompactionPlan): Promise<void> {
   const { bot, task, fold } = plan;
   const deterministic = deterministicSummary(fold.folded, bot.name);
   let model: string | undefined;
-  if (plan.generateText) {
-    model = await Promise.race([
-      plan.generateText(MODEL_SUMMARY_PROMPT(fold.folded, bot.name), { ...(task.cwd ? { cwd: task.cwd } : {}) }).then((text: string) => text.trim() || undefined),
+  const generate = plan.generate;
+  if (generate) {
+    // a harness-initiated model call: fingerprinted, budget-checked, booked
+    // (Phase 1 part 2), so a retried dispatch never drafts or pays twice
+    const outcome = await Promise.race([
+      runHarnessCall(DATA_DIR, {
+        kind: "compaction-summary",
+        botId: bot.id,
+        botName: bot.name,
+        threadId: task.threadId,
+        turnKey: fold.folded.at(-1)!.id,
+        prompt: MODEL_SUMMARY_PROMPT(fold.folded, bot.name),
+        instanceId: plan.selection.instanceId,
+        driverKind: plan.driverKind,
+        model: plan.selection.model,
+        call: (prompt) => generate(prompt, { ...(task.cwd ? { cwd: task.cwd } : {}) }),
+      }, { budgetExhausted: () => Boolean(spendState(cfg, DATA_DIR)?.exceeded) }),
       new Promise<undefined>((resolve) => { const t = setTimeout(() => resolve(undefined), 20_000); t.unref?.(); }),
     ]).catch(() => undefined);
+    model = outcome && "text" in outcome ? outcome.text.trim() || undefined : undefined;
   }
   appendCompactionRecord(task.threadId, {
     summary: composeSummary(model, deterministic),
