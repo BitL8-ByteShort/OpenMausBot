@@ -41,16 +41,16 @@ describe("buildRecall", () => {
     const other = store.createTask(bot.id, "Deploy notes", false)!;
     const room = store.createGroup("Ops", [bot.id]);
     writeFileSync(join(ensureWorkspace(bot.id), "MEMORY.md"), "- 2026-09-01 · the deploy password hint is blue-falcon\n");
-    insertMessage(other.threadId, msg("m1", "the deploy runs at noon", { role: "bot" }));
-    insertMessage(room.threadId, msg("m2", "deploy freeze on Fridays"));
+    insertMessage(other.threadId, msg("m1", "the deploy password rotates at noon", { role: "bot" }));
+    insertMessage(room.threadId, msg("m2", "deploy password freeze on Fridays"));
     insertMessage(bot.threadId, msg("m3", "deploy deploy deploy in the current thread"));
     const block = (await buildRecall(store, { botId: bot.id, botName: "Scout", threadId: bot.threadId, query: "what is the deploy password hint", includeConversations: true, freshSession: false, captures }))!;
     expect(block.text).toContain("[1] MEMORY.md");
     expect(block.text).toContain("blue-falcon");
     expect(block.text).toContain('chat "Deploy notes"');
     expect(block.text).toContain('room "Ops"');
-    expect(block.text).toContain("Scout: the deploy runs at noon");
-    expect(block.text).toContain("User: deploy freeze");
+    expect(block.text).toContain("Scout: the deploy password rotates at noon");
+    expect(block.text).toContain("User: deploy password freeze");
     expect(block.text).toContain('capture "ChatGPT"');
     expect(block.text).not.toContain("current thread");
     expect(block.counts).toEqual({ notes: 1, conversations: 2, captures: 1 });
@@ -74,6 +74,18 @@ describe("buildRecall", () => {
     expect(block.refs).toEqual([]);
     // and a resumed session with nothing to search gets nothing at all
     expect(await buildRecall(store, { botId: bot.id, botName: "Scout", threadId: bot.threadId, query: null, includeConversations: true, freshSession: false })).toBeNull();
+  });
+
+  it("ignores a note that shares only one common word with a long question", async () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const other = store.createTask(bot.id, "Chores", false)!;
+    insertMessage(other.threadId, msg("m1", "please reply when the laundry is done", { role: "user" }));
+    writeFileSync(join(ensureWorkspace(bot.id), "MEMORY.md"), "- 2026-09-01 · the person likes a warm reply\n");
+    expect(await buildRecall(store, { botId: bot.id, botName: "Scout", threadId: bot.threadId, query: "Create a file called notes.txt and reply in one short sentence", includeConversations: true, freshSession: false })).toBeNull();
+    // two shared terms is a match
+    const block = await buildRecall(store, { botId: bot.id, botName: "Scout", threadId: bot.threadId, query: "is the laundry done, reply please", includeConversations: true, freshSession: false });
+    expect(block?.text).toContain("laundry");
   });
 
   it("leaves other conversations out when asked (room turns) and survives a missing workspace", async () => {

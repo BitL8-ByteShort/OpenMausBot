@@ -36,6 +36,8 @@ export interface SupamausClient {
 export const SUPAMAUS_URL = "http://127.0.0.1:19741";
 export const SUPAMAUS_TOKEN_PATH = join(homedir(), "Library", "Application Support", "SupaMaus", "server-token");
 const HISTORY_LIMIT = 200;
+/** From this many query terms on, a hit must share two of them. */
+export const MIN_TERMS_QUERY = 3;
 const TEXT_CHARS = 300;
 
 interface HistoryItem {
@@ -132,12 +134,15 @@ export function supamausClient(opts: {
   const rank = (hits: readonly CaptureHit[], query: string, limit: number): CaptureHit[] => {
     const terms = captureTerms(query);
     if (!terms.length) return [];
+    // one shared word out of many is a coincidence, not a match: a question
+    // of several terms must share at least two with a capture
+    const minimum = terms.length >= MIN_TERMS_QUERY ? 2 : 1;
     return hits
       .map((hit) => {
         const haystack = `${hit.app} ${hit.title} ${hit.text}`.toLowerCase();
         return { hit, score: terms.filter((term) => haystack.includes(term)).length };
       })
-      .filter((entry) => entry.score > 0)
+      .filter((entry) => entry.score >= minimum)
       .sort((a, b) => b.score - a.score || b.hit.at - a.hit.at)
       .slice(0, limit)
       .map((entry) => entry.hit);

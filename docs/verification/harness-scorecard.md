@@ -80,11 +80,11 @@ compare between builds are **input at turn 10** and **total tokens over the
 ten turns**. The script prints both.
 
 **T6 — recall (two threads, one bot; Phase 1 part 2).** New bot. Send:
-> Remember this for later: our deploy password hint is 'blue-falcon-42'.
+> Remember this for later: our release codename is 'blue-falcon-42'.
 > Reply with just OK.
 
 Then open a **new task** on the same bot and send:
-> What is our deploy password hint? Reply with the hint only, in one line,
+> What is our release codename? Reply with the codename only, in one line,
 > without running any tools.
 
 Correct when the reply says `blue-falcon-42`. On the branch a chip

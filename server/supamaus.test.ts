@@ -61,6 +61,8 @@ describe("supamausClient", () => {
     expect(await client.search("deploy password")).toMatchObject([{ id: "B" }]);
     // short query words are not terms
     expect(await client.search("a of")).toEqual([]);
+    // one shared common word out of a long question is not a match
+    expect(await client.search("Create a file and reply in one short sentence about the dashboard")).toEqual([]);
   });
 
   it("serves a second read from the cache and lists recent captures newest first", async () => {

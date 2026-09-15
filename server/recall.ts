@@ -33,6 +33,17 @@ export interface RecallInput {
 /** FTS5 brackets the matched terms in a snippet; the block reads better plain. */
 const plain = (snippet: string) => snippet.replace(/\[([^[\]]+)\]/g, "$1");
 
+/** How many distinct query terms a snippet matched (the bracketed ones). */
+const matchedTerms = (snippet: string) => new Set([...snippet.matchAll(/\[([^[\]]+)\]/g)].map((m) => m[1]!.toLowerCase())).size;
+
+/** A question of several words that shares only one with a note is a
+ * coincidence ("reply", "file"), not recall: from three query terms on, a
+ * hit must match at least two. Mirrors the capture rule in supamaus.ts. */
+function enoughMatches(query: string, snippet: string): boolean {
+  const terms = query.split(/\s+/).filter((t) => t.replace(/[^\p{L}\p{N}]/gu, "").length >= 3).length;
+  return terms < 3 || matchedTerms(snippet) >= 2;
+}
+
 const MEMORY_HITS = 4;
 const CONVERSATION_HITS = 4;
 const CAPTURE_HITS = 3;
@@ -53,7 +64,7 @@ function sourceLabel(store: RecallStore, botId: string, threadId: string): strin
 function memoryPassages(input: RecallInput): RecallPassage[] {
   if (!input.query) return [];
   try {
-    return searchMemoryFiles(input.botId, input.query, MEMORY_HITS, { mode: "any" }).map((hit) => ({
+    return searchMemoryFiles(input.botId, input.query, MEMORY_HITS * 2, { mode: "any" }).filter((hit) => enoughMatches(input.query!, hit.snippet)).slice(0, MEMORY_HITS).map((hit) => ({
       source: "memory" as const,
       label: hit.file,
       at: hit.at,
@@ -69,7 +80,7 @@ function conversationPassages(store: RecallStore, input: RecallInput, userName: 
   if (!input.query || !input.includeConversations) return [];
   try {
     const threads = store.ownThreadIds(input.botId).filter((id) => id !== input.threadId);
-    return recallMessages(input.query, threads, CONVERSATION_HITS, { mode: "any" }).map((hit) => ({
+    return recallMessages(input.query, threads, CONVERSATION_HITS * 2, { mode: "any" }).filter((hit) => enoughMatches(input.query!, hit.snippet)).slice(0, CONVERSATION_HITS).map((hit) => ({
       source: "conversation" as const,
       label: sourceLabel(store, input.botId, hit.threadId),
       at: hit.at,
