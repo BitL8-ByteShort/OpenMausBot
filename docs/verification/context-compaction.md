@@ -2,8 +2,9 @@
 
 ## Sub-features
 
-- Keep the last turn's input tokens per task (`usage.lastInput`): the context
-  the next turn will carry.
+- Read the context the next turn will carry from main's per-task reading
+  (`usage.context.tokens`, what filled the window on the last model call),
+  falling back to the last turn's input, then to a byte estimate.
 - A budget per task: `context.compactAt` in config.json, a share of the
   model's window below 1 (default 0.6) or an absolute token count; the window
   from the catalog, else a pattern over the model id, else 128,000.

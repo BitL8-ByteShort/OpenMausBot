@@ -3541,20 +3541,25 @@ interface CompactionPlan {
 function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: (prompt: string, opts?: { cwd?: string }) => Promise<string> }): CompactionPlan | null {
   if (!contextAutoCompact(cfg)) return null;
   const selection = task.modelSelection ?? bot.modelSelection;
-  const { contextWindow } = contextWindowFor(selection.model, instance.models);
+  const { contextWindow } = contextWindowFor(selection.model, instance.models, task.usage?.context?.window);
   const budget = compactBudget(contextCompactAt(cfg), contextWindow);
   const messages = store.activePath(task.threadId);
   const record = [...messages].reverse().find((m) => m.kind === "compaction" && m.compaction)?.compaction;
   const keptFrom = record ? messages.findIndex((m) => m.id === record.firstKeptId) : -1;
   const since = keptFrom >= 0 ? messages.slice(keptFrom) : messages;
   const estimated = estimateTokens(since.reduce((n, m) => n + Buffer.byteLength(m.text ?? "", "utf8"), 0));
-  if (!shouldCompact({ lastInput: task.usage?.lastInput, estimatedTokens: estimated, budget })) return null;
+  // the size is what filled the window on the last model call (main's
+  // usage.context), not the turn's summed input: a tool-using turn makes
+  // several calls and its sum overstates the window by that factor
+  const contextTokens = task.usage?.context?.tokens;
+  const lastTurnInput = task.usage?.lastTurn?.input;
+  if (!shouldCompact({ contextTokens, lastTurnInput, estimatedTokens: estimated, budget })) return null;
   // the message that starts THIS turn is already in the transcript; it is
   // not an exchange to keep, so fold the history before it
   const history = since.at(-1)?.role === "user" ? since.slice(0, -1) : since;
   const fold = foldPoint(history);
   if (!fold) return null;
-  return { bot, task, generateText: instance.generateText?.bind(instance), fold, tokensBefore: task.usage?.lastInput || estimated, budget, contextWindow };
+  return { bot, task, generateText: instance.generateText?.bind(instance), fold, tokensBefore: contextTokens || lastTurnInput || estimated, budget, contextWindow };
 }
 
 /** Write the record and mark the task; the only awaited part is the
@@ -15096,7 +15101,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         by = "harness";
         if (!summary) return json(res, 502, { error: "the engine returned an empty summary" });
       }
-      const tokensBefore = task.usage?.lastInput || Math.ceil(history.reduce((n, msg) => n + Buffer.byteLength(msg.text ?? "", "utf8"), 0) / 4);
+      const tokensBefore = task.usage?.context?.tokens || task.usage?.lastTurn?.input || Math.ceil(history.reduce((n, msg) => n + Buffer.byteLength(msg.text ?? "", "utf8"), 0) / 4);
       const message = appendCompactionRecord(task.threadId, { summary, by, tokensBefore, foldedThroughId: history.at(-1)!.id });
       // the next turn starts a fresh session on the record (Phase 1)
       store.patchTask(bot.id, task.threadId, { contextReset: true });

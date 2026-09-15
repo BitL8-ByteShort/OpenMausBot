@@ -13,8 +13,8 @@ describe("contextWindowFor", () => {
     const catalog = { default: "m", options: [{ id: "m", label: "m", contextWindow: 64_000 }] };
     expect(contextWindowFor("m", catalog)).toEqual({ contextWindow: 64_000, source: "catalog" });
     expect(contextWindowFor("claude-sonnet-5")).toEqual({ contextWindow: 200_000, source: "pattern" });
-    expect(contextWindowFor("gpt-5.6-sol")).toEqual({ contextWindow: 200_000, source: "pattern" });
-    expect(contextWindowFor("ollama/qwen3:8b")).toEqual({ contextWindow: 32_000, source: "pattern" });
+    expect(contextWindowFor("gpt-5.6-sol")).toEqual({ contextWindow: 272_000, source: "pattern" });
+    expect(contextWindowFor("claude-sonnet-5", undefined, 250_000)).toEqual({ contextWindow: 250_000, source: "reported" });
     expect(contextWindowFor("mystery-model")).toEqual({ contextWindow: 128_000, source: "default" });
     expect(contextWindowFor(undefined)).toEqual({ contextWindow: 128_000, source: "default" });
   });
@@ -35,11 +35,13 @@ describe("compactBudget", () => {
 });
 
 describe("shouldCompact", () => {
-  it("trusts the reported input and falls back to the estimate only when nothing was reported", () => {
-    expect(shouldCompact({ lastInput: 130_000, estimatedTokens: 0, budget: 120_000 })).toBe(true);
-    expect(shouldCompact({ lastInput: 100_000, estimatedTokens: 500_000, budget: 120_000 })).toBe(false);
-    expect(shouldCompact({ lastInput: undefined, estimatedTokens: 130_000, budget: 120_000 })).toBe(true);
-    expect(shouldCompact({ lastInput: 0, estimatedTokens: 130_000, budget: 120_000 })).toBe(true);
+  it("trusts the window reading, then the last turn's input, then the estimate", () => {
+    expect(shouldCompact({ contextTokens: 130_000, lastTurnInput: 260_000, estimatedTokens: 0, budget: 120_000 })).toBe(true);
+    // a tool-using turn sums two model calls: its input can be twice the window fill
+    expect(shouldCompact({ contextTokens: 64_000, lastTurnInput: 127_000, estimatedTokens: 0, budget: 120_000 })).toBe(false);
+    expect(shouldCompact({ lastTurnInput: 130_000, estimatedTokens: 0, budget: 120_000 })).toBe(true);
+    expect(shouldCompact({ estimatedTokens: 130_000, budget: 120_000 })).toBe(true);
+    expect(shouldCompact({ contextTokens: 0, lastTurnInput: 0, estimatedTokens: 100, budget: 120_000 })).toBe(false);
   });
 });
 
