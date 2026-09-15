@@ -5817,8 +5817,10 @@ async function startTurn(
   // session (first turn, engine switch, rewind, compaction) also hears what
   // the bot was doing recently. Never fails the turn; nothing on a nod.
   const willResume = !rewound && !(fresh || contextReset) && !externalContextMarker;
-  const recall = recallAuto(cfg) && !opts?.cardContinuation
-    ? await buildRecall(store, {
+  let recall: RecallBlock | null = null;
+  try {
+    recall = recallAuto(cfg) && !opts?.cardContinuation
+      ? buildRecall(store, {
         botId: bot.id,
         botName: bot.name,
         threadId,
@@ -5827,8 +5829,11 @@ async function startTurn(
         freshSession: !willResume,
         ...(recallCaptures(cfg) ? { captures: supamaus } : {}),
         ...(recallMaxChars(cfg) ? { maxChars: recallMaxChars(cfg)! } : {}),
-      }, cfg.profile?.name?.trim() || "User").catch(() => null)
-    : null;
+      }, cfg.profile?.name?.trim() || "User")
+      : null;
+  } catch (error) {
+    console.error(`[omb-recall] skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
   recallByThread.delete(threadId);
   if (recall) beginRecall(threadId, recall);
   const { turnText, resume } = buildTurnContext({
@@ -7980,9 +7985,14 @@ async function runGroupMemberTurn(
   // message in the room. Other conversations stay out: recall from a private
   // thread into a room is the bot's own, disclosed session_search.
   const latestRoomText = [...store.messagesFor(threadId)].reverse().find((m) => m.role === "user" && m.kind === "text" && m.text)?.text ?? "";
-  const roomRecall = recallAuto(cfg) && !cardContinuation
-    ? await buildRecall(store, { botId: bot.id, botName: bot.name, threadId, query: recallQuery(latestRoomText), includeConversations: false, freshSession: false, ...(recallMaxChars(cfg) ? { maxChars: recallMaxChars(cfg)! } : {}) }).catch(() => null)
-    : null;
+  let roomRecall: RecallBlock | null = null;
+  try {
+    roomRecall = recallAuto(cfg) && !cardContinuation
+      ? buildRecall(store, { botId: bot.id, botName: bot.name, threadId, query: recallQuery(latestRoomText), includeConversations: false, freshSession: false, ...(recallMaxChars(cfg) ? { maxChars: recallMaxChars(cfg)! } : {}) })
+      : null;
+  } catch (error) {
+    console.error(`[omb-recall] room skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
   recallByThread.delete(threadId);
   if (roomRecall) beginRecall(threadId, roomRecall, { botId: bot.id, name: bot.name, color: bot.color });
   const text = `${roomRecall ? `${roomRecall.text}\n\n` : ""}${roomContext}\n\n(Reply to the conversation above as ${bot.name}.)${learnBlock}${cardContinuation ? `\n\n${cardContinuation}` : ""}${coordinationReminder}`;

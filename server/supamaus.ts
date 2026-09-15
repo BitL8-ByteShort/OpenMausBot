@@ -25,6 +25,12 @@ export interface SupamausClient {
   search(query: string, limit?: number): Promise<CaptureHit[]>;
   /** Captures newer than `withinMs`, newest first. */
   recent(withinMs: number, limit?: number): Promise<CaptureHit[]>;
+  /** Start a background refresh when the cache is stale; never waits. The
+   * turn path must not yield before dispatch (thread capacity and queued
+   * threads rely on its ordering), so it reads the cache and primes it. */
+  prime(): void;
+  searchNow(query: string, limit?: number): CaptureHit[];
+  recentNow(withinMs: number, limit?: number): CaptureHit[];
 }
 
 export const SUPAMAUS_URL = "http://127.0.0.1:19741";
@@ -123,23 +129,43 @@ export function supamausClient(opts: {
     }
   };
 
+  const rank = (hits: readonly CaptureHit[], query: string, limit: number): CaptureHit[] => {
+    const terms = captureTerms(query);
+    if (!terms.length) return [];
+    return hits
+      .map((hit) => {
+        const haystack = `${hit.app} ${hit.title} ${hit.text}`.toLowerCase();
+        return { hit, score: terms.filter((term) => haystack.includes(term)).length };
+      })
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score || b.hit.at - a.hit.at)
+      .slice(0, limit)
+      .map((entry) => entry.hit);
+  };
+  const newest = (hits: readonly CaptureHit[], withinMs: number, limit: number): CaptureHit[] => {
+    const since = now() - withinMs;
+    return hits.filter((hit) => hit.at >= since).sort((a, b) => b.at - a.at).slice(0, limit);
+  };
+  let refreshing: Promise<CaptureHit[]> | null = null;
+  const cached = (): CaptureHit[] => (cache && now() - cache.at < cacheMs ? cache.hits : cache?.hits ?? []);
+
   return {
     enabled: () => token() !== null,
     async search(query, limit = 4) {
-      const terms = captureTerms(query);
-      if (!terms.length) return [];
-      const scored = (await history())
-        .map((hit) => {
-          const haystack = `${hit.app} ${hit.title} ${hit.text}`.toLowerCase();
-          return { hit, score: terms.filter((term) => haystack.includes(term)).length };
-        })
-        .filter((entry) => entry.score > 0)
-        .sort((a, b) => b.score - a.score || b.hit.at - a.hit.at);
-      return scored.slice(0, limit).map((entry) => entry.hit);
+      return rank(await history(), query, limit);
     },
     async recent(withinMs, limit = 3) {
-      const since = now() - withinMs;
-      return (await history()).filter((hit) => hit.at >= since).sort((a, b) => b.at - a.at).slice(0, limit);
+      return newest(await history(), withinMs, limit);
+    },
+    prime() {
+      if (refreshing || (cache && now() - cache.at < cacheMs) || token() === null) return;
+      refreshing = history().finally(() => { refreshing = null; });
+    },
+    searchNow(query, limit = 4) {
+      return rank(cached(), query, limit);
+    },
+    recentNow(withinMs, limit = 3) {
+      return newest(cached(), withinMs, limit);
     },
   };
 }

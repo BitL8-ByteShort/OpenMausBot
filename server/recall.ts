@@ -81,9 +81,15 @@ function conversationPassages(store: RecallStore, input: RecallInput, userName: 
   }
 }
 
-async function capturePassages(input: RecallInput): Promise<RecallPassage[]> {
+function capturePassages(input: RecallInput): RecallPassage[] {
   if (!input.query || !input.captures?.enabled()) return [];
-  const hits = await input.captures.search(input.query, CAPTURE_HITS).catch(() => []);
+  let hits: ReturnType<SupamausClient["searchNow"]> = [];
+  try {
+    input.captures.prime();
+    hits = input.captures.searchNow(input.query, CAPTURE_HITS);
+  } catch {
+    hits = [];
+  }
   return hits.map((hit) => ({
     source: "capture" as const,
     label: `capture ${JSON.stringify(hit.app || hit.title || "screen")}`,
@@ -95,7 +101,7 @@ async function capturePassages(input: RecallInput): Promise<RecallPassage[]> {
 
 const short = (text: string) => (text.length > RECENT_TEXT_CHARS ? `${text.slice(0, RECENT_TEXT_CHARS)}…` : text);
 
-async function recentItems(store: RecallStore, input: RecallInput): Promise<RecentItem[]> {
+function recentItems(store: RecallStore, input: RecallInput): RecentItem[] {
   if (!input.freshSession) return [];
   const now = input.now?.() ?? Date.now();
   const items: RecentItem[] = [];
@@ -131,15 +137,21 @@ async function recentItems(store: RecallStore, input: RecallInput): Promise<Rece
     // logs are optional
   }
   if (input.captures?.enabled()) {
-    const recent = await input.captures.recent(RECENT_CAPTURE_MS).catch(() => []);
-    for (const hit of recent) items.push({ label: `capture ${JSON.stringify(hit.app || "screen")} (${hit.id})`, text: short(hit.text || hit.title || "(no text)") });
+    try {
+      input.captures.prime();
+      for (const hit of input.captures.recentNow(RECENT_CAPTURE_MS)) items.push({ label: `capture ${JSON.stringify(hit.app || "screen")} (${hit.id})`, text: short(hit.text || hit.title || "(no text)") });
+    } catch {
+      // captures are optional
+    }
   }
   return items;
 }
 
-/** The block for this turn, or null when there is nothing worth saying. */
-export async function buildRecall(store: RecallStore, input: RecallInput, userName = "User"): Promise<RecallBlock | null> {
-  const [captures, recent] = await Promise.all([capturePassages(input), recentItems(store, input)]);
-  const passages = [...memoryPassages(input), ...conversationPassages(store, input, userName), ...captures];
-  return renderRecallBlock(passages, recent, input.maxChars ? { maxChars: input.maxChars } : {});
+/** The block for this turn, or null when there is nothing worth saying.
+ * Synchronous on purpose: it runs on the turn path before dispatch, whose
+ * ordering thread capacity and queued threads rely on; the only remote
+ * source (SupaMaus) is read from its cache and refreshed in the background. */
+export function buildRecall(store: RecallStore, input: RecallInput, userName = "User"): RecallBlock | null {
+  const passages = [...memoryPassages(input), ...conversationPassages(store, input, userName), ...capturePassages(input)];
+  return renderRecallBlock(passages, recentItems(store, input), input.maxChars ? { maxChars: input.maxChars } : {});
 }

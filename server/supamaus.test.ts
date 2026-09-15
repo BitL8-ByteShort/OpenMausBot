@@ -73,6 +73,23 @@ describe("supamausClient", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("reads the cache synchronously and primes it in the background, so the turn path never waits", async () => {
+    const { fetchImpl, calls } = stub(() => new Response(JSON.stringify(history)));
+    const now = Date.parse("2026-09-15T06:00:00Z");
+    const client = supamausClient({ tokenPath: tokenFile("t"), fetch: fetchImpl, now: () => now });
+    // cold: nothing yet, one refresh started
+    expect(client.searchNow("linear")).toEqual([]);
+    client.prime();
+    client.prime();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toHaveLength(1);
+    expect(client.searchNow("linear").map((h) => h.id)).toEqual(["A", "C"]);
+    expect(client.recentNow(60 * 60 * 1000).map((h) => h.id)).toEqual(["A"]);
+    // warm: prime is a no-op until the cache ages
+    client.prime();
+    expect(calls).toHaveLength(1);
+  });
+
   it("gives up quietly when the server is slow or answers garbage", async () => {
     const slow = stub(() => new Promise<Response>(() => {}));
     const client = supamausClient({ tokenPath: tokenFile("t"), fetch: slow.fetchImpl, timeoutMs: 50 });

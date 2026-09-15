@@ -16,10 +16,15 @@ import { ensureWorkspace, WORKSPACES_DIR } from "./workspace.ts";
 const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-sonnet-5" });
 const msg = (id: string, text: string, extra: Partial<Message> = {}): Message => ({ id, role: "user", kind: "text", text, at: Date.now(), ...extra });
 
+const found = [{ id: "CAP-1", at: Date.now(), app: "ChatGPT", title: "ChatGPT", text: "Fix the deploy password rotation" }];
+const fresh = [{ id: "CAP-2", at: Date.now(), app: "Safari", title: "Linear", text: "" }];
 const captures: SupamausClient = {
   enabled: () => true,
-  search: async () => [{ id: "CAP-1", at: Date.now(), app: "ChatGPT", title: "ChatGPT", text: "Fix the deploy password rotation" }],
-  recent: async () => [{ id: "CAP-2", at: Date.now(), app: "Safari", title: "Linear", text: "" }],
+  search: async () => found,
+  recent: async () => fresh,
+  prime: () => {},
+  searchNow: () => found,
+  recentNow: () => fresh,
 };
 
 describe("buildRecall", () => {
