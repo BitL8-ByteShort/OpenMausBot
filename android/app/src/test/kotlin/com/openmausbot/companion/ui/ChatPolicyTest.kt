@@ -613,6 +613,27 @@ class MessageActionsTest {
     }
 
     @Test
+    fun `a bubble earns its handle only when the tray would hold a control`() {
+        assertTrue(MessageActions.showsTray(message(Message.Kind.TEXT, "ls -la")))
+        assertTrue(MessageActions.showsTray(message(Message.Kind.UNKNOWN, "hello")))
+        // Your own text with no upload can be retried even when it is blank-only copy.
+        assertTrue(
+            MessageActions.showsTray(
+                Message(id = "u1", role = Message.Role.USER, kind = Message.Kind.TEXT, at = 0.0, text = "again"),
+            ),
+        )
+        // A tool chip, a screenshot, or attachment-only transport text: nothing to open.
+        assertFalse(MessageActions.showsTray(message(Message.Kind.ACTIVITY, "ran ls")))
+        assertFalse(MessageActions.showsTray(message(Message.Kind.SCREEN)))
+        assertFalse(MessageActions.showsTray(message(Message.Kind.TEXT, "   ")))
+        assertFalse(
+            MessageActions.showsTray(
+                message(Message.Kind.TEXT, """<attached-image path="/tmp/x.png" name="x.png" />"""),
+            ),
+        )
+    }
+
+    @Test
     fun `an approval card copies what it is asking to do`() {
         val card = OptionCard(
             title = "Run a command",

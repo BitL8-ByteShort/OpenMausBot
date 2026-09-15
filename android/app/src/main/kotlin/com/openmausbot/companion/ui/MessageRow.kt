@@ -147,6 +147,34 @@ fun MessageRow(
             horizontalAlignment = if (mine) Alignment.End else Alignment.Start,
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
+            // The controls behind the bubble's "…" handle — the same set the
+            // long-press menu offers minus reactions, which want the bigger
+            // targets. Empty for a bubble with nothing to copy or retry, and
+            // then no handle is drawn: a handle that opens nothing is a broken
+            // button.
+            val trayActions = buildList {
+                MessageActions.copyableText(message)?.let { text ->
+                    add(
+                        TrayAction("Copy", TrayIcons.ContentCopy) {
+                            scope.launch {
+                                clipboard.setClipEntry(
+                                    ClipEntry(ClipData.newPlainText(MESSAGE_CLIP_LABEL, text)),
+                                )
+                            }
+                        },
+                    )
+                    add(TrayAction("Select text", TrayIcons.SelectAll) { selectingText = text })
+                }
+                val editableText = MessageActions.editableText(message)
+                if (editableText != null && bot != null) {
+                    add(
+                        TrayAction("Edit and retry", TrayIcons.Edit, enabled = bot.busy != true) {
+                            editText = editableText
+                            editing = true
+                        },
+                    )
+                }
+            }
             MessageContent(
                 chat = chat,
                 message = message,
@@ -155,6 +183,11 @@ fun MessageRow(
                 openLink = openLink,
                 openAttachment = openAttachment,
                 openThread = openThread,
+                actions = if (trayActions.isEmpty()) {
+                    null
+                } else {
+                    { MessageActionTray(mirrored = mine, actions = trayActions) }
+                },
             )
 
             message.comm?.let {
@@ -395,9 +428,11 @@ private fun MessageContent(
     openLink: ((String, Message) -> Unit)?,
     openAttachment: ((DisplayedMessageAttachment, Message, DownloadedFile?) -> Unit)?,
     openThread: ((ThreadRef) -> Unit)?,
+    /** The "…" handle and its tray, drawn in the gutter beside a text bubble. */
+    actions: (@Composable () -> Unit)? = null,
 ) {
     when (message.kind) {
-        Message.Kind.TEXT -> TextBubble(chat.threadId, message, endsRun, openLink, openAttachment)
+        Message.Kind.TEXT -> TextBubble(chat.threadId, message, endsRun, openLink, openAttachment, actions)
         // A structured ask draws its own card: its answers are the model's
         // questions, not an allow/deny a tap could stand for.
         Message.Kind.OPTIONS -> if (QuestionCardRules.drawsQuestionCard(message)) {
@@ -413,7 +448,7 @@ private fun MessageContent(
         // show, show nothing — a placeholder saying "unsupported" is a worse gap
         // than the gap.
         Message.Kind.UNKNOWN -> if (!message.text.isNullOrEmpty()) {
-            TextBubble(chat.threadId, message, endsRun, openLink, openAttachment)
+            TextBubble(chat.threadId, message, endsRun, openLink, openAttachment, actions)
         }
     }
 }
@@ -425,6 +460,7 @@ private fun TextBubble(
     endsRun: Boolean,
     openLink: ((String, Message) -> Unit)?,
     openAttachment: ((DisplayedMessageAttachment, Message, DownloadedFile?) -> Unit)?,
+    actions: (@Composable () -> Unit)? = null,
 ) {
     val mine = message.role == Message.Role.USER
     val tail = TranscriptLayout.tail(message, endsRun)
@@ -447,13 +483,16 @@ private fun TextBubble(
     ) {
         // iOS spaces the far side with `Spacer(minLength:)`; a non-filling weight
         // lets the bubble shrink to its text while never crossing that gutter.
+        // The tray sits on the bubble's chin, clear of the tail below it.
+        val tailInset = if (bubble && endsRun) SpeechBubble.tailDrop() else 0.dp
         if (mine) Spacer(Modifier.width(56.dp))
+        if (mine && actions != null) Box(Modifier.padding(bottom = tailInset)) { actions() }
         Column(
             modifier = Modifier
                 .weight(1f, fill = false)
                 .widthIn(max = 640.dp)
                 // Room for the tail below, so the next row does not sit on it.
-                .padding(bottom = if (bubble && endsRun) SpeechBubble.tailDrop() else 0.dp)
+                .padding(bottom = tailInset)
                 .then(
                     if (bubble) {
                         Modifier
@@ -519,6 +558,7 @@ private fun TextBubble(
                 }
             }
         }
+        if (!mine && actions != null) Box(Modifier.padding(bottom = tailInset)) { actions() }
         if (!mine) Spacer(Modifier.width(44.dp))
     }
 }
