@@ -1692,6 +1692,37 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     expect(completed.map((e) => e.cost)).toEqual([0.01, 0.01]);
   });
 
+  it("evicts the longest-idle live session when the process cap leaves no room for a new thread (F13)", async () => {
+    await create();
+    const dump = join(scratch, "dump-evict.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    process.env.FAKE_CLAUDE_DUMP_EACH_TURN = "1";
+    const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-evict-a", text: "one" });
+      await recorder.until((e) => e.type === "turn.completed");
+      const pidA = JSON.parse(readFileSync(dump, "utf8")).pid as number;
+      const second = await instance.adapter.sendTurn({ threadId: "t-evict-b", text: "two" });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+      const pidB = JSON.parse(readFileSync(dump, "utf8")).pid as number;
+      expect(pidB).not.toBe(pidA);
+      expect(alive(pidA) && alive(pidB)).toBe(true);
+      // two idle processes fill the cap: a third thread's turn must not be
+      // refused; the longest-idle session (a) makes room, b stays
+      procs.setProcessCap(procs.liveCliCount());
+      const third = await instance.adapter.sendTurn({ threadId: "t-evict-c", text: "three" });
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === third.turnId);
+      const seen = JSON.parse(readFileSync(dump, "utf8"));
+      expect(seen.prompt.message.content).toBe("three");
+      expect([pidA, pidB]).not.toContain(seen.pid);
+      await expect.poll(() => alive(pidA), { timeout: 8_000 }).toBe(false);
+      expect(alive(pidB)).toBe(true);
+    } finally {
+      procs.setProcessCap(null);
+      delete process.env.FAKE_CLAUDE_DUMP_EACH_TURN;
+    }
+  });
+
   it("starts a new process when the harness asks for a session reset, even with a live one idle", async () => {
     await create();
     const dump = join(scratch, "dump-reset.json");
