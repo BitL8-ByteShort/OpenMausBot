@@ -59,7 +59,9 @@ describe("usage chip", () => {
     setLocale("pt-br");
     expect(usageDetail(usage)).toContain("entrada");
     expect(usageDetail(usage)).toContain("saída");
-    expect(usageChip(usage)).toContain("tok");
+    // cost is the headline on its own; the token unit shows when no cost is known
+    expect(usageChip({ ...usage, costUsd: null })).toContain("tok");
+    expect(usageChip(usage)).toBe("$0.02");
     expect(costCaption("subscription")).toBe("equivalente — está na sua assinatura, não é cobrado");
     expect(costCaption(undefined)).toBe("conforme informado pelo mecanismo");
   });
