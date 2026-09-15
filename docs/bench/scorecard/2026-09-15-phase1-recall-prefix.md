@@ -132,6 +132,22 @@ passed 23/24; by kind: conversation 9/10, memory 5/5, log 1/1, corrected 3/3, mi
 | T9 filter-off | 1 | claude | 7.6 | 92,368 | 45,599 | 1 | yes |
 | T9 filter-on | 1 | claude | 6.8 | 98,265 | 45,560 | 1 | yes |
 
+## T10 — a standing rule across a compaction (part 4, goal recitation)
+
+Twelve turns of T5's growing file, with "begin every reply with the word LANTERN" given at turn one.
+Correct = the reply starts with LANTERN and gives the count. Three runs, one after the other:
+
+| Run | Kept the rule | Compactions (input drops) | Input at turn 12 |
+| --- | --- | --- | --- |
+| branch, recitation on | **12/12** | turn 9 (128k → 96k) | 131,580 |
+| branch, recitation off (`context.recite: false`) | 11/12 — lost the rule at turn 12, the turn right after the second compaction (127k → 97k) | turns 8 and 12 | 96,979 |
+| main (no compaction) | 12/12 | none; input climbs to 173,949 | 173,949 |
+
+This is the case recitation exists for: after a compaction the rule lives only inside the summary,
+and the second time round the model dropped it. With the first request restated in the turn text
+after every compaction, all twelve replies kept it, at the cost of about 60 tokens on those turns.
+Main keeps the rule only because it never compacts, and pays 174k input by turn 12.
+
 ## Reading the numbers honestly
 
 - The recall set is where parts 2–3 show: eight more cases answered from the bot's own notes and
