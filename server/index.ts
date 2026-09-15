@@ -3525,8 +3525,21 @@ const compactedThreads = new Set<string>();
  * failure here never fails the turn (it runs on the old session instead).
  * The deterministic summary exists on every engine; a model summary is
  * added where the engine can draft one, bounded by a timeout. */
-async function compactBeforeTurn(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: (prompt: string) => Promise<string> }): Promise<boolean> {
-  if (!contextAutoCompact(cfg)) return false;
+interface CompactionPlan {
+  bot: BotRecord;
+  task: TaskRecord;
+  generateText?: (prompt: string) => Promise<string>;
+  fold: ReturnType<typeof foldPoint> & object;
+  tokensBefore: number;
+  budget: number;
+  contextWindow: number;
+}
+
+/** Decide synchronously — the common case is "nothing to do" and must not
+ * yield the event loop, because startTurn's ordering up to dispatch is what
+ * thread capacity and queued threads rely on. */
+function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: (prompt: string) => Promise<string> }): CompactionPlan | null {
+  if (!contextAutoCompact(cfg)) return null;
   const selection = task.modelSelection ?? bot.modelSelection;
   const { contextWindow } = contextWindowFor(selection.model, instance.models);
   const budget = compactBudget(contextCompactAt(cfg), contextWindow);
@@ -3535,17 +3548,24 @@ async function compactBeforeTurn(bot: BotRecord, task: TaskRecord, instance: { m
   const keptFrom = record ? messages.findIndex((m) => m.id === record.firstKeptId) : -1;
   const since = keptFrom >= 0 ? messages.slice(keptFrom) : messages;
   const estimated = estimateTokens(since.reduce((n, m) => n + Buffer.byteLength(m.text ?? "", "utf8"), 0));
-  if (!shouldCompact({ lastInput: task.usage?.lastInput, estimatedTokens: estimated, budget })) return false;
+  if (!shouldCompact({ lastInput: task.usage?.lastInput, estimatedTokens: estimated, budget })) return null;
   // the message that starts THIS turn is already in the transcript; it is
   // not an exchange to keep, so fold the history before it
   const history = since.at(-1)?.role === "user" ? since.slice(0, -1) : since;
   const fold = foldPoint(history);
-  if (!fold) return false;
+  if (!fold) return null;
+  return { bot, task, generateText: instance.generateText?.bind(instance), fold, tokensBefore: task.usage?.lastInput || estimated, budget, contextWindow };
+}
+
+/** Write the record and mark the task; the only awaited part is the
+ * optional model summary, bounded by a timeout. */
+async function performCompaction(plan: CompactionPlan): Promise<void> {
+  const { bot, task, fold } = plan;
   const deterministic = deterministicSummary(fold.folded, bot.name);
   let model: string | undefined;
-  if (instance.generateText) {
+  if (plan.generateText) {
     model = await Promise.race([
-      instance.generateText(MODEL_SUMMARY_PROMPT(fold.folded, bot.name)).then((text: string) => text.trim() || undefined),
+      plan.generateText(MODEL_SUMMARY_PROMPT(fold.folded, bot.name)).then((text: string) => text.trim() || undefined),
       new Promise<undefined>((resolve) => { const t = setTimeout(() => resolve(undefined), 20_000); t.unref?.(); }),
     ]).catch(() => undefined);
   }
@@ -3553,13 +3573,12 @@ async function compactBeforeTurn(bot: BotRecord, task: TaskRecord, instance: { m
     summary: composeSummary(model, deterministic),
     by: "harness",
     firstKeptId: fold.firstKeptId,
-    tokensBefore: task.usage?.lastInput || estimated,
+    tokensBefore: plan.tokensBefore,
     foldedThroughId: fold.folded.at(-1)!.id,
   });
   store.patchTask(bot.id, task.threadId, { contextReset: true });
   compactedThreads.add(task.threadId);
-  console.error(`[omb-compaction] bot=${bot.id} thread=${task.threadId} folded=${fold.folded.length} tokensBefore=${task.usage?.lastInput ?? estimated} budget=${budget} window=${contextWindow}${model ? " model-summary" : ""}`);
-  return true;
+  console.error(`[omb-compaction] bot=${bot.id} thread=${task.threadId} folded=${fold.folded.length} tokensBefore=${plan.tokensBefore} budget=${plan.budget} window=${plan.contextWindow}${model ? " model-summary" : ""}`);
 }
 
 // ── Bench runs (item 0.8) ────────────────────────────────────────────────
@@ -5642,10 +5661,13 @@ async function startTurn(
   const skipTranscript = new Set<string>([userMessage.id, ...(opts?.excludeMessageIds ?? [])]);
   // Phase 1: fold the older part of an over-budget thread first, so the
   // replay below is built from the record. Never fails the turn.
-  try {
-    await compactBeforeTurn(bot, task, instance);
-  } catch (error) {
-    console.error(`[omb-compaction] skipped: ${error instanceof Error ? error.message : String(error)}`);
+  const compactionPlan = planCompaction(bot, task, instance);
+  if (compactionPlan) {
+    try {
+      await performCompaction(compactionPlan);
+    } catch (error) {
+      console.error(`[omb-compaction] skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   const contextReset = Boolean(store.taskByThread(bot.id, threadId)?.contextReset);
   const activeMessages = store.activePath(threadId);
