@@ -1,0 +1,51 @@
+// Context budget (Phase 1 part 1): how big a model's window is, how much of
+// it a thread may carry before the harness compacts, and whether the last
+// turn crossed that line — from the input tokens the engine reported, or an
+// estimate when it reported none.
+import { afterEach, describe, expect, it } from "vitest";
+
+import { compactBudget, contextWindowFor, estimateTokens, shouldCompact } from "./context-budget.ts";
+
+describe("contextWindowFor", () => {
+  afterEach(() => { delete process.env.OMB_CONTEXT_WINDOW; });
+
+  it("prefers the catalog, then a pattern over the model id, then a default", () => {
+    const catalog = { default: "m", options: [{ id: "m", label: "m", contextWindow: 64_000 }] };
+    expect(contextWindowFor("m", catalog)).toEqual({ contextWindow: 64_000, source: "catalog" });
+    expect(contextWindowFor("claude-sonnet-5")).toEqual({ contextWindow: 200_000, source: "pattern" });
+    expect(contextWindowFor("gpt-5.6-sol")).toEqual({ contextWindow: 200_000, source: "pattern" });
+    expect(contextWindowFor("ollama/qwen3:8b")).toEqual({ contextWindow: 32_000, source: "pattern" });
+    expect(contextWindowFor("mystery-model")).toEqual({ contextWindow: 128_000, source: "default" });
+    expect(contextWindowFor(undefined)).toEqual({ contextWindow: 128_000, source: "default" });
+  });
+
+  it("can be forced for tests", () => {
+    process.env.OMB_CONTEXT_WINDOW = "100000";
+    expect(contextWindowFor("claude-sonnet-5")).toEqual({ contextWindow: 100_000, source: "forced" });
+  });
+});
+
+describe("compactBudget", () => {
+  it("is a share of the window below 1, an absolute count otherwise, never under the floor", () => {
+    expect(compactBudget(undefined, 200_000)).toBe(120_000);
+    expect(compactBudget(0.5, 200_000)).toBe(100_000);
+    expect(compactBudget(50_000, 200_000)).toBe(50_000);
+    expect(compactBudget(0.6, 10_000)).toBe(8_000);
+  });
+});
+
+describe("shouldCompact", () => {
+  it("trusts the reported input and falls back to the estimate only when nothing was reported", () => {
+    expect(shouldCompact({ lastInput: 130_000, estimatedTokens: 0, budget: 120_000 })).toBe(true);
+    expect(shouldCompact({ lastInput: 100_000, estimatedTokens: 500_000, budget: 120_000 })).toBe(false);
+    expect(shouldCompact({ lastInput: undefined, estimatedTokens: 130_000, budget: 120_000 })).toBe(true);
+    expect(shouldCompact({ lastInput: 0, estimatedTokens: 130_000, budget: 120_000 })).toBe(true);
+  });
+});
+
+describe("estimateTokens", () => {
+  it("is bytes over four, rounded up", () => {
+    expect(estimateTokens(0)).toBe(0);
+    expect(estimateTokens(9)).toBe(3);
+  });
+});
