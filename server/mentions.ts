@@ -19,7 +19,7 @@ export interface Mention {
 /** What the harness knows about one entity, one line. Null = unknown. */
 export type MentionResolver = (mention: Mention) => string | null;
 
-const TOKEN = /(?:@([^\s\[\]]{1,80})\s+)?\[\[omb:([a-z]+):([\w.:@+~-]{1,200})\]\]/g;
+const TOKEN = /(?:@([^\s[\]]{1,80})\s+)?\[\[omb:([a-z]+):([\w.:@+~-]{1,200})\]\]/g;
 
 /** Every token in the text, in order. */
 export function findMentions(text: string): Mention[] {

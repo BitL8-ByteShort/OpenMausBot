@@ -2558,3 +2558,17 @@ describe("routine continuity", () => {
     })).toThrow(/continuity/i);
   });
 });
+
+describe("mention tokens in routine instructions (Phase 2 part 4)", () => {
+  it("resolves tokens at run time, so the turn sees ids and one line per entity", async () => {
+    const h = harness();
+    const manager = new RoutineManager({ ...h.options, file: h.options.file!.replace(/\.json$/, "-mentions.json"), resolveMentions: (text) => text.replace("@Scout [[omb:bot:b1]]", "Scout (bot b1)") + "\n\n[References: bot b1: Scout — idle]" });
+    const routine = manager.create({ name: "Nudge", prompt: "Ask @Scout [[omb:bot:b1]] for the numbers", botId: "maus-1", schedule: { type: "once", at: 10 } } as any);
+    manager.runNow(routine.id);
+    await manager.tick();
+    expect(h.started.at(-1)?.prompt).toContain("Ask Scout (bot b1) for the numbers");
+    expect(h.started.at(-1)?.prompt).toContain("[References: bot b1: Scout — idle]");
+    // the definition keeps the token, so a rename never breaks it
+    expect(manager.listRoutines()[0]?.prompt).toContain("[[omb:bot:b1]]");
+  });
+});
