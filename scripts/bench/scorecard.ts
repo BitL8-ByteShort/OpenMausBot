@@ -7,7 +7,7 @@
 //
 //   node --experimental-strip-types scripts/bench/scorecard.ts \
 //     --url http://127.0.0.1:PORT --data-dir DIR --label phase0 \
-//     [--engine claude] [--switch-to codex] [--out FILE.json]
+//     [--engine claude] [--switch-to codex] [--out FILE.json] [--skip-long]
 //
 // Point it at a harness started standalone (`OMB_DATA_DIR=DIR OMB_PORT=PORT
 // node --experimental-strip-types server/index.ts`): the packaged desktop
@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-interface Args { url: string; dataDir: string; label: string; engine: string; switchTo?: string; out?: string }
+interface Args { url: string; dataDir: string; label: string; engine: string; switchTo?: string; out?: string; skipLong?: boolean }
 
 function parseArgs(argv: string[]): Args {
   const a: Partial<Args> = { engine: "claude", label: "run" };
@@ -28,6 +28,7 @@ function parseArgs(argv: string[]): Args {
       case "--engine": a.engine = v!; i += 1; break;
       case "--switch-to": a.switchTo = v!; i += 1; break;
       case "--out": a.out = v!; i += 1; break;
+      case "--skip-long": a.skipLong = true; break;
       default: throw new Error(`unknown argument ${argv[i]}`);
     }
   }
@@ -147,6 +148,16 @@ async function main() {
   await turn("T3 big-output", 1, t3, engine,
     "Using one shell loop, write a file named log.txt with 200 lines of the form 'line N' (N from 1 to 200). Then print the whole file with cat. Then tell me how many lines it has, in one short sentence.",
     has("200"));
+  // T5 — a long thread: ten turns that each print a growing file, so the
+  // context grows every turn; the point is input at turn 10 and the total
+  if (!args.skipLong) {
+    const t5 = await bot(`Score T5 ${args.label}`, engine);
+    for (let n = 1; n <= 10; n += 1) {
+      await turn("T5 long-thread", n, t5, engine,
+        `Append 100 lines of the form 'entry N' (N continuing from where the file ends, starting at 1 if it does not exist) to log.txt with one shell loop, then print the whole file with cat, then reply with only the total number of lines in the file.`,
+        has(String(100 * n)));
+    }
+  }
   // T4 — a different engine takes over T1's thread and must know what happened
   if (args.switchTo) {
     const catalog = (await api("GET", "/api/instances")).instances.find((i: any) => i.instanceId === args.switchTo);
@@ -163,6 +174,12 @@ async function main() {
   console.log("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const r of results) {
     console.log(`| ${r.task} | ${r.turn} | ${r.engine} | ${(r.wallMs / 1000).toFixed(1)} | ${fmt(r.input)} | ${fmt(r.output)} | ${fmt(r.cachedInput)} | ${r.costUsd === null ? "—" : r.costUsd.toFixed(3)} | ${r.steps} | ${r.correct === null ? "—" : r.correct ? "yes" : "no"} | ${r.hookCoverage ?? "—"} |`);
+  }
+  const long = results.filter((r) => r.task === "T5 long-thread");
+  if (long.length) {
+    const total = long.reduce((n, r) => n + (r.input ?? 0) + (r.output ?? 0), 0);
+    const last = long.at(-1)!;
+    console.log(`\nT5: input at turn ${last.turn} = ${fmt(last.input)}; total tokens over ${long.length} turns = ${fmt(total)}; correct ${long.filter((r) => r.correct).length}/${long.length}`);
   }
 }
 
