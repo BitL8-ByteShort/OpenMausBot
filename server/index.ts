@@ -149,7 +149,7 @@ import {
   DATA_DIR,
   EVENTS_DIR,
   NATIVE_DIR,
-  customMcpServers, recallAuto, recallCaptures, recallMaxChars, contextRecite, boardDefaultBudgetUsd } from "./config.ts";
+  customMcpServers, recallAuto, recallCaptures, recallMaxChars, contextRecite, boardDefaultBudgetUsd, toolsDeferred } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
 import { registerEnginesBinDir } from "./engine-install.ts";
@@ -938,6 +938,7 @@ function agentsIntegration(
       // gate is on; the routes behind them refuse regardless.
       OMB_SHARED_COMPUTERS_ENABLED: sharedComputersEnabled(cfg) ? "1" : "0",
       OMB_BOARD_ENABLED: boardToolsEnabled ? "1" : "0",
+      OMB_TOOLS_DEFERRED: toolsDeferred(cfg) ? "1" : "0",
     },
   };
 }
