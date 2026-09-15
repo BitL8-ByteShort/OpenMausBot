@@ -7,7 +7,7 @@
 //
 //   node --experimental-strip-types scripts/bench/scorecard.ts \
 //     --url http://127.0.0.1:PORT --data-dir DIR --label phase0 \
-//     [--engine claude] [--switch-to codex] [--out FILE.json] [--skip-long | --only-long]
+//     [--engine claude] [--switch-to codex] [--out FILE.json] [--skip-long | --only-long] [--skip-recall]
 //
 // Point it at a harness started standalone (`OMB_DATA_DIR=DIR OMB_PORT=PORT
 // node --experimental-strip-types server/index.ts`): the packaged desktop
@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-interface Args { url: string; dataDir: string; label: string; engine: string; switchTo?: string; out?: string; skipLong?: boolean; onlyLong?: boolean }
+interface Args { url: string; dataDir: string; label: string; engine: string; switchTo?: string; out?: string; skipLong?: boolean; onlyLong?: boolean; skipRecall?: boolean }
 
 function parseArgs(argv: string[]): Args {
   const a: Partial<Args> = { engine: "claude", label: "run" };
@@ -30,6 +30,7 @@ function parseArgs(argv: string[]): Args {
       case "--out": a.out = v!; i += 1; break;
       case "--skip-long": a.skipLong = true; break;
       case "--only-long": a.onlyLong = true; break;
+      case "--skip-recall": a.skipRecall = true; break;
       default: throw new Error(`unknown argument ${argv[i]}`);
     }
   }
@@ -169,6 +170,19 @@ async function main() {
         has(String(100 * n)));
     }
   }
+  // T6 — recall (Phase 1 part 2): a fact told in one thread, asked for in a
+  // NEW task with no tools allowed. The harness's recall block is what makes
+  // this answerable on the branch; on main the bot has session_search only
+  if (!args.skipRecall) {
+    const t6 = await bot(`Score T6 ${args.label}`, engine);
+    await turn("T6 recall", 1, t6, engine,
+      "Remember this for later: our deploy password hint is 'blue-falcon-42'. Reply with just OK.",
+      has("ok"));
+    const opened = (await api("POST", `/api/bots/${t6.id}/tasks`, { title: "Later question" })).task;
+    await turn("T6 recall", 2, { id: t6.id, threadId: opened.threadId }, engine,
+      "What is our deploy password hint? Reply with the hint only, in one line, without running any tools.",
+      has("blue-falcon-42"));
+  }
   // T4 — a different engine takes over T1's thread and must know what happened
   if (args.switchTo) {
     const catalog = (await api("GET", "/api/instances")).instances.find((i: any) => i.instanceId === args.switchTo);
@@ -191,6 +205,8 @@ function report() {
   for (const r of results) {
     console.log(`| ${r.task} | ${r.turn} | ${r.engine} | ${(r.wallMs / 1000).toFixed(1)} | ${fmt(r.input)} | ${fmt(r.output)} | ${fmt(r.cachedInput)} | ${r.costUsd === null ? "—" : r.costUsd.toFixed(3)} | ${r.steps} | ${r.correct === null ? "—" : r.correct ? "yes" : "no"} | ${r.hookCoverage ?? "—"} |`);
   }
+  const recall = results.filter((r) => r.task === "T6 recall");
+  if (recall.length) console.log(`\nT6: recalled correctly ${recall.filter((r) => r.turn === 2 && r.correct).length}/${recall.filter((r) => r.turn === 2).length}; steps on the asking turn ${recall.find((r) => r.turn === 2)?.steps ?? "—"}`);
   const long = results.filter((r) => r.task === "T5 long-thread");
   if (long.length) {
     const total = long.reduce((n, r) => n + (r.input ?? 0) + (r.output ?? 0), 0);

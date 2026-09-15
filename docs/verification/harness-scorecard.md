@@ -79,9 +79,22 @@ budget is crossed and "in" drops back on the next turn. The two numbers to
 compare between builds are **input at turn 10** and **total tokens over the
 ten turns**. The script prints both.
 
+**T6 — recall (two threads, one bot; Phase 1 part 2).** New bot. Send:
+> Remember this for later: our deploy password hint is 'blue-falcon-42'.
+> Reply with just OK.
+
+Then open a **new task** on the same bot and send:
+> What is our deploy password hint? Reply with the hint only, in one line,
+> without running any tools.
+
+Correct when the reply says `blue-falcon-42`. On the branch a chip
+"recalled 1 conversation" precedes the reply and the asking turn takes no
+tool steps; on main the bot has to think of `session_search` itself. The
+fuller measure is the recall set (`docs/verification/recall.md`).
+
 ## Doing it unattended
 
-The script runs exactly the four tasks above and prints the same table:
+The script runs the tasks above (T6 included unless `--skip-recall`) and prints the same table:
 
 ```sh
 # 1. start the build's harness standalone on its own port and data folder
