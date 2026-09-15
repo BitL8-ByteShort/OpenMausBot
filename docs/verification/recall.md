@@ -40,8 +40,12 @@ node --experimental-strip-types scripts/bench/recall-set.ts \
   --url http://127.0.0.1:28801 --data-dir $HOME/.openmausbot-score --label branch --out /tmp/recall-branch.json
 ```
 
-Run the same against a `main` worktree on its own port and data folder, one
-after the other, never at the same time. The numbers to compare: the recall
+Before a measurement run, write `{"recall":{"captures":false}}` to the score
+folder's `config.json`: a harness started standalone on a Mac that runs
+SupaMaus would otherwise read the person's real capture token and recall
+their own captures into the test bots' turns (finding F14). Run the same
+against a `main` worktree on its own port and data folder, one after the
+other, never at the same time. The numbers to compare: the recall
 set's **passed N/24** and **asking turns with tools** (a bot that has to
 search by hand takes tool steps; a bot handed the passage does not), and
 T1–T5, which must not move. Records live under `docs/bench/scorecard/`.
