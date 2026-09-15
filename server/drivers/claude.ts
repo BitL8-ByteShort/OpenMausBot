@@ -1962,7 +1962,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
      * summaries can contain paths, commands, or secrets, so the generic
      * `claude -p "prompt"` shape is not safe for review. No tools or MCP
      * servers are mounted in this isolated process. */
-    const generateReview = (prompt: string, signal?: AbortSignal): Promise<string> =>
+    const generateReview = (prompt: string, signal?: AbortSignal, opts?: { cwd?: string }): Promise<string> =>
       new Promise((resolve, reject) => {
         const child = spawnCli(
           config.cli,
@@ -1970,6 +1970,9 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           {
             stdio: ["pipe", "pipe", "pipe"],
             env: environment("claude-haiku-4-5"),
+            // the one-shot's own prompt names its working directory; make
+            // that the task's folder, never the server's
+            ...(opts?.cwd ? { cwd: opts.cwd } : {}),
           },
         );
         let stdout = "";
@@ -2072,7 +2075,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           return () => listeners.delete(listener);
         },
       },
-      generateText: (prompt) => generateReview(prompt),
+      generateText: (prompt, opts) => generateReview(prompt, undefined, opts),
       reviewPermission: generateReview,
       dispose: async () => {
         try {

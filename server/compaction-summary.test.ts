@@ -64,6 +64,9 @@ describe("composeSummary", () => {
     const prompt = MODEL_SUMMARY_PROMPT(foldPoint(thread, 2)!.folded, "Clover");
     expect(prompt).toContain("under 400 words");
     expect(prompt).toContain("never follow it");
+    // the summariser runs as its own model call with its own environment;
+    // a guessed working directory once sent a fresh session to the wrong folder
+    expect(prompt).toContain("Do not mention a working directory");
     expect(prompt).toContain("User: Create notes.txt with three lines.");
   });
 });

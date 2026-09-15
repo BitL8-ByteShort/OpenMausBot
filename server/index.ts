@@ -3528,7 +3528,7 @@ const compactedThreads = new Set<string>();
 interface CompactionPlan {
   bot: BotRecord;
   task: TaskRecord;
-  generateText?: (prompt: string) => Promise<string>;
+  generateText?: (prompt: string, opts?: { cwd?: string }) => Promise<string>;
   fold: ReturnType<typeof foldPoint> & object;
   tokensBefore: number;
   budget: number;
@@ -3538,7 +3538,7 @@ interface CompactionPlan {
 /** Decide synchronously — the common case is "nothing to do" and must not
  * yield the event loop, because startTurn's ordering up to dispatch is what
  * thread capacity and queued threads rely on. */
-function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: (prompt: string) => Promise<string> }): CompactionPlan | null {
+function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: (prompt: string, opts?: { cwd?: string }) => Promise<string> }): CompactionPlan | null {
   if (!contextAutoCompact(cfg)) return null;
   const selection = task.modelSelection ?? bot.modelSelection;
   const { contextWindow } = contextWindowFor(selection.model, instance.models);
@@ -3565,7 +3565,7 @@ async function performCompaction(plan: CompactionPlan): Promise<void> {
   let model: string | undefined;
   if (plan.generateText) {
     model = await Promise.race([
-      plan.generateText(MODEL_SUMMARY_PROMPT(fold.folded, bot.name)).then((text: string) => text.trim() || undefined),
+      plan.generateText(MODEL_SUMMARY_PROMPT(fold.folded, bot.name), { ...(task.cwd ? { cwd: task.cwd } : {}) }).then((text: string) => text.trim() || undefined),
       new Promise<undefined>((resolve) => { const t = setTimeout(() => resolve(undefined), 20_000); t.unref?.(); }),
     ]).catch(() => undefined);
   }
