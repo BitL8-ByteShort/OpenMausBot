@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node
 import { join } from "node:path";
 
 import { writeFileAtomic } from "./atomic.ts";
-import { indexMemoryFile, indexedMemoryFiles, recallMemory, removeMemoryFile, type MemoryHit } from "./message-db.ts";
+import { indexMemoryFile, indexedMemoryFiles, recallMemory, removeMemoryFile, type MemoryHit, type RecallQueryOptions } from "./message-db.ts";
 import { redactSecretsInText } from "./redact.ts";
 
 import { DATA_DIR } from "./config.ts";
@@ -239,9 +239,9 @@ export function syncMemoryIndex(botId: string): void {
 }
 
 /** Search one bot's memory files, after syncing the index to the disk. */
-export function searchMemoryFiles(botId: string, query: string, limit = 12): MemoryHit[] {
+export function searchMemoryFiles(botId: string, query: string, limit = 12, options: RecallQueryOptions = {}): MemoryHit[] {
   syncMemoryIndex(botId);
-  return recallMemory(query, botId, limit);
+  return recallMemory(query, botId, limit, options);
 }
 
 export interface MemoryUpdate {

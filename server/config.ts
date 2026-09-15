@@ -364,6 +364,13 @@ const appConfigSchema = z.object({
     compactAt: z.number().positive().refine((v) => v < 1 || v >= 1_000, "compactAt is a share below 1 or at least 1000 tokens").optional(),
     autoCompact: z.boolean().optional(),
   }).strict().optional(),
+  /** Harness recall before a turn (Phase 1 part 2): on by default; captures
+   * from SupaMaus included where it runs; the block's size cap. */
+  recall: z.object({
+    auto: z.boolean().optional(),
+    captures: z.boolean().optional(),
+    maxChars: z.number().int().min(500).max(30_000).optional(),
+  }).strict().optional(),
   /** The global launch budget (docs/plans/2026-09-14-phase-0-foundation.md, 0.4). */
   launches: z.object({
     maxConcurrent: z.number().int().min(1).max(64).optional(),
@@ -416,6 +423,7 @@ export interface AppConfig {
   threads?: { maxConcurrentPerBot: number };
   launches?: { maxConcurrent?: number; maxPerHour?: number; maxPerDay?: number };
   context?: { rebuildBytes?: number; compactAt?: number; autoCompact?: boolean };
+  recall?: { auto?: boolean; captures?: boolean; maxChars?: number };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
@@ -552,6 +560,19 @@ export function contextCompactAt(cfg: AppConfig): number | undefined {
 
 export function contextAutoCompact(cfg: AppConfig): boolean {
   return cfg.context?.autoCompact !== false;
+}
+
+/** Phase 1 part 2: the harness recalls before every direct turn unless told not to. */
+export function recallAuto(cfg: AppConfig): boolean {
+  return cfg.recall?.auto !== false;
+}
+
+export function recallCaptures(cfg: AppConfig): boolean {
+  return cfg.recall?.captures !== false;
+}
+
+export function recallMaxChars(cfg: AppConfig): number | undefined {
+  return cfg.recall?.maxChars;
 }
 
 export function launchLimits(cfg: AppConfig): LaunchLimits {
