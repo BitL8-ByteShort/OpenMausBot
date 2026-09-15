@@ -662,6 +662,7 @@ const TOOLS = [
         action: { type: "string", enum: ["append", "replace", "remove", "supersede"] },
         text: { type: "string", minLength: 1, description: "Non-blank new text for append, replace, or supersede: the fact itself, without a date or bullet. Omit for remove; use remove to delete a passage." },
         old_text: { type: "string", minLength: 1, description: "Exact unique existing passage for replace, supersede, or remove. Omit for append." },
+        importance: { type: "integer", minimum: 1, maximum: 5, description: "How much this fact matters when MEMORY.md is over budget: 5 must never be lost (a standing decision, a correction), 1 is nice to have. Default 3. Only for append and supersede." },
       },
       required: ["action"],
     },
@@ -1488,6 +1489,7 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
         action: args.action,
         text: args.text,
         oldText: args.old_text,
+        ...(typeof args.importance === "number" ? { importance: args.importance } : {}),
       }),
     });
     if (r.error || r.ok !== true) {
