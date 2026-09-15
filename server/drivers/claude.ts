@@ -1346,7 +1346,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       // Reuse the live process when it is idle, unchanged, and is the session
       // the harness wants resumed. Anything else: close it and spawn fresh
       // (with --resume, so the conversation continues in the new process).
-      const live = sessions.get(threadId);
+      // a rewind or a harness compaction asks for a NEW session: the live
+      // process holds the very context the harness is replacing
+      if (turn.sessionReset && sessions.has(threadId)) closeSession(threadId, "session reset");
+      const live = turn.sessionReset ? undefined : sessions.get(threadId);
       if (live && !live.turn && !live.closing && live.child.exitCode === null && live.argsKey === argsKey && (!sessionId || sessionId === live.sessionId)) {
         if (live.idleTimer) clearTimeout(live.idleTimer);
         live.turn = { turnId, input: turn, retryAbort, settled: false, sawStreamDelta: false };

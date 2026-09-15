@@ -6302,6 +6302,9 @@ async function startTurn(
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
         resumeCursor,
+        // a rewind or a harness compaction: the driver must not keep the
+        // live session, whose context the replay below replaces
+        ...(rewound || contextReset ? { sessionReset: true } : {}),
         ...(recoveryText !== undefined ? { recoveryText } : {}),
         transcript,
         system: prompt.text,

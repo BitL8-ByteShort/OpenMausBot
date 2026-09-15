@@ -89,7 +89,17 @@ posixOnly("harness-owned compaction (every fake engine, window forced to 100k)",
     // until a third exchange exists, so turn 4 is the first to compact
     const third = await h.turn(bot.id, "third: remember the codeword FIG");
     expect((third.messages as Msg[]).filter((m) => m.kind === "compaction")).toHaveLength(0);
+    const pidBefore = engine.id === "claude" ? JSON.parse(readFileSync(join(h.home(), "claude.dump.json"), "utf8")).pid : null;
     const after = await h.turn(bot.id, "fourth: which codewords do you know?");
+    // the turn was a rebuild on a fresh session, and the ledger says so
+    const ledger = readFileSync(join(h.home(), ".openmausbot", "usage", `${new Date().toISOString().slice(0, 7)}.jsonl`), "utf8")
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.threadId === bot.threadId);
+    expect(ledger.at(-1)).toMatchObject({ compacted: true, promptShape: { replayed: true } });
+    // Claude keeps one process per thread; a reset must not land on the one
+    // that still holds the whole thread
+    if (engine.id === "claude") {
+      expect(JSON.parse(readFileSync(join(h.home(), "claude.dump.json"), "utf8")).pid).not.toBe(pidBefore);
+    }
     const records = (after.messages as Msg[]).filter((m) => m.kind === "compaction");
     expect(records).toHaveLength(1);
     expect(records[0]!.compaction).toMatchObject({ by: "harness" });
