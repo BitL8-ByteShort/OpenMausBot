@@ -573,13 +573,38 @@ const STOP_WORDS = new Set(
  * whitespace-separated token becomes a quoted string, so `AND`, `NOT`,
  * `*`, `:`, and stray quotes are searched for rather than interpreted.
  * Tokens are ANDed — FTS5's default — so a hit contains all of them. */
-function ftsQuery(query: string): string | null {
+/** How a query's terms combine: `all` (the bot's own session_search; every
+ * term must match) or `any` (the harness's recall at turn start, Phase 1
+ * part 2: a whole user message is the query, so one shared term is a hit
+ * and bm25 ranks the richer matches first). */
+export interface RecallQueryOptions {
+  mode?: "all" | "any";
+}
+
+/** Terms an any-mode query keeps: at most this many distinct content words
+ * of three letters or more, in message order. */
+const ANY_QUERY_TERMS = 16;
+
+function ftsQuery(query: string, mode: "all" | "any" = "all"): string | null {
   const tokens = query
     .split(/\s+/)
     .map((token) => token.replace(/"/g, "").trim())
     .filter(Boolean);
   if (!tokens.length) return null;
   const content = tokens.filter((token) => !STOP_WORDS.has(token.toLowerCase()));
+  if (mode === "any") {
+    const seen = new Set<string>();
+    const terms: string[] = [];
+    for (const token of content) {
+      const word = token.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+      const key = word.toLowerCase();
+      if (word.length < 3 || seen.has(key)) continue;
+      seen.add(key);
+      terms.push(word);
+      if (terms.length >= ANY_QUERY_TERMS) break;
+    }
+    return terms.length ? terms.map((term) => `"${term}"`).join(" OR ") : null;
+  }
   return (content.length ? content : tokens).map((token) => `"${token}"`).join(" ");
 }
 
@@ -621,8 +646,8 @@ export function readMessageText(
  * bm25 rank from FTS5; the snippet is FTS5's own, windowed around the
  * matched terms. Scoping happens in SQL before LIMIT, so a busy thread
  * cannot crowd out a quieter one. */
-export function recallMessages(query: string, threadIds: readonly string[], limit = 12): RecallHit[] {
-  const match = ftsQuery(query);
+export function recallMessages(query: string, threadIds: readonly string[], limit = 12, options: RecallQueryOptions = {}): RecallHit[] {
+  const match = ftsQuery(query, options.mode);
   if (!match || !threadIds.length) return [];
   const placeholders = threadIds.map(() => "?").join(", ");
   const rows = db()
@@ -704,8 +729,8 @@ export interface MemoryHit {
 /** Relevance-ranked recall over ONE bot's memory files. Scoped by bot id
  * in SQL, the same way recallMessages scopes by thread: another bot's
  * memory is not a lower-ranked result, it is not a result. */
-export function recallMemory(query: string, botId: string, limit = 12): MemoryHit[] {
-  const match = ftsQuery(query);
+export function recallMemory(query: string, botId: string, limit = 12, options: RecallQueryOptions = {}): MemoryHit[] {
+  const match = ftsQuery(query, options.mode);
   if (!match) return [];
   const rows = db()
     .prepare(
