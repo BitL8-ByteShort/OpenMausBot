@@ -249,6 +249,9 @@ const featureConfigSchema = z.object({
 const boardConfigSchema = z.object({
   /** Concurrency cap across the whole board. See DEFAULT_BOARD_MAX_RUNNING. */
   maxRunning: z.number().int().min(MIN_BOARD_MAX_RUNNING).max(MAX_BOARD_MAX_RUNNING).optional(),
+  /** Phase 2 part 1 (decision 11): the money cap a board task gets when it
+   * was filed without one. Unset = no cap. */
+  defaultBudgetUsd: z.number().positive().max(10_000).optional(),
 }).optional();
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -451,7 +454,7 @@ export interface AppConfig {
   /** Opt-in product experiments. Every flag defaults to disabled. */
   features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; board?: boolean };
   /** The board's concurrency cap; see boardEnabled/boardMaxRunning. */
-  board?: { maxRunning?: number };
+  board?: { maxRunning?: number; defaultBudgetUsd?: number };
   /** First-run progress; see onboardingConfigSchema. */
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
   /** Named browser sessions any bot can be pointed at. */
@@ -666,6 +669,12 @@ export function boardEnabled(cfg: AppConfig): boolean {
  * for why this is a plain number rather than a budget-derived one. */
 export function boardMaxRunning(cfg: AppConfig): number {
   return cfg.board?.maxRunning ?? DEFAULT_BOARD_MAX_RUNNING;
+}
+
+/** The unattended default money cap for a board task filed without one; null = no cap. */
+export function boardDefaultBudgetUsd(cfg: AppConfig): number | null {
+  const value = cfg.board?.defaultBudgetUsd;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 /** Config sections no provider driver reads. A write that touches only

@@ -103,6 +103,14 @@ describe("the task board routes through an isolated HTTP fixture", () => {
     expect(longBody.status).toBe(400);
     const longComment = await api("POST", `/api/tasks/${taskId}/comments`, { text: "x".repeat(4_001) });
     expect(longComment.status).toBe(400);
+    // Phase 2 part 1: owner, due date and a money cap ride the same routes
+    const withFields = await api("POST", "/api/tasks", { title: "invoice Acme", owner: "person", dueAt: 1_800_000_000_000, budgetUsd: 2 });
+    expect(withFields.status).toBe(201);
+    expect(withFields.body.task).toMatchObject({ owner: "person", dueAt: 1_800_000_000_000, budgetUsd: 2, spentUsd: 0 });
+    const fieldsPatched = await api("PATCH", `/api/tasks/${withFields.body.task.id}`, { owner: null, budgetUsd: 3 });
+    expect(fieldsPatched.body.task).toMatchObject({ owner: null, budgetUsd: 3 });
+    expect((await api("PATCH", `/api/tasks/${withFields.body.task.id}`, { budgetUsd: -1 })).status).toBe(400);
+    expect((await api("POST", "/api/tasks", { title: "bad due", dueAt: "tomorrow" })).status).toBe(400);
     expect((await api("PATCH", "/api/tasks/no-such-task", { priority: 1 })).status).toBe(404);
     expect((await api("POST", "/api/tasks/no-such-task/comments", { text: "x" })).status).toBe(404);
   });

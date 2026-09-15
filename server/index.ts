@@ -149,7 +149,7 @@ import {
   DATA_DIR,
   EVENTS_DIR,
   NATIVE_DIR,
-  customMcpServers, recallAuto, recallCaptures, recallMaxChars, contextRecite } from "./config.ts";
+  customMcpServers, recallAuto, recallCaptures, recallMaxChars, contextRecite, boardDefaultBudgetUsd } from "./config.ts";
 import { ComputerControl } from "./computer-control.ts";
 import { augmentedPath, findCliCandidates, resetPathCache } from "./env-path.ts";
 import { registerEnginesBinDir } from "./engine-install.ts";
@@ -366,8 +366,7 @@ import {
   TASK_TITLE_MAX,
   visibleTo as visibleBoardTasks,
   type BoardStatus,
-  type TaskPatch as BoardTaskPatch,
-} from "./task-board.ts";
+  type TaskPatch as BoardTaskPatch, bookSpend, taskByThread, setResult, BUDGET_PAUSED_REASON } from "./task-board.ts";
 import { createBotDispatch } from "./task-dispatch-bot.ts";
 import { DEFAULT_STALE_AFTER_MS, createDispatcher as createBoardDispatcher } from "./task-dispatcher.ts";
 import { createTaskTurnWatch } from "./task-turn-watch.ts";
@@ -3856,6 +3855,7 @@ function scheduleTurnDigest(input: {
         });
         return message.id;
       });
+      recordBoardResult(input.threadId, renderDigest(digest));
     } catch (error) {
       console.error(`digest: could not record turn ${input.turnId} on ${input.threadId}:`, error instanceof Error ? error.message : error);
     }
@@ -4809,6 +4809,7 @@ bus.subscribe((event: RuntimeEvent) => {
               : turnTriggers.get(event.threadId) ?? { kind: "owner" },
         });
         noteSpend(DATA_DIR, event.cost ?? null);
+        bookBoardSpend(event.threadId, event.cost ?? null);
         if (completedTurnId) {
           scheduleTurnDigest({
             botId: bot.id,
@@ -4888,6 +4889,7 @@ bus.subscribe((event: RuntimeEvent) => {
             : turnTriggers.get(event.threadId) ?? { kind: "owner" },
         });
         noteSpend(DATA_DIR, event.cost ?? null);
+        bookBoardSpend(event.threadId, event.cost ?? null);
       }
       if (speaker && group?.busyBotId === speaker.botId) {
         releaseTurnResources(turnResourceOwners.get(event.threadId));
@@ -6928,6 +6930,32 @@ let boardOpened = false;
  * if so — is its storage open? Returns false when the flag is off, which is
  * what every /api/tasks* route turns into a 404 and what makes the tick a
  * genuine no-op. */
+/** Phase 2 part 1: a settled turn in a board task's thread books its cost
+ * against the task's money cap; never fails the turn it is booking. */
+function bookBoardSpend(threadId: string, costUsd: number | null): void {
+  if (!boardReady()) return;
+  try {
+    const task = taskByThread(threadId);
+    if (!task) return;
+    const booked = bookSpend(task.id, costUsd);
+    if (booked.paused || booked.warned) broadcast({ kind: "board", taskId: task.id } as never);
+    if (booked.paused) console.error(`[omb-board] task ${task.id} ${BUDGET_PAUSED_REASON}: $${booked.task.spentUsd.toFixed(3)} of $${booked.task.budgetUsd?.toFixed(3)}`);
+  } catch (error) {
+    console.error(`[omb-board] could not book spend for ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** The digest is the task's result: what the turn did, not only what it said. */
+function recordBoardResult(threadId: string, digestLine: string): void {
+  if (!boardReady()) return;
+  try {
+    const task = taskByThread(threadId);
+    if (task) setResult(task.id, digestLine);
+  } catch (error) {
+    console.error(`[omb-board] could not record the result for ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function boardReady(): boolean {
   if (!boardEnabled(cfg)) return false;
   if (!boardOpened) {
@@ -6989,6 +7017,7 @@ const boardDispatch = createBotDispatch<BotRecord>({
     }),
   redact: redactSecretsInText,
   log: (message) => console.error(message),
+  defaultBudgetUsd: () => boardDefaultBudgetUsd(cfg),
 });
 const boardDispatcher = createBoardDispatcher({
   maxRunning: boardMaxRunning(cfg),
@@ -7003,6 +7032,25 @@ const boardDispatcher = createBoardDispatcher({
  * rest of this file — an internal thread title caps at 80, a room post at
  * ROOM_POST_MAX_CHARS — and a looping bot would otherwise write rows of any
  * size that every board read and every SSE broadcast then carries. */
+/** owner / dueAt / budgetUsd from a request body (Phase 2 part 1): each
+ * tri-state (absent, null, value); a bad shape is a 400, never a guess. */
+function boardFieldsFromBody(body: any): { owner?: string | null; dueAt?: number | null; budgetUsd?: number | null } | { error: string } {
+  const out: { owner?: string | null; dueAt?: number | null; budgetUsd?: number | null } = {};
+  if (body?.owner !== undefined) {
+    if (body.owner !== null && (typeof body.owner !== "string" || !body.owner.trim() || body.owner.length > 120)) return { error: "owner must be a bot id, \"person\", or null" };
+    out.owner = body.owner === null ? null : body.owner.trim();
+  }
+  if (body?.dueAt !== undefined) {
+    if (body.dueAt !== null && (typeof body.dueAt !== "number" || !Number.isFinite(body.dueAt) || body.dueAt <= 0)) return { error: "dueAt must be a time in milliseconds, or null" };
+    out.dueAt = body.dueAt === null ? null : Math.trunc(body.dueAt);
+  }
+  if (body?.budgetUsd !== undefined) {
+    if (body.budgetUsd !== null && (typeof body.budgetUsd !== "number" || !Number.isFinite(body.budgetUsd) || body.budgetUsd <= 0 || body.budgetUsd > 10_000)) return { error: "budgetUsd must be a positive amount in dollars, or null for no cap" };
+    out.budgetUsd = body.budgetUsd;
+  }
+  return out;
+}
+
 function boardInputTooLong(title?: string, body?: string): string | null {
   if (title !== undefined && title.length > TASK_TITLE_MAX) {
     return `a task title is at most ${TASK_TITLE_MAX} characters`;
@@ -10955,11 +11003,14 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         for (const parentId of parentIds ?? []) {
           if (!getBoardTask(parentId)) return json(res, 404, { error: `no board task with id ${parentId} — check the id and try again` });
         }
+        const fields = boardFieldsFromBody(body);
+        if ("error" in fields) return json(res, 400, { error: fields.error });
         const task = createBoardTask({
           title,
           body: taskBody,
           assigneeBotId,
           createdByBotId: internalSender.id,
+          ...fields,
           parentIds,
         });
         return json(res, 201, { task });
@@ -12548,12 +12599,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       for (const parentId of parentIds ?? []) {
         if (!getBoardTask(parentId)) return json(res, 404, { error: `no board task with id ${parentId}` });
       }
+      const fields = boardFieldsFromBody(body);
+      if ("error" in fields) return json(res, 400, { error: fields.error });
       const task = createBoardTask({
         title,
         body: taskBody,
         assigneeBotId,
         priority: typeof body?.priority === "number" ? body.priority : undefined,
         parentIds,
+        ...fields,
       });
       return json(res, 201, { task });
     }
@@ -12584,6 +12638,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         if (typeof body?.body === "string") patch.body = body.body;
         if (typeof body?.priority === "number") patch.priority = body.priority;
         if (body?.assigneeBotId !== undefined) patch.assigneeBotId = body.assigneeBotId;
+        const fields = boardFieldsFromBody(body);
+        if ("error" in fields) return json(res, 400, { error: fields.error });
+        Object.assign(patch, fields);
         if (Object.keys(patch).length > 0) updated = patchBoardTask(updated.id, patch);
         return json(res, 200, { task: updated });
       } catch (error) {

@@ -846,6 +846,9 @@ const TOOLS = [
           items: { type: "string" },
           description: "Optional: ids of other board tasks that must reach done or archived before this one can be claimed.",
         },
+        owner: { type: "string", description: "Optional: who is responsible — a bot id, or \"person\" for the user." },
+        due_at: { type: "string", description: "Optional: when it is due, as an ISO date or date-time." },
+        budget_usd: { type: "number", description: "Optional: the most this task may spend, in dollars. The harness pauses the task at that amount; only the person can raise it." },
       },
       required: ["title"],
     },
@@ -1712,8 +1715,12 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
         body: typeof args.body === "string" ? args.body : undefined,
         assigneeBotId,
         parentTaskIds,
+        ...(typeof args.owner === "string" && args.owner.trim() ? { owner: args.owner.trim() } : {}),
+        ...(typeof args.due_at === "string" && Number.isFinite(Date.parse(args.due_at)) ? { dueAt: Date.parse(args.due_at) } : {}),
+        ...(typeof args.budget_usd === "number" && Number.isFinite(args.budget_usd) && args.budget_usd > 0 ? { budgetUsd: args.budget_usd } : {}),
       }),
     });
+    if (r.error) return { text: String(r.error), isError: true };
     const task = (r.task ?? {}) as Json;
     const assignment = typeof task.assigneeBotId === "string"
       ? `assigned to ${task.assigneeBotId}`
@@ -1734,7 +1741,13 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
       const assignee = typeof task.assigneeBotId === "string" ? `, assignee: ${task.assigneeBotId}` : "";
       const attempts = typeof task.attempts === "number" && task.attempts > 1 ? `, attempts: ${task.attempts}` : "";
       const blocked = typeof task.blockedReason === "string" && task.blockedReason ? `, blocked: ${task.blockedReason}` : "";
-      return `- [${task.status}] ${task.title} (id: ${task.id})${assignee}${attempts}${blocked}`;
+      const owner = typeof task.owner === "string" && task.owner ? `, owner: ${task.owner}` : "";
+      const due = typeof task.dueAt === "number" ? `, due ${new Date(task.dueAt).toISOString().slice(0, 10)}` : "";
+      const budget = typeof task.budgetUsd === "number"
+        ? `, spent $${Number(task.spentUsd ?? 0).toFixed(3)} of $${task.budgetUsd.toFixed(3)}`
+        : typeof task.spentUsd === "number" && task.spentUsd > 0 ? `, spent $${task.spentUsd.toFixed(3)}` : "";
+      const result = typeof task.result === "string" && task.result ? `\n  result: ${task.result.slice(0, 200)}` : "";
+      return `- [${task.status}] ${task.title} (id: ${task.id})${assignee}${owner}${due}${budget}${attempts}${blocked}${result}`;
     });
     return { text: `Board tasks:\n${lines.join("\n")}` };
   }

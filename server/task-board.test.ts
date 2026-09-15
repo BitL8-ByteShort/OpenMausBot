@@ -274,3 +274,73 @@ describe("visibleTo", () => {
     expect(seen).not.toContain(strangerFiled.id);
   });
 });
+
+describe("owner, due date, budget and result (Phase 2 part 1)", () => {
+  beforeEach(() => board.openBoard(join(DATA, `b-${Math.random()}.db`)));
+
+  it("round-trips owner, dueAt and budgetUsd, and patches them", () => {
+    const task = board.createTask({ title: "Invoice Acme", owner: "person", dueAt: 1_800_000_000_000, budgetUsd: 2 });
+    expect(task).toMatchObject({ owner: "person", dueAt: 1_800_000_000_000, budgetUsd: 2, spentUsd: 0, unpricedTurns: 0 });
+    const patched = board.patchTask(task.id, { owner: "bot-1", dueAt: null, budgetUsd: 3 });
+    expect(patched).toMatchObject({ owner: "bot-1", dueAt: null, budgetUsd: 3 });
+    expect(board.createTask({ title: "no cap" })).toMatchObject({ owner: null, dueAt: null, budgetUsd: null });
+  });
+
+  it("adds the columns to a board file written before this part", () => {
+    const file = join(DATA, `old-${Math.random()}.db`);
+    const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+    const old = new DatabaseSync(file);
+    old.exec(`CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, assignee_bot_id TEXT, created_by_bot_id TEXT, priority INTEGER NOT NULL DEFAULT 0, thread_id TEXT, result TEXT, blocked_reason TEXT, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, started_at INTEGER, heartbeat_at INTEGER, finished_at INTEGER);
+      INSERT INTO tasks (id, title, status, created_at, updated_at) VALUES ('t-old', 'old row', 'todo', 1, 1);`);
+    old.close();
+    board.openBoard(file);
+    expect(board.getTask("t-old")).toMatchObject({ title: "old row", owner: null, dueAt: null, budgetUsd: null, spentUsd: 0 });
+    board.openBoard(file); // idempotent
+    expect(board.getTask("t-old")?.title).toBe("old row");
+  });
+
+  it("books spend, warns once at 70%, and pauses at the cap with the stated reason", () => {
+    const task = board.createTask({ title: "capped", assigneeBotId: "bot-1", budgetUsd: 0.014 });
+    board.setStatus(task.id, "ready");
+    board.claimTask(task.id);
+    const first = board.bookSpend(task.id, 0.01);
+    expect(first).toMatchObject({ warned: true, paused: false });
+    expect(board.getTask(task.id)).toMatchObject({ spentUsd: 0.01, status: "running" });
+    expect(board.commentsOf(task.id).map((c) => c.text)).toEqual(["70% of this task's budget is spent ($0.010 of $0.014)."]);
+    // a second booking past the cap pauses, and the warning is not repeated
+    const second = board.bookSpend(task.id, 0.01);
+    expect(second).toMatchObject({ warned: false, paused: true });
+    expect(board.getTask(task.id)).toMatchObject({ status: "blocked", blockedReason: "paused, needs a budget increase", spentUsd: 0.02 });
+    expect(board.commentsOf(task.id)).toHaveLength(2);
+    expect(board.commentsOf(task.id)[1]!.text).toContain("paused, needs a budget increase");
+    // a turn with no reported cost books nothing but is counted, and a
+    // task already paused is not commented on again
+    expect(board.bookSpend(task.id, null)).toMatchObject({ warned: false, paused: false });
+    expect(board.getTask(task.id)?.unpricedTurns).toBe(1);
+    expect(board.commentsOf(task.id)).toHaveLength(2);
+  });
+
+  it("never dispatches a task at its cap, and a raised cap resumes a task paused for budget", () => {
+    const task = board.createTask({ title: "capped", assigneeBotId: "bot-1", budgetUsd: 0.01 });
+    board.setStatus(task.id, "ready");
+    board.claimTask(task.id);
+    board.bookSpend(task.id, 0.01);
+    expect(board.getTask(task.id)?.status).toBe("blocked");
+    expect(board.exhausted(board.getTask(task.id)!)).toBe(true);
+    expect(() => board.patchTask(task.id, { budgetUsd: 0.005 })).toThrow(/below what is already spent/);
+    const resumed = board.patchTask(task.id, { budgetUsd: 0.05 });
+    expect(resumed).toMatchObject({ status: "ready", blockedReason: null, budgetUsd: 0.05 });
+    expect(board.exhausted(resumed)).toBe(false);
+  });
+
+  it("finds a task by its thread and stores the digest as its result", () => {
+    const task = board.createTask({ title: "digested", assigneeBotId: "bot-1" });
+    board.setStatus(task.id, "ready");
+    board.claimTask(task.id);
+    board.attachThread(task.id, "thread-9");
+    expect(board.taskByThread("thread-9")?.id).toBe(task.id);
+    expect(board.taskByThread("thread-none")).toBeNull();
+    board.setStatus(task.id, "review", { result: "the reply" });
+    expect(board.setResult(task.id, "[digest] · tools: Bash ×1 · reply: the reply").result).toBe("[digest] · tools: Bash ×1 · reply: the reply");
+  });
+});

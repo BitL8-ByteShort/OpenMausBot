@@ -16,7 +16,7 @@
 //   - dispatch does the part that cannot be answered synchronously: create
 //     the thread, arm the watch, start the turn. Anything that goes wrong
 //     there returns null, and the tick refunds the claim.
-import type { BoardTask } from "./task-board.ts";
+import { exhausted, patchTask, type BoardTask } from "./task-board.ts";
 
 /** Just enough of a BotRecord to decide a dispatch — a structural shape so
  * this module never has to import the store. */
@@ -51,6 +51,9 @@ export interface BotDispatchDeps<Bot extends DispatchBot> {
   audit: (entry: { threadId: string; botId: string; botName: string; title: string }) => void;
   redact: (text: string) => string;
   log?: (message: string) => void;
+  /** Phase 2 part 1, decision 11: the money cap a task gets when it was
+   * filed without one, read live (board.defaultBudgetUsd); null = no cap. */
+  defaultBudgetUsd?: () => number | null;
 }
 
 export interface BotDispatch {
@@ -75,6 +78,9 @@ export function createBotDispatch<Bot extends DispatchBot>(deps: BotDispatchDeps
     // Unassigned work waits for a human to assign it (PATCH /api/tasks/:id);
     // the dispatcher never guesses a recipient.
     if (!task.assigneeBotId) return null;
+    // A task at its money cap never runs again until a person raises the
+    // cap (Phase 2 part 1); declining here costs no attempt.
+    if (exhausted(task)) return null;
     const bot = deps.bot(task.assigneeBotId);
     if (!bot || bot.busy || bot.hidden) return null;
     // The capability rule: this dispatch happens with nobody at the
@@ -89,11 +95,18 @@ export function createBotDispatch<Bot extends DispatchBot>(deps: BotDispatchDeps
     return bot;
   }
 
-  async function dispatch(task: BoardTask): Promise<{ threadId: string } | null> {
+  async function dispatch(input: BoardTask): Promise<{ threadId: string } | null> {
+    let task = input;
     // Re-checked rather than trusted from canDispatch: an await elsewhere in
     // the tick may have let the bot go busy since.
     const bot = eligible(task);
     if (!bot) return null;
+    // Board work runs with nobody at the keyboard, so a task filed without
+    // a cap gets the unattended default before it spends anything.
+    const fallbackCap = deps.defaultBudgetUsd?.() ?? null;
+    if (task.budgetUsd === null && fallbackCap !== null && fallbackCap > 0) {
+      task = patchTask(task.id, { budgetUsd: fallbackCap });
+    }
     const runThread = deps.createRunThread(bot, task.title);
     if (!runThread) return null;
     const threadId = runThread.threadId;

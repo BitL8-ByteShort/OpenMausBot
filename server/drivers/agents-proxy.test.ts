@@ -1783,6 +1783,8 @@ describe("coordinate_bots arguments (room turn)", () => {
     expect(text).toContain("botIds");
     expect(text).toContain("message");
     expect(lastCoordinateBody).toBeNull();
+  });
+});
 
 // Board tools get their own process, spawned only with OMB_BOARD_ENABLED=1
 // (mirroring OMB_SKILL_AUTHORING_ENABLED above): the main suite's shared

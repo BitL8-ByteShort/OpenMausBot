@@ -157,3 +157,35 @@ describe("board dispatch policy", () => {
     watch.stopAll();
   });
 });
+
+describe("money caps in the dispatch policy (Phase 2 part 1)", () => {
+  beforeEach(() => board.openBoard(join(DATA, `cap-${Math.random()}.db`)));
+
+  it("never dispatches a task at its cap, and costs it no attempt", async () => {
+    const { dispatch, calls } = harness();
+    const task = board.createTask({ title: "capped", assigneeBotId: "bot-1", budgetUsd: 0.01 });
+    board.setStatus(task.id, "ready");
+    board.claimTask(task.id);
+    board.bookSpend(task.id, 0.02);
+    const paused = board.getTask(task.id)!;
+    expect(paused.status).toBe("blocked");
+    expect(dispatch.canDispatch(paused)).toBe(false);
+    expect(await dispatch.dispatch(paused)).toBeNull();
+    expect(calls.started).toHaveLength(0);
+  });
+
+  it("gives a task filed without a cap the unattended default before its first turn", async () => {
+    const { dispatch, calls } = harness({ defaultBudgetUsd: () => 0.5 });
+    const task = board.createTask({ title: "uncapped", assigneeBotId: "bot-1" });
+    board.setStatus(task.id, "ready");
+    const claimed = board.claimTask(task.id)!;
+    expect(await dispatch.dispatch(claimed)).toEqual({ threadId: "thread-for-bot-1" });
+    expect(board.getTask(task.id)?.budgetUsd).toBe(0.5);
+    expect(calls.started).toHaveLength(1);
+    // an explicit cap is kept, and no default means no cap
+    const explicit = board.createTask({ title: "explicit", assigneeBotId: "bot-1", budgetUsd: 0.2 });
+    board.setStatus(explicit.id, "ready");
+    await dispatch.dispatch(board.claimTask(explicit.id)!);
+    expect(board.getTask(explicit.id)?.budgetUsd).toBe(0.2);
+  });
+});

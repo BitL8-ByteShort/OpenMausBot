@@ -69,7 +69,22 @@ export interface BoardTask {
   startedAt: number | null;
   heartbeatAt: number | null;
   finishedAt: number | null;
+  /** Phase 2 part 1: who is responsible — a bot id, or "person". */
+  owner: string | null;
+  /** When it is due, ms since the epoch; null when it has no date. */
+  dueAt: number | null;
+  /** The money cap (decision 11); null means no cap. */
+  budgetUsd: number | null;
+  /** What the harness has booked against it from usage rows, in USD. */
+  spentUsd: number;
+  /** Turns in its thread that reported no price and so booked nothing (#59's rule). */
+  unpricedTurns: number;
 }
+
+/** The reason a task paused for money carries; a raised cap resumes it. */
+export const BUDGET_PAUSED_REASON = "paused, needs a budget increase";
+/** The share of the cap at which one warning comment is posted. */
+export const BUDGET_WARN_SHARE = 0.7;
 
 export interface BoardComment {
   id: number;
@@ -86,6 +101,9 @@ export interface CreateTaskInput {
   createdByBotId?: string | null;
   priority?: number;
   parentIds?: string[];
+  owner?: string | null;
+  dueAt?: number | null;
+  budgetUsd?: number | null;
 }
 
 export interface StatusPatch {
@@ -103,6 +121,12 @@ export interface TaskPatch {
   body?: string;
   assigneeBotId?: string | null;
   priority?: number;
+  /** Tri-state like assigneeBotId: omitted leaves it, null clears it. */
+  owner?: string | null;
+  dueAt?: number | null;
+  /** A cap below what is already spent is refused; raising the cap on a
+   * task paused for money moves it back to ready. */
+  budgetUsd?: number | null;
 }
 
 /** The only legal moves. Everything else throws, including the ones that
@@ -186,6 +210,20 @@ export function openBoard(path: string = join(DATA_DIR, "tasks.db")): void {
     CREATE INDEX IF NOT EXISTS task_links_child ON task_links (child_id);
     CREATE INDEX IF NOT EXISTS task_comments_task ON task_comments (task_id, id);
   `);
+  // Phase 2 part 1 columns, added to a board written before them. ADD COLUMN
+  // is the one migration SQLite does in place; each is guarded by the table
+  // description so a reopen is a no-op.
+  const present = new Set((db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name));
+  const wanted: Array<[string, string]> = [
+    ["owner", "TEXT"],
+    ["due_at", "INTEGER"],
+    ["budget_usd", "REAL"],
+    ["spent_usd", "REAL NOT NULL DEFAULT 0"],
+    ["unpriced_turns", "INTEGER NOT NULL DEFAULT 0"],
+    ["budget_warned", "INTEGER NOT NULL DEFAULT 0"],
+  ];
+  for (const [column, type] of wanted) if (!present.has(column)) db.exec(`ALTER TABLE tasks ADD COLUMN ${column} ${type}`);
+  db.exec("CREATE INDEX IF NOT EXISTS tasks_thread ON tasks (thread_id, updated_at DESC)");
 }
 
 interface TaskRow {
@@ -205,6 +243,12 @@ interface TaskRow {
   started_at: number | null;
   heartbeat_at: number | null;
   finished_at: number | null;
+  owner: string | null;
+  due_at: number | null;
+  budget_usd: number | null;
+  spent_usd: number;
+  unpriced_turns: number;
+  budget_warned: number;
 }
 
 function rowToTask(row: TaskRow): BoardTask {
@@ -225,6 +269,11 @@ function rowToTask(row: TaskRow): BoardTask {
     startedAt: row.started_at,
     heartbeatAt: row.heartbeat_at,
     finishedAt: row.finished_at,
+    owner: row.owner ?? null,
+    dueAt: row.due_at ?? null,
+    budgetUsd: row.budget_usd ?? null,
+    spentUsd: row.spent_usd ?? 0,
+    unpricedTurns: row.unpriced_turns ?? 0,
   };
 }
 
@@ -236,8 +285,9 @@ export function createTask(input: CreateTaskInput): BoardTask {
       INSERT INTO tasks (
         id, title, body, status, assignee_bot_id, created_by_bot_id,
         priority, thread_id, result, blocked_reason, attempts,
-        created_at, updated_at, started_at, heartbeat_at, finished_at
-      ) VALUES (?, ?, ?, 'todo', ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, NULL, NULL, NULL)
+        created_at, updated_at, started_at, heartbeat_at, finished_at,
+        owner, due_at, budget_usd
+      ) VALUES (?, ?, ?, 'todo', ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, NULL, NULL, NULL, ?, ?, ?)
     `)
     .run(
       id,
@@ -248,6 +298,9 @@ export function createTask(input: CreateTaskInput): BoardTask {
       input.priority ?? 0,
       now,
       now,
+      input.owner ?? null,
+      input.dueAt ?? null,
+      input.budgetUsd ?? null,
     );
   for (const parentId of input.parentIds ?? []) linkTasks(parentId, id);
   const created = getTask(id);
@@ -411,8 +464,14 @@ export function releaseClaim(id: string): BoardTask {
 export function patchTask(id: string, patch: TaskPatch): BoardTask {
   const task = getTask(id);
   if (!task) throw new Error(`no such task: ${id}`);
+  if (patch.budgetUsd != null && patch.budgetUsd < task.spentUsd) {
+    throw new Error(`budget $${patch.budgetUsd.toFixed(3)} is below what is already spent ($${task.spentUsd.toFixed(3)})`);
+  }
   const now = Date.now();
   const setAssignee = patch.assigneeBotId !== undefined;
+  const setOwner = patch.owner !== undefined;
+  const setDue = patch.dueAt !== undefined;
+  const setBudget = patch.budgetUsd !== undefined;
   handle()
     .prepare(`
       UPDATE tasks SET
@@ -420,6 +479,10 @@ export function patchTask(id: string, patch: TaskPatch): BoardTask {
         body = COALESCE(?, body),
         assignee_bot_id = CASE WHEN ? THEN ? ELSE assignee_bot_id END,
         priority = COALESCE(?, priority),
+        owner = CASE WHEN ? THEN ? ELSE owner END,
+        due_at = CASE WHEN ? THEN ? ELSE due_at END,
+        budget_usd = CASE WHEN ? THEN ? ELSE budget_usd END,
+        budget_warned = CASE WHEN ? THEN 0 ELSE budget_warned END,
         updated_at = ?
       WHERE id = ?
     `)
@@ -429,12 +492,81 @@ export function patchTask(id: string, patch: TaskPatch): BoardTask {
       setAssignee ? 1 : 0,
       patch.assigneeBotId ?? null,
       patch.priority ?? null,
+      setOwner ? 1 : 0,
+      patch.owner ?? null,
+      setDue ? 1 : 0,
+      patch.dueAt ?? null,
+      setBudget ? 1 : 0,
+      patch.budgetUsd ?? null,
+      setBudget ? 1 : 0,
       now,
       id,
     );
-  const updated = getTask(id);
+  let updated = getTask(id);
   if (!updated) throw new Error(`task vanished during update: ${id}`);
+  // a raised (or removed) cap resumes a task that paused for money
+  if (setBudget && updated.status === "blocked" && updated.blockedReason === BUDGET_PAUSED_REASON && !exhausted(updated)) {
+    updated = setStatus(id, "ready");
+    addComment(id, null, `Budget raised to ${updated.budgetUsd === null ? "no cap" : `$${updated.budgetUsd.toFixed(3)}`}; the task can run again.`);
+  }
   return updated;
+}
+
+/** True when the task may spend nothing more: it has a cap and has reached it. */
+export function exhausted(task: Pick<BoardTask, "budgetUsd" | "spentUsd">): boolean {
+  return task.budgetUsd !== null && task.spentUsd >= task.budgetUsd;
+}
+
+/** Book one settled turn's cost against the task (Phase 2 part 1, decision
+ * 11). A turn that reported no price books nothing and is counted. Crossing
+ * the warning share posts one comment; reaching the cap pauses the task —
+ * running or ready → blocked with BUDGET_PAUSED_REASON — and a task in
+ * review keeps its status (the person is already deciding) but gets the
+ * comment; the dispatcher never runs an exhausted task again either way. */
+export function bookSpend(id: string, costUsd: number | null | undefined): { task: BoardTask; warned: boolean; paused: boolean } {
+  const before = getTask(id);
+  if (!before) throw new Error(`no such task: ${id}`);
+  const priced = typeof costUsd === "number" && Number.isFinite(costUsd) && costUsd > 0;
+  handle()
+    .prepare("UPDATE tasks SET spent_usd = spent_usd + ?, unpriced_turns = unpriced_turns + ?, updated_at = ? WHERE id = ?")
+    .run(priced ? costUsd : 0, priced ? 0 : 1, Date.now(), id);
+  let task = getTask(id)!;
+  let warned = false;
+  let paused = false;
+  const cap = task.budgetUsd;
+  if (cap !== null && priced) {
+    const row = handle().prepare("SELECT budget_warned FROM tasks WHERE id = ?").get(id) as { budget_warned: number };
+    if (exhausted(task)) {
+      if (task.status === "running" || task.status === "ready") {
+        task = setStatus(id, "blocked", { blockedReason: BUDGET_PAUSED_REASON });
+        paused = true;
+      }
+      if (before.status !== "blocked") {
+        addComment(id, null, `${BUDGET_PAUSED_REASON}: $${task.spentUsd.toFixed(3)} of $${cap.toFixed(3)} spent.`);
+      }
+    } else if (!row.budget_warned && task.spentUsd >= cap * BUDGET_WARN_SHARE) {
+      handle().prepare("UPDATE tasks SET budget_warned = 1 WHERE id = ?").run(id);
+      addComment(id, null, `${Math.round(BUDGET_WARN_SHARE * 100)}% of this task's budget is spent ($${task.spentUsd.toFixed(3)} of $${cap.toFixed(3)}).`);
+      warned = true;
+    }
+  }
+  return { task: getTask(id)!, warned, paused };
+}
+
+/** The task whose turn ran in this thread, newest first; null when the
+ * thread is not a board task's. */
+export function taskByThread(threadId: string): BoardTask | null {
+  const row = handle().prepare("SELECT * FROM tasks WHERE thread_id = ? ORDER BY updated_at DESC LIMIT 1").get(threadId) as unknown as TaskRow | undefined;
+  return row ? rowToTask(row) : null;
+}
+
+/** The result as the harness recorded it (the turn's digest line), without
+ * touching status: what was done, not only what was said. */
+export function setResult(id: string, result: string): BoardTask {
+  handle().prepare("UPDATE tasks SET result = ?, updated_at = ? WHERE id = ?").run(clamp(result, TASK_BODY_MAX), Date.now(), id);
+  const task = getTask(id);
+  if (!task) throw new Error(`no such task: ${id}`);
+  return task;
 }
 
 /** todo tasks with nothing left to wait for. An archived parent counts as
