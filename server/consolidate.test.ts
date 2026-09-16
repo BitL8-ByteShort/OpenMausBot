@@ -2,7 +2,7 @@
 // the confirmed stamp, the plan (duplicates, contradictions, stale lines,
 // the floor) and applying it.
 import { describe, expect, it } from "vitest";
-import { applyPlan, confirmedDate, consolidatorPrompt, parseContradictions, parseNotebook, planConsolidation, stampConfirmed } from "./consolidate.ts";
+import { applyPlan, confirmedDate, consolidatorPrompt, duplicateIndexes, parseContradictions, parseNotebook, planConsolidation, stampConfirmed } from "./consolidate.ts";
 
 const TODAY = "2026-09-16";
 const NOTEBOOK = [
@@ -82,6 +82,11 @@ describe("the contradiction call", () => {
     const prompt = consolidatorPrompt(entries);
     expect(prompt).toContain("You are the CONSOLIDATOR");
     expect(prompt).toMatch(/\[0\] We ship on Fridays/);
+    // asked after dedupe: the older copy is left out, the survivor keeps its index
+    expect(duplicateIndexes(entries)).toEqual(new Set([0]));
+    const deduped = consolidatorPrompt(entries, duplicateIndexes(entries));
+    expect(deduped).not.toMatch(/\[0\] We ship on Fridays/);
+    expect(deduped).toMatch(/\[1\] we ship on fridays\./);
     const pairs = parseContradictions('{"pairs": [{"a": 1, "b": 2, "keep": "b"}, {"a": 9, "b": 1, "keep": "a"}, {"a": 2, "b": 2, "keep": "a"}]}', entries.length);
     expect(pairs).toEqual([{ a: 1, b: 2, keep: "b" }]);
     expect(parseContradictions("nothing here", 5)).toEqual([]);

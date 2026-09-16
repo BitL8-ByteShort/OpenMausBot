@@ -74,6 +74,26 @@ function daysBetween(a: string, b: string): number {
   return Math.round((Date.parse(b) - Date.parse(a)) / 86_400_000);
 }
 
+/** The older copies of every exact duplicate, so the contradiction call
+ * can be asked over the deduplicated list — a model shown two identical
+ * lines beside their correction tends to miss the correction. */
+export function duplicateIndexes(entries: readonly NotebookEntry[]): Set<number> {
+  const byKey = new Map<string, Array<{ e: NotebookEntry; index: number }>>();
+  entries.forEach((e, index) => {
+    if (e.struck) return;
+    const key = normaliseBody(e.body);
+    if (!key) return;
+    byKey.set(key, [...(byKey.get(key) ?? []), { e, index }]);
+  });
+  const older = new Set<number>();
+  for (const group of byKey.values()) {
+    if (group.length < 2) continue;
+    const sorted = [...group].sort((x, y) => (x.e.date < y.e.date ? 1 : x.e.date > y.e.date ? -1 : y.index - x.index));
+    for (const item of sorted.slice(1)) older.add(item.index);
+  }
+  return older;
+}
+
 export function planConsolidation(entries: readonly NotebookEntry[], opts: { today: string; staleDays: number; floorShare: number; contradictions: readonly Contradiction[] }): ConsolidationPlan {
   const live = entries.map((e, index) => ({ e, index })).filter(({ e }) => !e.struck);
   const touched = new Set<number>();
@@ -145,8 +165,8 @@ export function applyPlan(text: string, entries: readonly NotebookEntry[], plan:
 
 const PROMPT_CAP = 200;
 
-export function consolidatorPrompt(entries: readonly NotebookEntry[]): string {
-  const listed = entries.slice(0, PROMPT_CAP).map((e, index) => (e.struck ? null : `[${index}] ${e.body}`)).filter(Boolean).join("\n");
+export function consolidatorPrompt(entries: readonly NotebookEntry[], exclude: ReadonlySet<number> = new Set()): string {
+  const listed = entries.slice(0, PROMPT_CAP).map((e, index) => (e.struck || exclude.has(index) ? null : `[${index}] ${e.body}`)).filter(Boolean).join("\n");
   return [
     "You are the CONSOLIDATOR of a personal notebook. You have no tools. Read only the numbered lines below.",
     "",

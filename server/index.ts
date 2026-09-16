@@ -346,7 +346,7 @@ import { LocalVmIdleTimer } from "./local-vm-idle.ts";
 import { LocalVmLease, LocalVmLeasePool } from "./local-vm-lease.ts";
 import { discoverGates, runGates, scopeLine } from "./gates.ts";
 import { CaptureBuffer, capturePrompt, dedupeCandidates, MAX_PER_FLUSH, normaliseFact, parseCandidates, type CaptureBatch, type Candidate } from "./capture.ts";
-import { applyPlan, consolidatorPrompt, DEFAULT_FLOOR_SHARE, parseContradictions, parseNotebook, planConsolidation, stampConfirmed, type Contradiction } from "./consolidate.ts";
+import { applyPlan, consolidatorPrompt, DEFAULT_FLOOR_SHARE, duplicateIndexes, parseContradictions, parseNotebook, planConsolidation, stampConfirmed, type Contradiction } from "./consolidate.ts";
 import { parseVerdict, verdictLine, verifierPrompt, type Verdict } from "./verifier.ts";
 import { beginNode, bySubject, finishNode, nextPending, nodeOutput, resetRunningNodes, skipNode, startGraphRun } from "./graph-runner.ts";
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
@@ -7167,7 +7167,7 @@ async function consolidateMemory(botId: string): Promise<ConsolidationSummary | 
         botName: bot.name,
         threadId: bot.threadId,
         turnKey: doc.hash,
-        prompt: consolidatorPrompt(entries),
+        prompt: consolidatorPrompt(entries, duplicateIndexes(entries)),
         instanceId: bot.modelSelection.instanceId,
         driverKind: instance?.driverKind ?? "unknown",
         model: bot.modelSelection.model,
