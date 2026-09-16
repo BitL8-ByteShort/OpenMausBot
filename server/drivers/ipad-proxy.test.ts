@@ -5,7 +5,9 @@ import {
   MAX_ELEMENTS,
   MAX_TEXT,
   START_HINT,
+  TOOLS,
   WdaUnreachable,
+  createToolRunner,
   createWdaClient,
   elementLines,
   findByText,
@@ -16,8 +18,122 @@ import {
   validatePoint,
   validateText,
   wdaBaseUrl,
+  type Downscale,
   type FetchLike,
 } from "./ipad-proxy.ts";
+
+const PNG_1X1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
+
+const text = (r: { content: Array<{ type: string; text?: string }> }) => r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
+
+function runnerWith(extraRoutes: Record<string, Route> = {}, downscale: Downscale = async (png) => png) {
+  const source = {
+    type: "XCUIElementTypeApplication", label: "", name: "Notes", value: "", isVisible: "1", rect: { x: 0, y: 0, width: 1024, height: 768 },
+    children: [
+      { type: "XCUIElementTypeButton", label: "New Note", name: "", value: "", isVisible: "1", rect: { x: 900, y: 10, width: 100, height: 40 }, children: [] },
+      { type: "XCUIElementTypeSecureTextField", label: "Password", name: "", value: "", isVisible: "0", rect: { x: 0, y: 0, width: 10, height: 10 }, children: [] },
+    ],
+  };
+  const wda = fakeWda({
+    "GET /status": () => ({ value: { ready: true, os: { name: "iPadOS", version: "26.0" }, device: "ipad" } }),
+    "POST /session": () => ({ value: { sessionId: "S1" } }),
+    "GET /session/S1/window/size": () => ({ value: { width: 1024, height: 768 } }),
+    "GET /session/S1/wda/screen": () => ({ value: { scale: 2, statusBarSize: { width: 1024, height: 24 } } }),
+    "GET /source?format=json": () => ({ value: source }),
+    "GET /screenshot": () => ({ value: PNG_1X1.toString("base64") }),
+    "POST /session/S1/wda/apps/launch": () => ({ value: null }),
+    "POST /session/S1/wda/keys": () => ({ value: null }),
+    "POST /session/S1/wda/homescreen": () => ({ value: null }),
+    "POST /session/S1/actions": () => ({ value: null }),
+    ...extraRoutes,
+  });
+  const client = createWdaClient({ fetch: wda.fetch, baseUrl: "http://127.0.0.1:8100" });
+  return { run: createToolRunner({ client, downscale }), calls: wda.calls };
+}
+
+describe("TOOLS", () => {
+  it("exposes the nine phone-shaped tools", () => {
+    expect(TOOLS.map((t) => t.name)).toEqual(["status", "read_screen", "screenshot", "open_app", "tap_text", "tap", "swipe", "type_text", "press"]);
+  });
+});
+
+describe("createToolRunner", () => {
+  it("status reports the device, size and scale when reachable", async () => {
+    const { run } = runnerWith();
+    const out = JSON.parse(text(await run("status", {})));
+    expect(out).toMatchObject({ available: true, os: "iPadOS 26.0", screen: { width: 1024, height: 768, scale: 2 } });
+  });
+
+  it("status explains how to start WDA when unreachable, without isError", async () => {
+    const client = createWdaClient({ fetch: async () => { throw new Error("ECONNREFUSED"); }, baseUrl: "http://127.0.0.1:8100" });
+    const run = createToolRunner({ client, downscale: async (png) => png });
+    const result = await run("status", {});
+    expect(result.isError).toBeUndefined();
+    expect(text(result)).toContain("pnpm ipad:wda");
+    expect(JSON.parse(text(result)).available).toBe(false);
+  });
+
+  it("read_screen lists visible elements only", async () => {
+    const { run } = runnerWith();
+    const lines = text(await run("read_screen", {}));
+    expect(lines).toContain('Button "New Note" at (950,30) rect 900,10 100x40');
+    expect(lines).not.toContain("Password");
+  });
+
+  it("screenshot downscales to the point width and returns a PNG", async () => {
+    const seen: number[] = [];
+    const { run } = runnerWith({}, async (png, width) => { seen.push(width); return png; });
+    const result = await run("screenshot", {});
+    expect(seen).toEqual([1024]);
+    expect(result.content[1]).toMatchObject({ type: "image", mimeType: "image/png", data: PNG_1X1.toString("base64") });
+    expect(text(result)).toContain("1024x768 points");
+  });
+
+  it("open_app launches a known name or bundle id and hints on unknown names", async () => {
+    const { run, calls } = runnerWith();
+    expect(text(await run("open_app", { name: "Notes" }))).toBe("Opened Notes (com.apple.mobilenotes)");
+    expect(calls.find((c) => c.path === "/session/S1/wda/apps/launch")?.body).toEqual({ bundleId: "com.apple.mobilenotes" });
+    expect(text(await run("open_app", { name: "org.mozilla.ios.Firefox" }))).toContain("org.mozilla.ios.Firefox");
+    const unknown = await run("open_app", { name: "Fortnite" });
+    expect(unknown.isError).toBe(true);
+    expect(text(unknown)).toMatch(/tap_text/);
+  });
+
+  it("tap_text touches the centre of the match", async () => {
+    const { run, calls } = runnerWith();
+    expect(text(await run("tap_text", { text: "new note" }))).toBe('Tapped "New Note"');
+    const actions = calls.find((c) => c.path === "/session/S1/actions")?.body as { actions: Array<{ actions: Array<Record<string, unknown>> }> };
+    expect(actions.actions[0].actions[0]).toMatchObject({ x: 950, y: 30 });
+  });
+
+  it("tap validates against the screen size", async () => {
+    const { run } = runnerWith();
+    expect(text(await run("tap", { x: 100, y: 200 }))).toBe("Tapped 100,200");
+    const bad = await run("tap", { x: 5000, y: 0 });
+    expect(bad.isError).toBe(true);
+  });
+
+  it("swipe, type_text and press hit the right WDA routes", async () => {
+    const { run, calls } = runnerWith();
+    expect(text(await run("swipe", { direction: "up" }))).toBe("Swiped up");
+    expect(text(await run("type_text", { text: "hello" }))).toBe("Typed text into the focused iPad field");
+    expect(calls.find((c) => c.path === "/session/S1/wda/keys")?.body).toEqual({ value: ["hello"] });
+    expect(text(await run("press", { key: "home" }))).toBe("Pressed home");
+    expect(calls.some((c) => c.path === "/session/S1/wda/homescreen")).toBe(true);
+    expect(text(await run("press", { key: "enter" }))).toBe("Pressed enter");
+    expect(calls.filter((c) => c.path === "/session/S1/wda/keys").at(-1)?.body).toEqual({ value: ["\n"] });
+    const bad = await run("press", { key: "volume" });
+    expect(bad.isError).toBe(true);
+  });
+
+  it("unknown tools and WDA failures come back as isError results", async () => {
+    const { run } = runnerWith({ "POST /session/S1/wda/apps/launch": () => ({ status: 400, value: { error: "invalid argument", message: "no such app" } }) });
+    expect((await run("nope", {})).isError).toBe(true);
+    const failed = await run("open_app", { name: "Notes" });
+    expect(failed.isError).toBe(true);
+    expect(text(failed)).toContain("no such app");
+  });
+});
 
 type Route = (body: unknown) => { status?: number; value: unknown };
 function fakeWda(routes: Record<string, Route>) {
