@@ -997,14 +997,9 @@ export class RoutineManager {
     // schedule for the same bot, still enabled, is told it is already
     // scheduled instead of adding a twin. A person's own calendar edits
     // (no request) stay free to duplicate on purpose.
-    const twin = request
-      ? this.routines.find((existing) => existing.enabled && existing.botId === clean.botId && existing.target === clean.target
-        && normaliseRoutinePrompt(existing.prompt) === normaliseRoutinePrompt(clean.prompt)
-        && JSON.stringify(existing.schedule) === JSON.stringify(clean.schedule))
-      : undefined;
-    if (twin) {
-      const when = twin.nextRunAt ? new Date(twin.nextRunAt).toISOString() : "when its schedule allows";
-      throw new Error(`already scheduled: "${twin.name}" runs these same instructions, next at ${when}. Edit that routine instead of adding another.`);
+    if (request) {
+      const twin = this.scheduledTwin(clean);
+      if (twin) throw new Error(this.alreadyScheduledMessage(twin));
     }
     const nextRunAt = clean.enabled ? this.initialOccurrence(clean.schedule, at) : null;
     if (clean.schedule.type === "interval" && clean.enabled && nextRunAt === null) {
@@ -1027,6 +1022,34 @@ export class RoutineManager {
     }, discardResults);
     this.emitRoutine(routine);
     return cloneRoutine(routine);
+  }
+
+  /** Phase 4 part 4: an enabled routine of the same bot with the same
+   * instructions on the same schedule, or null. Checked before a bot's
+   * proposal card and again when the card is confirmed. */
+  scheduledTwin(input: Pick<RoutineInput, "prompt" | "botId" | "schedule"> & { target?: RoutineTarget }): Routine | null {
+    const target = input.target ?? "bot";
+    const twin = this.routines.find((existing) => existing.enabled && existing.botId === input.botId && existing.target === target
+      && normaliseRoutinePrompt(existing.prompt) === normaliseRoutinePrompt(input.prompt)
+      && JSON.stringify(existing.schedule) === JSON.stringify(input.schedule));
+    return twin ? cloneRoutine(twin) : null;
+  }
+
+  /** The same check for a raw proposal, before its card: the input is
+   * sanitised like a create would; an invalid proposal has no twin (the
+   * create will say what is wrong). */
+  proposalTwin(input: RoutineInput): Routine | null {
+    try {
+      const clean = sanitizeInput(input, this.now());
+      return this.scheduledTwin({ prompt: clean.prompt, botId: clean.botId, schedule: clean.schedule, target: clean.target });
+    } catch {
+      return null;
+    }
+  }
+
+  alreadyScheduledMessage(twin: Routine): string {
+    const when = twin.nextRunAt ? new Date(twin.nextRunAt).toISOString() : "when its schedule allows";
+    return `already scheduled: "${twin.name}" runs these same instructions, next at ${when}. Edit that routine instead of adding another.`;
   }
 
   update(

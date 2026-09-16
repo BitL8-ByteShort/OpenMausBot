@@ -2633,6 +2633,7 @@ describe("run records for recurring routines (Phase 2 part 4)", () => {
     const input = () => ({ name: "Queue check", prompt: "Check the queue and report", botId: "maus-1", enabled: true, schedule: { type: "daily" as const, time: "09:00", weekdays: [1] } });
     const request = (n: number) => ({ requestId: `req-${n}`, messageId: `msg-${n}`, botId: "maus-1", threadId: "thread-1", action: "create" as const, fingerprintVersion: 1 as const, fingerprint: `fp-${n}` });
     const first = h.manager.create(input(), request(1));
+    expect(h.manager.proposalTwin({ ...input(), name: "Proposed twin" })?.name).toBe("Queue check"); // checked before the card
     expect(() => h.manager.create({ ...input(), name: "Another name" }, request(2))).toThrow(/already scheduled: "Queue check"/);
     // a different schedule is not a twin; a person's own create never is
     expect(h.manager.create({ ...input(), name: "Evening", schedule: { type: "daily" as const, time: "18:00", weekdays: [1] } }, request(3)).id).not.toBe(first.id);

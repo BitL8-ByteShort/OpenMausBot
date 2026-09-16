@@ -353,7 +353,7 @@ import { beginNode, bySubject, finishNode, nextPending, nodeOutput, resetRunning
 import { RepeatDetector, callKey } from "./repeat-detector.ts";
 import { redactSecretsInText } from "./redact.ts";
 import * as vps from "./vps-computer.ts";
-import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
+import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger, type RoutineInput } from "./routines.ts";
 import { CalendarCallManager, type CalendarCall } from "./calendar-calls.ts";
 import {
   addComment,
@@ -11866,6 +11866,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const persistence = proposalPersistence(from.id, fromThreadId);
         if (!persistence.ok) {
           return json(res, persistence.status, { error: persistence.error });
+        }
+        // Phase 4 part 4: an enabled twin is named now, before any card,
+        // so the bot can tell the person instead of asking them to confirm
+        if (body.action === "create") {
+          const twin = routines.proposalTwin({ ...(body.routine as RoutineInput), botId: forBot?.botId ?? from.id });
+          if (twin) return json(res, 409, { error: routines.alreadyScheduledMessage(twin) });
         }
         const proposedInput = body.action === "create"
           ? { action: body.action, routine: body.routine, forBot }
