@@ -45,6 +45,33 @@ export function pickIpad(devicectl) {
   return null;
 }
 
+/** xcodebuild answers a refusal with one useful sentence and several hundred
+ * lines of DVT stack frames. Print the sentence; drop the frames. */
+export function runnerNotes(text) {
+  const notes = [];
+  for (const line of text.split("\n")) {
+    const locked = /Unlock ([^"]+) to Continue|device is locked/.exec(line);
+    if (locked) {
+      notes.push("The iPad is locked. Unlock it (and set Auto-Lock to Never for a long session), then run this again.");
+      continue;
+    }
+    if (/isn't registered in your developer account|not registered to your team/.test(line)) {
+      notes.push("The iPad is not registered on this developer team. Add its UDID at developer.apple.com → Devices, then run this again.");
+      continue;
+    }
+    if (/Developer Mode disabled/.test(line)) {
+      notes.push("Developer Mode is off on the iPad. Turn it on in Settings → Privacy & Security → Developer Mode, restart, then run this again.");
+      continue;
+    }
+    if (/^(\*\* TEST|Testing failed|\s+error:)/.test(line) || /^[^\s].*\berror:/.test(line)) notes.push(line.trim());
+  }
+  return [...new Set(notes)];
+}
+
+function report(text) {
+  for (const note of runnerNotes(text)) console.error(note);
+}
+
 function teamIdFromExportOptions() {
   const plist = readFileSync(join(ROOT, "ios", "ExportOptions.plist"), "utf8");
   const match = /<key>teamID<\/key>\s*<string>([^<]+)<\/string>/.exec(plist);
@@ -100,8 +127,12 @@ async function main(argv) {
   }
 
   console.log("Starting the runner on the iPad...");
-  const runner = spawn("xcodebuild", plan.test, { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, ...plan.env } });
-  const forward = spawn("iproxy", plan.iproxy, { stdio: ["ignore", "ignore", "inherit"] });
+  const runner = spawn("xcodebuild", plan.test, { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...plan.env } });
+  for (const stream of [runner.stdout, runner.stderr]) stream.on("data", (chunk) => report(chunk.toString("utf8")));
+  // iproxy retries once a second until the runner answers; that spam would
+  // bury the one line that matters (a locked iPad, a signing refusal).
+  const forward = spawn("iproxy", plan.iproxy, { stdio: ["ignore", "ignore", "pipe"] });
+  forward.stderr.on("data", () => {});
   const stop = () => { runner.kill("SIGINT"); forward.kill("SIGINT"); };
   process.on("SIGINT", () => { stop(); process.exit(0); });
   process.on("SIGTERM", () => { stop(); process.exit(0); });
