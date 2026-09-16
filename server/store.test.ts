@@ -65,6 +65,27 @@ describe("Store", () => {
     expect(bot.modelSelection).toEqual(selection());
   });
 
+  it("clears provider-owned voice ids as one durable mutation", () => {
+    const store = new Store(selection);
+    const first = store.createBot();
+    const second = store.createBot();
+    store.patchBot(first.id, { voice: "provider-a-1" });
+    store.patchBot(second.id, { voice: "provider-a-2" });
+
+    const save = vi.spyOn(store as unknown as { saveBots(bots: BotRecord[]): void }, "saveBots");
+    save.mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(() => store.clearVoiceSelections()).toThrow("disk full");
+    expect(first.voice).toBe("provider-a-1");
+    expect(second.voice).toBe("provider-a-2");
+
+    expect(store.clearVoiceSelections().map((bot) => bot.id).sort()).toEqual([first.id, second.id].sort());
+    expect(first.voice).toBeUndefined();
+    expect(second.voice).toBeUndefined();
+    const reloaded = new Store(selection);
+    expect(reloaded.bot(first.id)?.voice).toBeUndefined();
+    expect(reloaded.bot(second.id)?.voice).toBeUndefined();
+  });
+
   it("restarts with legacy bot and group migrations despite an unreadable team registry, without permitting later team writes", () => {
     const original = new Store(selection);
     const bot = original.createBot({ name: "Legacy bot", section: "Research" });
@@ -228,7 +249,7 @@ describe("Store", () => {
   it("addTaskUsage accumulates settled-turn totals per task and survives a restart", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 1200, output: 300, cachedInput: 1000, costUsd: null })).toEqual({
+    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 1200, output: 300, cachedInput: 1000, costUsd: null })).toMatchObject({
       input: 1200,
       output: 300,
       cachedInput: 1000,
@@ -245,13 +266,19 @@ describe("Store", () => {
     expect(store.addTaskUsage(bot.id, "no-such-thread", { input: 5, output: 5, costUsd: null })).toBeNull();
 
     const reloaded = new Store(selection);
-    expect(reloaded.taskByThread(bot.id, bot.threadId)?.usage).toEqual({
+    expect(reloaded.taskByThread(bot.id, bot.threadId)?.usage).toMatchObject({
       input: 2010,
       output: 400,
       cachedInput: 1010,
       costUsd: null,
       turns: 4,
     });
+    // the last turn stands on its own, and the context reading survives a turn that did not report one
+    const withContext = store.addTaskUsage(bot.id, bot.threadId, { input: 300, output: 40, cachedInput: 250, costUsd: null, context: { tokens: 142_000, window: 272_000 } });
+    expect(withContext).toMatchObject({ lastTurn: { input: 300, output: 40, cachedInput: 250, costUsd: null }, context: { tokens: 142_000, window: 272_000 } });
+    const kept = store.addTaskUsage(bot.id, bot.threadId, { input: 5, output: 1, costUsd: null, context: { tokens: 0 } });
+    expect(kept).toMatchObject({ lastTurn: { input: 5, output: 1, costUsd: null }, context: { tokens: 142_000, window: 272_000 } });
+    expect(kept?.lastTurn).not.toHaveProperty("cachedInput");
   });
 
   it("chain-inserts a late turn artifact after its anchor without stealing the leaf", () => {
@@ -569,6 +596,22 @@ describe("Store", () => {
 
     const reloaded = new Store(selection);
     expect(reloaded.bot(bot.id)?.modelSelection.effort).toBe("high");
+  });
+
+  it("stores variants independently and seeds future conversations from the bot default", () => {
+    const store = new Store(selection);
+    const bot = store.createBot();
+    const first = bot.threadId;
+    const second = store.createTask(bot.id, "Second")!;
+    const chosen = { instanceId: "opencodeGo", model: "provider/model", variant: "low" };
+    store.switchTaskModel(bot.id, first, chosen, false, false);
+    expect(store.projectBotForTask(bot.id, second.threadId)!.modelSelection).toEqual(selection());
+    store.patchBot(bot.id, { modelSelection: { ...chosen, variant: "minimal" } });
+    const future = store.createTask(bot.id, "Future")!;
+    const reloaded = new Store(selection);
+    expect(reloaded.projectBotForTask(bot.id, first)!.modelSelection).toEqual(chosen);
+    expect(reloaded.projectBotForTask(bot.id, second.threadId)!.modelSelection).toEqual(selection());
+    expect(reloaded.projectBotForTask(bot.id, future.threadId)!.modelSelection).toEqual({ ...chosen, variant: "minimal" });
   });
 
   it("keeps one persisted Chief of Staff per section and supports handoff", () => {
@@ -1450,19 +1493,19 @@ describe("Store task usage", () => {
   it("banks each turn's tokens and cost on the task, counting turns", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 100, output: 20, costUsd: 0.01 })).toEqual({
+    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 100, output: 20, costUsd: 0.01 })).toMatchObject({
       input: 100,
       output: 20,
       costUsd: 0.01,
       turns: 1,
     });
-    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 50, output: 5, costUsd: 0.005 })).toEqual({
+    expect(store.addTaskUsage(bot.id, bot.threadId, { input: 50, output: 5, costUsd: 0.005 })).toMatchObject({
       input: 150,
       output: 25,
       costUsd: 0.015,
       turns: 2,
     });
-    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toEqual({ input: 150, output: 25, costUsd: 0.015, turns: 2 });
+    expect(store.taskByThread(bot.id, bot.threadId)?.usage).toMatchObject({ input: 150, output: 25, costUsd: 0.015, turns: 2 });
   });
 
   it("keeps cost null until some turn reports one, then sums only reported costs", () => {
@@ -1476,7 +1519,7 @@ describe("Store task usage", () => {
   it("counts a turn that reported no tokens at all", () => {
     const store = new Store(selection);
     const bot = store.createBot();
-    expect(store.addTaskUsage(bot.id, bot.threadId, { costUsd: null })).toEqual({ input: 0, output: 0, costUsd: null, turns: 1 });
+    expect(store.addTaskUsage(bot.id, bot.threadId, { costUsd: null })).toMatchObject({ input: 0, output: 0, costUsd: null, turns: 1 });
   });
 
   it("ignores an unknown task", () => {

@@ -1,7 +1,9 @@
 import { track } from "@/lib/analytics";
+import { OrganizationIdentity } from "./OrganizationIdentity";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  Activity,
   Archive,
   BellDot,
   Bot as BotIcon,
@@ -49,13 +51,15 @@ import { BotPickerList } from "./BotPickerList";
 import { BotProjectDialog, FolderActions, FolderIcon, navigateThreadMenu, NewThreadButton } from "./BotProjects";
 import { draggedFolder, FOLDER_DRAG_TYPE, moveFolder, placeFolder } from "@/lib/folder-order";
 import { folderUnreadThreadIds, markFolderRead } from "@/lib/folder-read";
-import { SidebarThreadRow, visibleSidebarThreads } from "./SidebarThreadRow";
+import { isArchived, orderedSidebarThreads, SidebarThreadRow, visibleSidebarThreads } from "./SidebarThreadRow";
 import {
   loadCollapsedSections,
   loadSectionOrder,
+  loadSidebarAttentionPinned,
   loadSidebarDensity,
   saveCollapsedSections,
   saveSectionOrder,
+  saveSidebarAttentionPinned,
   saveSidebarDensity,
   toggleCollapsedSection,
   type SidebarDensity,
@@ -88,7 +92,8 @@ import { DesktopWorkspaceSwitcher } from "./DesktopWorkspaceSwitcher";
 import { profileInitials, SidebarProfileMenu } from "./SidebarProfileMenu";
 import { SidebarSectionHeader } from "./SidebarSectionHeader";
 import { useShowThreads } from "@/lib/thread-preferences";
-import { SidebarBotActivity, sidebarBotActivityTasks } from "./SidebarBotActivity";
+import { AttentionThreadRows, crossBotAttentionThreads, SidebarBotActivity, sidebarBotActivityTasks } from "./SidebarBotActivity";
+import { SidebarAttentionPanel } from "./SidebarAttentionPanel";
 import { ShortcutHint } from "./ShortcutHint";
 
 const SECTION_LABEL_KEYS: Record<string, LocaleKey> = {
@@ -808,8 +813,9 @@ export function currentArchivableBot(bots: readonly Bot[], id: string): Bot | un
 
 /** Copy for the archive / delete confirmation dialogs. Archiving keeps
  * everything and is reversible from Archived bots; deleting is not — the
- * server drops every task transcript, the workspace (files + memory), and
- * staged skill state with the bot. */
+ * server drops every task transcript, the workspace (files + memory), staged
+ * skill state, and any private computer the bot owns. Shared team computers
+ * remain. */
 export function botConfirmCopy(kind: BotConfirmKind, name: string) {
   return kind === "archive"
     ? {
@@ -854,6 +860,9 @@ export function BotDeleteMenuItem({ deleting, onClick }: { deleting: boolean; on
   );
 }
 
+/** The thread tree under one bot row: project folders, then ungrouped rows.
+ * Visibility folds old threads away; ordering floats attention to the top so
+ * the person never hunts for a working thread below newer idle ones. */
 export function BotThreadList({ bot, selected, density = "comfortable", query = "", hidden = false }: { bot: Bot; selected: boolean; density?: SidebarDensity; query?: string; hidden?: boolean }) {
   const { state, dispatch } = useStore();
   const tasks = (bot.tasks ?? [{ threadId: bot.threadId, title: t("task.newShort"), createdAt: 0 }])
@@ -872,6 +881,7 @@ export function BotThreadList({ bot, selected, density = "comfortable", query = 
   const [folderDrop, setFolderDrop] = useState<{ id: string; place: "before" | "after" } | null>(null);
   const draggingFolder = useRef<string | null>(null);
   const [showAll, setShowAll] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const currentProjectId = tasks.find((task) => task.threadId === bot.threadId)?.projectId;
   useEffect(() => {
     if (selected && currentProjectId) setCollapsed((previous) => {
@@ -881,7 +891,15 @@ export function BotThreadList({ bot, selected, density = "comfortable", query = 
       return next;
     });
   }, [selected, currentProjectId]);
-  const visibleTasks = visibleSidebarThreads(tasks, bot.threadId, query, projects, showAll);
+  // Attention floats within the default list; search keeps relevance order.
+  const visibleTasks = query
+    ? visibleSidebarThreads(tasks, bot.threadId, query, projects, showAll)
+    : orderedSidebarThreads(visibleSidebarThreads(tasks, bot.threadId, "", projects, showAll), bot.threadId);
+  // Folders follow their best thread in that same order, so a folder holding
+  // a waiting approval outranks one holding only idle history; search keeps
+  // relevance order, and the stored order still governs move up and down.
+  const visibleProjectIndex = (projectId: string) => visibleTasks.findIndex((task) => task.projectId === projectId);
+  const orderedProjects = query ? projects : [...projects].sort((a, b) => visibleProjectIndex(b.id) - visibleProjectIndex(a.id));
   useRevealedThreadRow(state.revealThread, selected ? bot.threadId : null);
   const renderThread = (task: (typeof tasks)[number]) => {
     const thread = currentTaskBot(bot, task.threadId);
@@ -889,9 +907,15 @@ export function BotThreadList({ bot, selected, density = "comfortable", query = 
       onSelect={() => { if (task.threadId !== bot.threadId) dispatch({ type: "switchTask", botId: bot.id, threadId: task.threadId }); else dispatch({ type: "select", id: bot.id }); }}
       onRename={(title) => dispatch({ type: "renameTask", botId: bot.id, threadId: task.threadId, title })}
       onDelete={() => dispatch({ type: "deleteTask", botId: bot.id, threadId: task.threadId })}
-      onMove={(projectId) => dispatch({ type: "updateTask", botId: bot.id, threadId: task.threadId, patch: { projectId } })} />;
+      onMove={(projectId) => dispatch({ type: "updateTask", botId: bot.id, threadId: task.threadId, patch: { projectId } })}
+      onArchive={(archivedAt) => dispatch({ type: "updateTask", botId: bot.id, threadId: task.threadId, patch: { archivedAt } })} />;
   };
   const ungrouped = visibleTasks.filter((task) => !projects.some((project) => project.id === task.projectId));
+  // The archived disclosure holds only what the default list folds away; an
+  // archived thread that demands attention already sits in the rows above.
+  const archivedTasks = !query && !showAll
+    ? tasks.filter((task) => isArchived(task) && !visibleTasks.some((visible) => visible.threadId === task.threadId))
+    : [];
   const projectToEdit = projects.find((project) => project.id === editingProject);
   const projectIds = projects.map((project) => project.id);
   const saveOrder = (ids: string[], onSaved?: () => void) => {
@@ -919,7 +943,8 @@ export function BotThreadList({ bot, selected, density = "comfortable", query = 
       onDragOver={(event) => { if (event.dataTransfer.types.includes(FOLDER_DRAG_TYPE)) event.stopPropagation(); }}
       onDrop={(event) => { if (event.dataTransfer.types.includes(FOLDER_DRAG_TYPE)) { event.preventDefault(); event.stopPropagation(); resetFolderDrag(); } }}>
       {!hidden && <>
-      {projects.map((project, index) => {
+      {orderedProjects.map((project) => {
+        const index = projects.indexOf(project);
         const projectTasks = tasks.filter((task) => task.projectId === project.id);
         const visible = visibleTasks.filter((task) => task.projectId === project.id);
         if (query && visible.length === 0 && !project.name.toLowerCase().includes(query.toLowerCase())) return null;
@@ -992,6 +1017,13 @@ export function BotThreadList({ bot, selected, density = "comfortable", query = 
       {projects.length > 0 && ungrouped.length > 0 && <div className="px-3 pb-1 pt-2 text-[10.5px] text-ink-secondary/70">{t("task.list")}</div>}
       {ungrouped.map(renderThread)}
       {!query && !showAll && tasks.length > visibleTasks.length && <button type="button" onClick={() => setShowAll(true)} className="px-3 py-1.5 text-[11px] text-ink-secondary hover:text-ink">{t("task.showAll", { count: tasks.length })}</button>}
+      {archivedTasks.length > 0 && <>
+        <button type="button" aria-expanded={showArchived} onClick={() => setShowArchived((previous) => !previous)} className="flex items-center gap-1 px-3 py-1.5 text-[11px] text-ink-secondary hover:text-ink">
+          <ChevronRight aria-hidden="true" size={11} className={cn("shrink-0 transition-transform", showArchived && "rotate-90")} />
+          {t("task.archivedList", { count: archivedTasks.length })}
+        </button>
+        {showArchived && archivedTasks.map(renderThread)}
+      </>}
       <NewThreadButton bot={bot} className="mt-1 w-full rounded-md" />
       {projectToEdit && <BotProjectDialog bot={bot} project={projectToEdit} onClose={() => setEditingProject(null)} />}
       </>}
@@ -1464,6 +1496,12 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
   const [roomMenu, setRoomMenu] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [roomSectionPicker, setRoomSectionPicker] = useState<{ groupId: string; x: number; y: number } | null>(null);
   const [plusOpen, setPlusOpen] = useState(false);
+  const [attentionOpen, setAttentionOpen] = useState(false);
+  const [attentionPinned, setAttentionPinnedState] = useState(() => loadSidebarAttentionPinned());
+  const setAttentionPinned = (pinned: boolean) => {
+    setAttentionPinnedState(pinned);
+    saveSidebarAttentionPinned(pinned);
+  };
   const [newRoom, setNewRoom] = useState(false);
   const [newFolderBotId, setNewFolderBotId] = useState<string | null>(null);
   const [teamLibraryOpen, setTeamLibraryOpen] = useState(false);
@@ -1729,6 +1767,10 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
     resetSectionDrag();
   };
   const archivedBots = state.bots.filter((bot) => bot.hidden);
+  // Every thread across every bot that needs the person right now — the
+  // same rule and order as the sidebar tree, so the bell can never
+  // disagree with it.
+  const attention = crossBotAttentionThreads(state.bots, state.pendingQueued);
   const pendingBotUndo = teamFeedback?.restoreBot;
 
   return (
@@ -1825,6 +1867,45 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
             )}
           </div>
           <button
+            type="button"
+            onClick={() => setAttentionOpen((o) => !o)}
+            aria-label={t("attention.title")}
+            title={t("attention.title")}
+            className="relative flex size-10 items-center justify-center rounded-md text-ink-secondary hover:bg-raised hover:text-ink"
+          >
+            <Activity size={20} strokeWidth={2} />
+            {attention.length > 0 && (
+              <span className="absolute right-1 top-1 flex min-w-4 items-center justify-center rounded-full bg-accent px-0.5 text-[9.5px] font-semibold leading-4 text-ink">{attention.length > 9 ? "9+" : attention.length}</span>
+            )}
+          </button>
+          {attentionOpen && (
+            <>
+              <div className="fixed inset-0 z-30" onMouseDown={() => setAttentionOpen(false)} />
+              <div className={cn(
+                "absolute top-full z-40 mt-1 w-72 overflow-hidden rounded-xl border border-hairline/50 bg-menu py-1.5 shadow-2xl shadow-black/60",
+                density === "icons" ? "left-0" : "right-0",
+              )}>
+                <div className="flex items-center gap-1 pb-1 pl-3.5 pr-2 pt-1.5">
+                  <span className="flex-1 text-[13px] font-medium text-ink">{t("attention.title")}</span>
+                  <button
+                    type="button"
+                    onClick={() => setAttentionPinned(!attentionPinned)}
+                    aria-label={t(attentionPinned ? "attention.unpin" : "attention.pin")}
+                    title={t(attentionPinned ? "attention.unpin" : "attention.pin")}
+                    className="flex size-6 items-center justify-center rounded text-ink-secondary hover:bg-raised hover:text-ink"
+                  >
+                    {attentionPinned ? <PinOff size={14} /> : <Pin size={14} />}
+                  </button>
+                </div>
+                {attention.length === 0 ? (
+                  <div className="px-3.5 py-2.5 text-[13px] text-ink-secondary">{t("attention.empty")}</div>
+                ) : (
+                  <AttentionThreadRows entries={attention} onJump={(entry) => { setAttentionOpen(false); dispatch({ type: "switchTask", botId: entry.botId, threadId: entry.task.threadId }); }} />
+                )}
+              </div>
+            </>
+          )}
+          <button
             ref={importReturnRef}
             onClick={() => setPlusOpen((o) => !o)}
             aria-label={remoteClient ? t("sidebar.new") : t("sidebar.newOrShare")}
@@ -1899,6 +1980,7 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
       </div>
 
       <DesktopWorkspaceSwitcher compact={density === "icons"} />
+      <OrganizationIdentity compact={density === "icons"} />
       {/* Search */}
       <div className={cn("pt-1 pb-3", density === "icons" ? "hidden" : "px-3")}>
         <div className="flex items-center gap-2 rounded-md border border-hairline/40 bg-inset/40 px-2.5 py-1.5 focus-within:border-accent/50">
@@ -1913,6 +1995,15 @@ export function Sidebar({ open, onClose }: { open: boolean; onClose: () => void 
           />
         </div>
       </div>
+
+      {attentionPinned && density !== "icons" && (
+        <SidebarAttentionPanel
+          entries={attention}
+          density={density}
+          onUnpin={() => setAttentionPinned(false)}
+          onJump={(entry) => dispatch({ type: "switchTask", botId: entry.botId, threadId: entry.task.threadId })}
+        />
+      )}
 
       {/* Bot list */}
       <div className="flex-1 overflow-y-auto px-2">

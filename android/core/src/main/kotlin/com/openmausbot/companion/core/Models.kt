@@ -292,6 +292,9 @@ data class BotTask(
     val projectId: String? = null,
     val openedBy: ThreadOpener? = null,
     val closedBy: ThreadCloser? = null,
+    /** The person put this thread away. Present means archived — a stamp of
+     * 0 is still archived, because the task API accepts any epoch number. */
+    val archivedAt: Double? = null,
     /** Bot-only internal execution. Keep it addressable, but out of thread pickers. */
     val routineRunId: String? = null,
 )
@@ -304,13 +307,18 @@ val BotTask.openedByLabel: String?
 val BotTask.isClosed: Boolean
     get() = closedBy != null
 
+/** Archived is the presence of the stamp, not its value: archivedAt 0 counts. */
+val BotTask.isArchived: Boolean
+    get() = archivedAt != null
+
 /**
  * The one line under a title: who closed it once a bot has, otherwise who
- * opened it, otherwise nothing. Closed wins because it is the newer fact and
- * the reason the row is dimmed.
+ * opened it, otherwise nothing. Closed wins because it is the newer fact;
+ * archived wins over the opener because it explains why the row sits where
+ * it does.
  */
 val BotTask.bylineLabel: String?
-    get() = closedBy?.let { "closed by ${it.name}" } ?: openedByLabel
+    get() = closedBy?.let { "closed by ${it.name}" } ?: if (isArchived) "Archived" else openedByLabel
 
 @Serializable
 data class Bot(
@@ -672,8 +680,24 @@ data class InstanceCapabilities(
 @Serializable
 data class InstanceList(val instances: List<Instance>)
 
-/** Which engine actually speaks. `VoiceProvider` in `server/tts/index.ts`. */
-enum class VoiceProvider { ELEVENLABS, SYSTEM }
+/**
+ * Which engine actually speaks. `VoiceProvider` in `server/tts/index.ts`;
+ * [wire] is the exact string the config write carries, and [fromWire] applies
+ * the server's own fallback: a missing field — an older desktop that predates
+ * the choice — and a provider this build has never heard of both mean
+ * ElevenLabs, keeping an unrecognised engine from being explained with copy
+ * written for a different one.
+ */
+enum class VoiceProvider(val wire: String) {
+    ELEVENLABS("elevenlabs"),
+    FISH("fish"),
+    SYSTEM("system"),
+    CHATTERBOX("chatterbox");
+
+    companion object {
+        fun fromWire(value: String?): VoiceProvider = entries.firstOrNull { it.wire == value } ?: ELEVENLABS
+    }
+}
 
 @Serializable
 data class ConfigFlag(
@@ -716,15 +740,12 @@ data class ConfigStatus(
         isTTSConfigured && (!agentVoice.isNullOrBlank() || hasWorkspaceDefaultVoice)
 
     /**
-     * `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact string
-     * "system" selects the built-in engine. A missing field — an older
-     * desktop that predates the choice — and a provider this build has never
-     * heard of both fall back to ElevenLabs, which is the server's own rule
-     * and keeps an unrecognised engine from being explained with copy
-     * written for a different one.
+     * `voiceProvider(cfg)` in `server/tts/index.ts`: only a known, exact wire
+     * value selects its engine. Everything else falls back to ElevenLabs
+     * through [VoiceProvider.fromWire], which is the server's own rule.
      */
     val voiceProvider: VoiceProvider
-        get() = if (tts?.provider == "system") VoiceProvider.SYSTEM else VoiceProvider.ELEVENLABS
+        get() = VoiceProvider.fromWire(tts?.provider)
 }
 
 object ConnectedAppsRules {

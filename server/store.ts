@@ -5,6 +5,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import type { Surface } from "./surface.ts";
 
 import { writeFileAtomic } from "./atomic.ts";
 import { ensureSections, readSections, changeEmptySection } from "./section-context.ts";
@@ -152,8 +153,9 @@ export interface Message {
   /** `setup` marks an error the user fixes by installing or configuring
    * something — the UI offers setup instead of a retry that cannot work.
    * `summary` is the call's input on one redacted line (the shell command)
-   * where the driver only names the tool in `name`. */
-  tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean; summary?: string; input?: string; output?: string };
+   * where the driver only names the tool in `name`. `terminal` marks a
+   * failure of the complete turn; later explanatory text cannot erase it. */
+  tool?: { name: string; ok?: boolean; spoken?: string; setup?: boolean; terminal?: boolean; summary?: string; input?: string; output?: string };
   /** user messages sent INTO a running turn (capabilities.queueing): the
    * model saw it mid-turn, so the transcript marks it — a reader should
    * know the reply above it may already account for this line */
@@ -346,6 +348,10 @@ export interface TaskRecord {
   /** Set by close_thread; absent while the thread is open. Runtime clears
    * it on the next turn. Persisted with the task like openedBy. */
   closedBy?: TaskClosedBy;
+  /** When the person archived this thread: it leaves the default list but
+   * stays under show-all and search, and resurfaces the moment it needs them
+   * again. Absent = unarchived; reversible, like bot-level hidden. */
+  archivedAt?: number;
   /** Defaults are copied when a task is created; older records fall back
    * to the bot until migration seeds their model selection. */
   modelSelection?: ModelSelection;
@@ -367,6 +373,11 @@ export interface TaskRecord {
   lastInstanceId?: string;
   /** what this task has spent: banked once per turn from turn.completed */
   usage?: TaskUsage;
+  /** Where this conversation works: pinned by the person from the composer,
+   * or by its first Auto turn to the place that turn reached. Wins over the
+   * bot's "Works on" default (except Off) so a thread never changes place
+   * under someone. Absent = follow the bot; persisted like cwd. */
+  surface?: Surface;
   /** the folder this task's turns run in, pinned on its first turn from
    * the bot's `cwd` at that moment. Pinned, not read live: Claude keeps
    * sessions per project directory and Codex threads carry their cwd, so
@@ -377,8 +388,8 @@ export interface TaskRecord {
 
 const TASK_PATCH_FIELDS = [
   "title", "projectId", "modelSelection", "approvalMode", "autoApprove", "alwaysAllow",
-  "unread", "rewound", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
-  "routineRunId",
+  "unread", "rewound", "archivedAt", "pinnedMessageId", "resumeCursors", "lastInstanceId", "cwd",
+  "routineRunId", "surface",
 ] as const satisfies readonly (keyof TaskRecord)[];
 export type TaskPatch = Partial<Pick<TaskRecord, typeof TASK_PATCH_FIELDS[number]>>;
 
@@ -394,6 +405,14 @@ export interface TaskUsage {
    * written by builds before cost existed lack the field; read as null. */
   costUsd: number | null;
   turns: number;
+  /** The most recent settled turn on its own, so a chip can say what the
+   * last message cost instead of only a running total that grows by the
+   * whole thread every message. Absent on records from older builds. */
+  lastTurn?: { input: number; output: number; cachedInput?: number; costUsd: number | null };
+  /** What filled the model's window on the last model call of the last
+   * turn, and the window's size when known. This, not the total, predicts
+   * the next message's cost and says when a thread has grown long. */
+  context?: { tokens: number; window?: number };
 }
 
 /** Everything the BOT authored is scrubbed of content-shaped secrets before
@@ -677,6 +696,11 @@ export interface BotRecord {
   /** This bot's own voice id, so a room of bots doesn't sound like one
    * person. Falls back to the app-wide voice in config. */
   voice?: string;
+  /** Queue this bot's direct-chat messages behind its outstanding delegated
+   * work instead of steering the conversation now: the words wait in the
+   * composer queue until every assignment settles, then run as one
+   * follow-up turn. Unset keeps the default steer-immediately behavior. */
+  parkDirectMessages?: boolean;
   /** true after an edit/branch-switch rewound the visible conversation:
    * provider sessions still hold the abandoned branch, so the next turn
    * must start fresh (drop cursors) and replay the surviving path. */
@@ -1864,6 +1888,22 @@ export class Store {
     return bot;
   }
 
+  /** Voice ids belong to one provider's catalog. Changing the workspace
+   * provider invalidates every per-agent selection as one durable mutation,
+   * before clients are told to pick replacement voices. */
+  clearVoiceSelections(): BotRecord[] {
+    const changed = this.bots.filter((bot) => bot.voice !== undefined && bot.voice !== "");
+    if (!changed.length) return [];
+    const next = this.bots.map((bot) =>
+      bot.voice === undefined || bot.voice === "" ? bot : { ...bot, voice: undefined });
+    this.saveBots(next);
+    for (const bot of changed) {
+      delete bot.voice;
+      this.emit({ type: "bot", botId: bot.id });
+    }
+    return changed;
+  }
+
   /** Commit a validated profile change before publishing its fields. Unlike
    * runtime revocation, a failed user edit must leave the old profile intact. */
   patchBotProfile(id: string, patch: BotProfilePatch & Partial<Pick<BotRecord, "cwd" | "lastProfileRequestId">>): BotRecord | null {
@@ -2030,7 +2070,7 @@ export class Store {
   addTaskUsage(
     botId: string,
     threadId: string,
-    turn: { input?: number; output?: number; cachedInput?: number; costUsd: number | null },
+    turn: { input?: number; output?: number; cachedInput?: number; costUsd: number | null; context?: { tokens?: number; window?: number } },
   ): TaskUsage | null {
     const task = this.taskByThread(botId, threadId);
     if (!task) return null;
@@ -2047,12 +2087,24 @@ export class Store {
     const turnInput = clean(turn.input);
     const nextCachedInput = Math.min(clean(prev.cachedInput), prevInput)
       + Math.min(clean(turn.cachedInput), turnInput);
+    const contextTokens = clean(turn.context?.tokens);
+    const contextWindow = clean(turn.context?.window);
     task.usage = {
       input: prevInput + turnInput,
       output: prev.output + clean(turn.output),
       ...(cachedKnown ? { cachedInput: nextCachedInput } : {}),
       costUsd: cost === null ? prevCost : (prevCost ?? 0) + cost,
       turns: prev.turns + 1,
+      lastTurn: {
+        input: turnInput, output: clean(turn.output),
+        ...(typeof turn.cachedInput === "number" ? { cachedInput: Math.min(clean(turn.cachedInput), turnInput) } : {}),
+        costUsd: cost,
+      },
+      // a turn that reported no context keeps the previous reading rather
+      // than pretending the window emptied
+      ...(contextTokens > 0
+        ? { context: { tokens: contextTokens, ...(contextWindow > 0 ? { window: contextWindow } : {}) } }
+        : prev.context ? { context: prev.context } : {}),
     };
     this.saveBots();
     this.emit({ type: "bot", botId });

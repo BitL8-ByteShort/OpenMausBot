@@ -17,6 +17,8 @@ let stub: Server;
 let stubPort = 0;
 let lastAuth: string | undefined;
 let lastAskBody: any = null;
+let lastCoordinateBody: any = null;
+let coordinateResponse: unknown = { ok: true };
 let lastRoomsQuery = "";
 let lastPostBody: any = null;
 let postCalls = 0;
@@ -38,6 +40,9 @@ let delegateResponse: unknown = { queued: true, message: "Delegation queued." };
 let lastThreadBody: any = null;
 let threadCalls = 0;
 let threadResponse: unknown = { threadId: "thread-new", title: "QA: PR #1", botId: "bot-asker", botName: "Asker", self: true, state: "running", limit: 3 };
+let computerRequests: { method: string; url: string; body: unknown }[] = [];
+let computerResponse: unknown = { current: "local", available: ["local", "vm"] };
+let computerStatus = 200;
 let lastCreateBody: any = null;
 let lastCreateRoomBody: unknown = null;
 let lastManageRoomBody: unknown = null;
@@ -107,6 +112,9 @@ afterEach(() => {
   profileRequestResponse = DEFAULT_PROFILE_RESPONSE;
   teamRequestResponse = DEFAULT_TEAM_RESPONSE;
   skillStageResponse = DEFAULT_SKILL_RESPONSE;
+  computerRequests = [];
+  computerResponse = { current: "local", available: ["local", "vm"] };
+  computerStatus = 200;
 });
 
 function setProposalResponse(tool: string, response: unknown) {
@@ -181,6 +189,16 @@ beforeAll(async () => {
       });
       return;
     }
+    if (req.method === "POST" && req.url === "/api/internal/coordinate-bots") {
+      let data = "";
+      req.on("data", (c) => (data += c));
+      req.on("end", () => {
+        lastCoordinateBody = JSON.parse(data);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(coordinateResponse));
+      });
+      return;
+    }
     if (req.method === "POST" && req.url === "/api/internal/delegate-bot") {
       let data = "";
       req.on("data", (c) => (data += c));
@@ -205,6 +223,16 @@ beforeAll(async () => {
         threadCalls += 1;
         res.writeHead(201, { "content-type": "application/json" });
         res.end(JSON.stringify(threadResponse));
+      });
+      return;
+    }
+    if (req.url === "/api/internal/computer/select") {
+      let data = "";
+      req.on("data", (chunk) => (data += chunk));
+      req.on("end", () => {
+        computerRequests.push({ method: req.method!, url: req.url!, body: data ? JSON.parse(data) : null });
+        res.writeHead(computerStatus, { "content-type": "application/json" });
+        res.end(JSON.stringify(computerResponse));
       });
       return;
     }
@@ -472,6 +500,7 @@ describe("agents-proxy MCP surface", () => {
       "delegate_bot",
       "check_delegation",
       "wait_delegation",
+      "select_computer",
       "list_threads",
       "close_thread",
       "start_thread",
@@ -505,6 +534,51 @@ describe("agents-proxy MCP surface", () => {
     expect(wait.description).toContain("Never call it in the same turn as delegate_bot");
     expect(credential.description).toContain("freshly QR-paired mobile app show a secure entry card");
     expect(credential.description).toContain("Never claim a secure field opened unless this request succeeds");
+  });
+
+  it("select_computer inspects actual choices with a GET when no target is given", async () => {
+    const response = await callTool("select_computer", {});
+    expect(response.result.isError).toBeFalsy();
+    expect(JSON.parse(response.result.content[0].text)).toEqual(computerResponse);
+    expect(computerRequests).toEqual([{ method: "GET", url: "/api/internal/computer/select", body: null }]);
+    expect(lastAuth).toBe(`Bearer ${TOKEN}`);
+    const list = await rpc("tools/list");
+    const tool = list.result.tools.find((entry: { name: string }) => entry.name === "select_computer");
+    expect(tool.inputSchema).toMatchObject({ type: "object", additionalProperties: false,
+      properties: { surface: { type: "string", enum: ["auto", "cloud", "vm", "local", "browser"] } } });
+    expect(tool.inputSchema.required ?? []).not.toContain("surface");
+    expect(tool.description).toContain("end this turn immediately");
+    expect(tool.description).toContain("with a configured provider it can start or provision one when needed");
+    expect(tool.description).toContain("Do not provision for ordinary chat or just to inspect availability");
+    expect(tool.annotations?.readOnlyHint).not.toBe(true);
+  });
+
+  it.each(["auto", "cloud", "vm", "local", "browser"])("select_computer posts the requested %s target without inventing success", async (surface) => {
+    computerResponse = { state: "pending", surface: surface === "auto" ? "vm" : surface, instruction: "End this turn; the original request will resume." };
+    const response = await callTool("select_computer", { surface });
+    expect(response.result.isError).toBeFalsy();
+    expect(JSON.parse(response.result.content[0].text)).toEqual(computerResponse);
+    expect(computerRequests).toEqual([{ method: "POST", url: "/api/internal/computer/select", body: { surface } }]);
+    expect(lastAuth).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it.each(["other", "off", " VM ", 42, null, {}, ["vm"]].map((surface) => ({ surface })))("select_computer rejects invalid target $surface before contacting the server", async ({ surface }) => {
+    const response = await callTool("select_computer", { surface });
+    expect(response.result.isError).toBe(true);
+    expect(response.result.content[0].text).toContain("Choose auto, cloud, vm, local or browser");
+    expect(computerRequests).toEqual([]);
+  });
+
+  it.each([
+    { status: 409, args: { surface: "cloud" }, error: "No existing cloud computer. Create one in the Computer panel first." },
+    { status: 503, args: {}, error: "Computer discovery is temporarily unavailable." },
+  ])("select_computer relays a $status server refusal as a tool error", async ({ status, args, error }) => {
+    computerStatus = status;
+    computerResponse = { error };
+    const response = await callTool("select_computer", args);
+    expect(response.result.isError).toBe(true);
+    expect(response.result.content[0].text).toContain(error);
+    expect(computerRequests).toHaveLength(1);
   });
 
   it("advertises read annotations only for the reviewed built-in reads", async () => {
@@ -1113,7 +1187,9 @@ describe("agents-proxy MCP surface", () => {
   it("session_search recalls the bot's own past threads through the harness, scoped to the sender", async () => {
     const list = await rpc("tools/list");
     const tool = list.result.tools.find((t: { name: string }) => t.name === "session_search");
-    expect(tool.inputSchema.required).toEqual(["query"]);
+    // words or a time window: neither alone is required
+    expect(tool.inputSchema.required).toBeUndefined();
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(["query", "since", "until", "limit", "scope"]);
     expect(tool.description).toContain("OWN earlier conversations");
 
     const res = await callTool("session_search", { query: "audit broken links", limit: 5 });
@@ -1136,6 +1212,33 @@ describe("agents-proxy MCP surface", () => {
 
     const missing = await callTool("session_search", {});
     expect(missing.result.isError).toBe(true);
+  });
+
+  it("session_search by time forwards since/until without words, and names the room a hit came from", async () => {
+    sessionSearchResponse = {
+      hits: [
+        { threadId: "room-standup", messageId: "m-room", at: Date.UTC(2026, 8, 16, 9, 5), role: "bot", snippet: "I'll take the deploy", room: "Standup", from: "Me", current: false, crossed: false },
+        { threadId: "thread-old", messageId: "m-audit", at: Date.UTC(2026, 8, 15, 17), role: "bot", snippet: "the audit found three broken links", task: "Site audit", current: false, crossed: false },
+      ],
+      memoryHits: [],
+    };
+    const res = await callTool("session_search", { since: "2d" });
+    expect(lastSessionSearchUrl).toContain("since=2d");
+    expect(lastSessionSearchUrl).not.toContain("q=");
+    const text = res.result.content[0].text as string;
+    expect(text).toContain("2 messages from your earlier conversations (newest first)");
+    expect(text).toContain('[2026-09-16 09:05 · room "Standup" ·');
+    expect(text).toContain('[2026-09-15 17:00 · task "Site audit" ·');
+
+    await callTool("session_search", { query: "deploy", since: "yesterday", until: "today" });
+    expect(lastSessionSearchUrl).toContain("q=deploy");
+    expect(lastSessionSearchUrl).toContain("since=yesterday");
+    expect(lastSessionSearchUrl).toContain("until=today");
+
+    sessionSearchResponse = { hits: [], memoryHits: [] };
+    const nothing = await callTool("session_search", { since: "1h" });
+    expect(nothing.result.content[0].text).toContain("Nothing of yours is there since 1h");
+    sessionSearchResponse = { hits: [] };
   });
 
   it("session_search lists memory-file hits by file, ahead of conversation hits, and forwards the scope", async () => {
@@ -1684,5 +1787,92 @@ describe("with computer sharing off (the default)", () => {
       const refused = await gatedRpc("tools/call", { name, arguments: { computer_id: "x", action: "list_files" } });
       expect(refused.error?.message ?? refused.result?.content?.[0]?.text).toMatch(/unknown tool|turned off/i);
     }
+  });
+});
+
+// coordinate_bots exists only in room turns, so its argument handling needs
+// its own child with the room flag on; the stub harness records the wire body.
+describe("coordinate_bots arguments (room turn)", () => {
+  let room: ChildProcess;
+  const roomPending = new Map<number, (msg: any) => void>();
+  let roomId = 700;
+  const roomRpc = (method: string, params?: unknown): Promise<any> =>
+    new Promise((resolve, reject) => {
+      const id = roomId++;
+      roomPending.set(id, resolve);
+      room.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      setTimeout(() => {
+        if (roomPending.delete(id)) reject(new Error(`${method} timed out`));
+      }, 10_000).unref?.();
+    });
+
+  beforeAll(async () => {
+    room = spawn(process.execPath, [PROXY], {
+      env: {
+        ...process.env,
+        OMB_HARNESS_URL: `http://127.0.0.1:${stubPort}`,
+        OMB_BOT_ID: "bot-asker",
+        OMB_THREAD_ID: "thread-asker-routine",
+        OMB_COMMS_TOKEN: TOKEN,
+        OMB_TURN_DEPTH: "0",
+        OMB_ROOM_TURN: "1",
+      },
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    let buf = "";
+    room.stdout!.on("data", (c) => {
+      buf += c;
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const msg = JSON.parse(line);
+        roomPending.get(msg.id)?.(msg);
+        roomPending.delete(msg.id);
+      }
+    });
+    await roomRpc("initialize", { protocolVersion: "2024-11-05" });
+  });
+
+  afterAll(() => {
+    room?.kill();
+  });
+
+  it("maps camelCase aliases onto the canonical snake_case fields", async () => {
+    const res = await roomRpc("tools/call", { name: "coordinate_bots", arguments: {
+      botIds: ["bot-helper"], message: "please review the patch", requestKey: "review-1",
+    } });
+    expect(res.result.isError).toBeFalsy();
+    expect(lastCoordinateBody).toMatchObject({
+      botIds: ["bot-helper"], message: "please review the patch", requestKey: "review-1",
+    });
+  });
+
+  it("keeps the documented snake_case key when both spellings arrive", async () => {
+    const res = await roomRpc("tools/call", { name: "coordinate_bots", arguments: {
+      bot_ids: ["bot-helper"], botIds: ["bot-other"], group_id: "room-right", groupId: "room-wrong",
+      message: "m", request_key: "k-2", requestKey: "wrong",
+    } });
+    expect(res.result.isError).toBeFalsy();
+    expect(lastCoordinateBody).toMatchObject({
+      botIds: ["bot-helper"], groupId: "room-right", requestKey: "k-2",
+    });
+    expect(lastCoordinateBody.botIds).not.toContain("bot-other");
+  });
+
+  it("names the expected snake_case fields when arguments are unusable", async () => {
+    lastCoordinateBody = null;
+    const res = await roomRpc("tools/call", { name: "coordinate_bots", arguments: {
+      botIds: "bot-helper", message: "ids is not an array",
+    } });
+    expect(res.result.isError).toBe(true);
+    const text = res.result.content[0].text;
+    for (const field of ["bot_ids", "message", "request_key", "group_id", "rework", "label"]) {
+      expect(text).toContain(field);
+    }
+    expect(text).toContain("botIds");
+    expect(text).toContain("message");
+    expect(lastCoordinateBody).toBeNull();
   });
 });

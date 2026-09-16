@@ -1721,6 +1721,19 @@ class Session(
         }
     }
 
+    suspend fun archiveTask(task: BotTask, forBot: Bot, archivedAt: Double?): Boolean {
+        val activeClient = client ?: return false
+        return try {
+            activeClient.setTaskArchived(forBot.id, task.threadId, archivedAt)
+            refresh()
+            true
+        } catch (error: Throwable) {
+            if (error is CancellationException) throw error
+            _actionError.value = error.message
+            false
+        }
+    }
+
     suspend fun deleteTask(task: BotTask, forBot: Bot): Bot? {
         val activeClient = client ?: return null
         return try {
@@ -1902,6 +1915,21 @@ class Session(
     } catch (error: Throwable) {
         if (error is kotlinx.coroutines.CancellationException) throw error
         null
+    }
+
+    /**
+     * Switch the workspace's voice engine. The sheet reloads the voice list
+     * afterwards, because every engine names its own voices.
+     */
+    suspend fun switchVoiceProvider(provider: VoiceProvider): ConfigStatus? {
+        val activeClient = client ?: return null
+        return try {
+            activeClient.updateVoiceProvider(provider)
+        } catch (error: Throwable) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            _actionError.value = error.message
+            null
+        }
     }
 
     suspend fun loadConnectorCatalog(): ConnectorCatalog? {

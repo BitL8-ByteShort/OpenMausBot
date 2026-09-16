@@ -53,6 +53,50 @@ class TaskRulesTest {
     }
 
     @Test
+    fun `attention floats live threads above the idle tail inside each half`() {
+        val closer = ThreadCloser(botId = "pm", name = "Parker", at = 9.0)
+        val subject = bot(
+            listOf(
+                task("idle"), task("t1"), task("unread").copy(unread = true),
+                task("queued").copy(activity = "queued"), task("waiting").copy(activity = "waiting-on-you"),
+                task("busy").copy(busy = true), task("helper").copy(closedBy = closer),
+            ),
+        )
+
+        assertEquals(
+            listOf("waiting", "busy", "queued", "unread", "t1", "idle", "helper"),
+            TaskRules.tasks(subject).map { it.threadId },
+        )
+    }
+
+    @Test
+    fun `archived threads fold to the tail unless they demand attention`() {
+        val tasks = listOf(
+            task("live", "Live"),
+            task("later", "Later").copy(archivedAt = 0.0),
+            task("held", "Held").copy(archivedAt = 5.0, unread = true),
+        )
+        // "held" is archived but unread, so it is surfaced AND floated: attention
+        // ordering (rank 3) puts it above the idle "live" thread, and only the
+        // quiet "later" folds to the tail.
+        assertEquals(
+            listOf("held", "live", "later"),
+            TaskRules.tasks(bot(tasks)).map { it.threadId },
+        )
+    }
+
+    @Test
+    fun `archiving waits for work to settle`() {
+        // A modern bot paints per-task busy, so the task alone decides.
+        val modern = bot(listOf(task("run").copy(busy = false)))
+        assertFalse(TaskRules.canArchive(task("run").copy(activity = "working"), modern))
+        assertFalse(TaskRules.canArchive(task("run").copy(activity = "running"), modern))
+        assertFalse(TaskRules.canArchive(task("run").copy(busy = true), modern))
+        assertTrue(TaskRules.canArchive(task("run").copy(activity = "waiting-on-you"), modern))
+        assertTrue(TaskRules.canArchive(task("run"), modern))
+    }
+
+    @Test
     fun `the current task is the one the bot's thread points at`() {
         val subject = bot(listOf(task("t1"), task("t2")), current = "t2")
         assertFalse(TaskRules.isCurrent(task("t1"), subject))
@@ -72,6 +116,7 @@ class TaskRulesTest {
         val busy = bot(tasks, current = "t1", busy = true)
         assertFalse(TaskRules.canCreate(busy))
         assertFalse(TaskRules.canDelete(task("t2"), busy))
+        assertFalse(TaskRules.canArchive(task("t2"), busy))
         assertTrue(TaskRules.canSwitch(task("t2"), busy))
     }
 
@@ -87,6 +132,8 @@ class TaskRulesTest {
         assertTrue(TaskRules.canSwitch(idle, subject))
         assertTrue(TaskRules.canDelete(idle, subject))
         assertFalse(TaskRules.canDelete(running, subject))
+        assertTrue(TaskRules.canArchive(idle, subject))
+        assertFalse(TaskRules.canArchive(running, subject))
     }
 
     @Test
@@ -95,6 +142,7 @@ class TaskRulesTest {
         val idle = bot(tasks, current = "t1", busy = false)
         assertTrue(TaskRules.canCreate(idle))
         assertTrue(TaskRules.canDelete(task("t2"), idle))
+        assertTrue(TaskRules.canArchive(task("t2"), idle))
         assertTrue(TaskRules.canSwitch(task("t2"), idle))
     }
 
@@ -137,8 +185,9 @@ class TaskRulesTest {
         val execution = task("run-thread").copy(routineRunId = "run-1", busy = true)
         val subject = bot(listOf(legacy, results, execution), current = "results", busy = true)
 
-        assertEquals(listOf(legacy, results), TaskRules.tasks(subject))
-        assertEquals(listOf(legacy, results), TaskRules.tasks(Chat.BotChat(subject)))
+        // Attention floats the current thread above the idle tail.
+        assertEquals(listOf(results, legacy), TaskRules.tasks(subject))
+        assertEquals(listOf(results, legacy), TaskRules.tasks(Chat.BotChat(subject)))
         assertEquals(3, subject.tasks?.size)
         assertTrue(TaskRules.canCreate(subject))
         assertFalse(TaskRules.canSwitch(execution, subject))

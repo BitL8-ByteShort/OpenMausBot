@@ -1591,6 +1591,16 @@ final class Session: ObservableObject {
     }
 
     @discardableResult
+    func setTaskArchived(_ task: BotTask, for bot: Bot, archivedAt: Double?) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.archiveTask(botId: bot.id, threadId: task.threadId, archivedAt: archivedAt)
+            await refresh()
+            return true
+        } catch { actionError = error.localizedDescription; return false }
+    }
+
+    @discardableResult
     func deleteTask(_ task: BotTask, for bot: Bot) async -> Bot? {
         guard let client else { return nil }
         do {
@@ -1735,6 +1745,27 @@ final class Session: ObservableObject {
         guard let client else { return [] }
         do { return try await client.voices() }
         catch { actionError = error.localizedDescription; return [] }
+    }
+
+    /// Switch the workspace's voice engine. The fresh status comes back so
+    /// the caller can re-derive every provider-dependent row in place.
+    func setVoiceProvider(_ provider: VoiceProvider) async -> ConfigStatus? {
+        guard let client else { return nil }
+        do { return try await client.setVoiceProvider(provider) }
+        catch { actionError = error.localizedDescription; return nil }
+    }
+
+    func saveChatterboxServer(baseURL: String, model: String) async -> ConfigStatus? {
+        guard let client else { return nil }
+        do { return try await client.saveChatterboxServer(baseURL: baseURL, model: model) }
+        catch { actionError = error.localizedDescription; return nil }
+    }
+
+    /// The host's platform, which decides whether its built-in voices are a
+    /// real engine choice there or a row that must stay disabled.
+    func serverEnvironment() async -> ServerEnvironment? {
+        guard let client else { return nil }
+        return try? await client.environment()
     }
 
     func previewVoice(_ voiceId: String, for bot: Bot) async -> Data? {
