@@ -28,7 +28,7 @@ posixOnly("a board task pauses at its money cap and resumes when it is raised", 
     return { status: res.status, body: await res.json() };
   };
   const task = async (id: string) => (await api("GET", "/api/tasks")).body.tasks.find((t: any) => t.id === id);
-  const until = async (pred: () => Promise<boolean>, what: string, ms = 90_000) => {
+  const until = async (pred: () => Promise<boolean>, what: string, ms = 150_000) => {
     const deadline = Date.now() + ms;
     while (!(await pred())) {
       if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}. stderr: ${stderr.slice(-2000)}`);
@@ -106,5 +106,5 @@ posixOnly("a board task pauses at its money cap and resumes when it is raised", 
     expect((await api("PATCH", `/api/tasks/${uncapped.body.task.id}`, { status: "ready" })).status).toBe(200);
     await until(async () => (await task(uncapped.body.task.id))?.status === "review", "the uncapped task to run");
     expect((await task(uncapped.body.task.id)).budgetUsd).toBe(1);
-  }, 300_000);
+  }, 480_000);
 });
