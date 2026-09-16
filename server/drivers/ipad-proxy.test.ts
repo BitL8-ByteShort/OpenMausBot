@@ -4,6 +4,9 @@ import {
   KNOWN_APPS,
   MAX_ELEMENTS,
   MAX_TEXT,
+  START_HINT,
+  WdaUnreachable,
+  createWdaClient,
   elementLines,
   findByText,
   flattenSource,
@@ -13,7 +16,25 @@ import {
   validatePoint,
   validateText,
   wdaBaseUrl,
+  type FetchLike,
 } from "./ipad-proxy.ts";
+
+type Route = (body: unknown) => { status?: number; value: unknown };
+function fakeWda(routes: Record<string, Route>) {
+  const calls: Array<{ method: string; path: string; body: unknown }> = [];
+  const fetch: FetchLike = async (input, init) => {
+    const url = new URL(input);
+    const method = init?.method ?? "GET";
+    const key = `${method} ${url.pathname}${url.search}`;
+    const body = init?.body ? JSON.parse(init.body) : undefined;
+    calls.push({ method, path: url.pathname, body });
+    const route = routes[key];
+    if (!route) return { status: 404, json: async () => ({ value: { error: "unknown command", message: key } }) };
+    const result = route(body);
+    return { status: result.status ?? 200, json: async () => ({ value: result.value, sessionId: "S1" }) };
+  };
+  return { fetch, calls };
+}
 
 const el = (type: string, extra: Record<string, unknown> = {}) => ({
   type: `XCUIElementType${type}`, label: "", name: "", value: "", isVisible: "1",
@@ -150,5 +171,68 @@ describe("validation", () => {
     expect(() => validateText("a".repeat(MAX_TEXT + 1))).toThrow(/1 to 512/);
     expect(() => validateText("line\nbreak")).toThrow(/printable/);
     expect(() => validateText(42)).toThrow();
+  });
+});
+
+describe("createWdaClient", () => {
+  it("returns the value of a plain GET", async () => {
+    const wda = fakeWda({ "GET /status": () => ({ value: { ready: true } }) });
+    const client = createWdaClient({ fetch: wda.fetch, baseUrl: "http://127.0.0.1:8100" });
+    await expect(client.get("/status")).resolves.toEqual({ ready: true });
+    expect(wda.calls[0].path).toBe("/status");
+  });
+
+  it("creates a session lazily once and reuses it", async () => {
+    const wda = fakeWda({
+      "POST /session": () => ({ value: { sessionId: "S1" } }),
+      "GET /session/S1/window/size": () => ({ value: { width: 1024, height: 768 } }),
+    });
+    const client = createWdaClient({ fetch: wda.fetch, baseUrl: "http://127.0.0.1:8100" });
+    await client.session("GET", "/window/size");
+    await client.session("GET", "/window/size");
+    expect(wda.calls.filter((c) => c.path === "/session")).toHaveLength(1);
+    expect(wda.calls[0].body).toEqual({ capabilities: { alwaysMatch: {}, firstMatch: [{}] } });
+  });
+
+  it("recreates the session exactly once after invalid session id", async () => {
+    let sessions = 0;
+    const wda = fakeWda({
+      "POST /session": () => ({ value: { sessionId: `S${++sessions}` } }),
+      "GET /session/S1/window/size": () => ({ status: 404, value: { error: "invalid session id", message: "gone" } }),
+      "GET /session/S2/window/size": () => ({ value: { width: 1, height: 2 } }),
+    });
+    const client = createWdaClient({ fetch: wda.fetch, baseUrl: "http://127.0.0.1:8100" });
+    await expect(client.session("GET", "/window/size")).resolves.toEqual({ width: 1, height: 2 });
+    expect(sessions).toBe(2);
+  });
+
+  it("surfaces other WDA errors with their message and gives up after one retry", async () => {
+    let sessions = 0;
+    const wda = fakeWda({
+      "POST /session": () => ({ value: { sessionId: `S${++sessions}` } }),
+      "POST /session/S1/wda/apps/launch": () => ({ status: 400, value: { error: "invalid argument", message: "no such app" } }),
+      "GET /session/S1/window/size": () => ({ status: 404, value: { error: "invalid session id", message: "gone" } }),
+      "GET /session/S2/window/size": () => ({ status: 404, value: { error: "invalid session id", message: "gone again" } }),
+    });
+    const client = createWdaClient({ fetch: wda.fetch, baseUrl: "http://127.0.0.1:8100" });
+    await expect(client.session("POST", "/wda/apps/launch", { bundleId: "x" })).rejects.toThrow(/no such app/);
+    await expect(client.session("GET", "/window/size")).rejects.toThrow(/gone again/);
+    expect(sessions).toBe(2);
+  });
+
+  it("turns connection failures into WdaUnreachable carrying the start hint", async () => {
+    const fetch: FetchLike = async () => { throw new Error("ECONNREFUSED"); };
+    const client = createWdaClient({ fetch, baseUrl: "http://127.0.0.1:8100" });
+    await expect(client.get("/status")).rejects.toBeInstanceOf(WdaUnreachable);
+    await expect(client.get("/status")).rejects.toThrow(START_HINT);
+    await expect(client.reachable()).resolves.toBe(false);
+  });
+
+  it("aborts a call that exceeds its timeout", async () => {
+    const fetch: FetchLike = (_input, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    });
+    const client = createWdaClient({ fetch, baseUrl: "http://127.0.0.1:8100", defaultTimeoutMs: 20 });
+    await expect(client.get("/status")).rejects.toThrow(/timed out/);
   });
 });
