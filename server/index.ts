@@ -11143,13 +11143,17 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const taskBody = typeof body.body === "string" ? body.body : undefined;
         const overLong = boardInputTooLong(title, taskBody);
         if (overLong) return json(res, 400, { error: overLong });
-        const assigneeBotId = typeof body.assigneeBotId === "string" && body.assigneeBotId.trim()
+        const requestedAssignee = typeof body.assigneeBotId === "string" && body.assigneeBotId.trim()
           ? body.assigneeBotId.trim()
           : undefined;
-        if (assigneeBotId) {
+        // A bot may file work for itself: "me" (the proxy never tells a bot
+        // its own id) or its own id. The peer-reach rule below is for OTHER
+        // bots — it excludes self by design, so it must not gate this.
+        const assigneeBotId = requestedAssignee === "me" || requestedAssignee === "self" ? internalSender.id : requestedAssignee;
+        if (assigneeBotId && assigneeBotId !== internalSender.id) {
           const target = store.bot(assigneeBotId);
           if (!target) {
-            return json(res, 404, { error: "no bot with that id — call list_bots and copy the exact id from the result" });
+            return json(res, 404, { error: "no bot with that id — call list_bots and copy the exact id from the result, or pass \"me\" to do it yourself" });
           }
           if (!canReachPeer(internalSender, target)) {
             return json(res, 403, { error: "that bot belongs to a different section" });
