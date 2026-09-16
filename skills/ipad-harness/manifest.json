@@ -1,0 +1,16 @@
+{
+  "id": "ipad-harness",
+  "name": "iPad Harness",
+  "version": "0.1.0",
+  "description": "Control a physical iPad connected to this Mac over USB through WebDriverAgent.",
+  "defaultEnabled": true,
+  "triggerTerms": [
+    "ipad",
+    "ipados",
+    "on the ipad",
+    "ipad app",
+    "ipad screen",
+    "tablet"
+  ],
+  "requiredCapabilities": ["ipadMcp"]
+}

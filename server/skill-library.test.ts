@@ -102,3 +102,18 @@ describe("bundled verification skill", () => {
     }
   });
 });
+
+describe("bundled ipad-harness skill", () => {
+  const skills = loadBundledSkills(join(process.cwd(), "skills"));
+  const ipad = skills.find((s) => s.manifest.id === "ipad-harness");
+  it("is bundled with the ipadMcp capability", () => {
+    expect(ipad?.manifest.requiredCapabilities).toEqual(["ipadMcp"]);
+    expect(ipad?.manifest.defaultEnabled).toBe(true);
+  });
+  it("selects on iPad wording and not on phone wording", () => {
+    const both = ["phoneMcp", "ipadMcp"];
+    expect(selectBundledSkills("Open Notes on the iPad and write hello", both, skills).map((s) => s.manifest.id)).toEqual(["ipad-harness"]);
+    expect(selectBundledSkills("Open Uber on my phone", both, skills).map((s) => s.manifest.id)).toEqual(["phone-harness"]);
+    expect(selectBundledSkills("Open Notes on the iPad", ["phoneMcp"], skills)).toEqual([]);
+  });
+});

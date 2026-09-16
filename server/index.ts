@@ -847,6 +847,7 @@ const phoneSecretEnvelopeSchema = z.object({
 // there is exactly one way proxies are located.
 const agentsProxyPath = SPAWNED_PROXIES.agents;
 const phoneProxyPath = SPAWNED_PROXIES.phone;
+const ipadProxyPath = SPAWNED_PROXIES.ipad;
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
@@ -1228,6 +1229,12 @@ function phoneIntegration() {
   if (process.env.OMB_RESOURCES_PATH) env.OMB_RESOURCES_PATH = process.env.OMB_RESOURCES_PATH;
   if (process.env.PH_ANDROID_SERIAL) env.PH_ANDROID_SERIAL = process.env.PH_ANDROID_SERIAL;
   return { command: process.execPath, args: [phoneProxyPath], env };
+}
+
+function ipadIntegration() {
+  const env: Record<string, string> = { ...AGENTS_NODE_FLAG };
+  if (process.env.OMB_IPAD_WDA_URL) env.OMB_IPAD_WDA_URL = process.env.OMB_IPAD_WDA_URL;
+  return { command: process.execPath, args: [ipadProxyPath], env };
 }
 
 function connectedAppsIntegration(botId: string, threadId: string, generation: string) {
@@ -5606,6 +5613,7 @@ async function startTurn(
         providerText,
         [
           ...(instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : []),
+          ...(instance.adapter.capabilities.ipadMcp === true ? ["ipadMcp"] : []),
           ...(skillAuthoring ? ["skillAuthoring"] : []),
         ],
         availableSkills(),
@@ -5613,6 +5621,10 @@ async function startTurn(
       if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
         if (!claimTurnResource(resourceOwner, "computer:phone")) throw new Error("another thread is using the phone — wait for it to finish");
         integrations.phone = phoneIntegration();
+      }
+      if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("ipadMcp"))) {
+        if (!claimTurnResource(resourceOwner, "computer:ipad")) throw new Error("another thread is using the iPad — wait for it to finish");
+        integrations.ipad = ipadIntegration();
       }
       // the user's connected apps, but only to a driver that can mount
       // them — a key in the config says the connections exist, not that
@@ -7412,7 +7424,10 @@ async function runGroupMemberTurn(
   const selectedSkills = mergeSkills(
     selectBundledSkills(
       roomContext,
-      instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : [],
+      [
+        ...(instance.adapter.capabilities.phoneMcp === true ? ["phoneMcp"] : []),
+        ...(instance.adapter.capabilities.ipadMcp === true ? ["ipadMcp"] : []),
+      ],
       skills,
     ),
     selectBundledSkills(
@@ -7424,6 +7439,10 @@ async function runGroupMemberTurn(
   if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("phoneMcp"))) {
     if (!claimTurnResource(resourceOwner, "computer:phone")) throw new Error("another thread is using the phone — wait for it to finish");
     integrations.phone = phoneIntegration();
+  }
+  if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("ipadMcp"))) {
+    if (!claimTurnResource(resourceOwner, "computer:ipad")) throw new Error("another thread is using the iPad — wait for it to finish");
+    integrations.ipad = ipadIntegration();
   }
   try {
     if (bot.composio !== false && composio.configured(cfg) && instance.adapter.capabilities.composioMcp === true) {
