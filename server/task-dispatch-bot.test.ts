@@ -182,6 +182,12 @@ describe("money caps in the dispatch policy (Phase 2 part 1)", () => {
     expect(await dispatch.dispatch(claimed)).toEqual({ threadId: "thread-for-bot-1" });
     expect(board.getTask(task.id)?.budgetUsd).toBe(0.5);
     expect(calls.started).toHaveLength(1);
+    // without a configured default the cap comes from the bot's history
+    const learned = harness({ defaultBudgetUsd: (task: { assigneeBotId: string | null }) => board.suggestedBudgetUsd(task.assigneeBotId) });
+    const fresh = board.createTask({ title: "fresh", assigneeBotId: "bot-1" });
+    board.setStatus(fresh.id, "ready");
+    await learned.dispatch.dispatch(board.claimTask(fresh.id)!);
+    expect(board.getTask(fresh.id)?.budgetUsd).toBe(board.AUTO_BUDGET_FLOOR_USD);
     // an explicit cap is kept, and no default means no cap
     const explicit = board.createTask({ title: "explicit", assigneeBotId: "bot-1", budgetUsd: 0.2 });
     board.setStatus(explicit.id, "ready");

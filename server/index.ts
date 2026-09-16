@@ -202,6 +202,7 @@ import { getOrCreateChannel, mirrorActivity, mirrorExchange, mirrorReply, type C
 import { readMessageText, recallMessages, searchMessages, closeMessageDb, chatFollowups, cancelledChatFollowup, settleChatFollowups } from "./message-db.ts";
 import { claimRecallCrossings, recallCrossingLabel } from "./recall-disclosure.ts";
 import { runHarnessCall, type HarnessCallResult } from "./harness-calls.ts";
+import { raiseBudgetCard, resolveBudgetCard } from "./budget-card.ts";
 import { buildRecall } from "./recall.ts";
 import { resolveMentions, type MentionResolver } from "./mentions.ts";
 import { progressNote } from "./progress.ts";
@@ -367,7 +368,7 @@ import {
   TASK_TITLE_MAX,
   visibleTo as visibleBoardTasks,
   type BoardStatus,
-  type TaskPatch as BoardTaskPatch, bookSpend, taskByThread, setResult, BUDGET_PAUSED_REASON } from "./task-board.ts";
+  type TaskPatch as BoardTaskPatch, bookSpend, taskByThread, setResult, BUDGET_PAUSED_REASON, suggestedBudgetUsd } from "./task-board.ts";
 import { createBotDispatch } from "./task-dispatch-bot.ts";
 import { DEFAULT_STALE_AFTER_MS, createDispatcher as createBoardDispatcher } from "./task-dispatcher.ts";
 import { createTaskTurnWatch } from "./task-turn-watch.ts";
@@ -6993,6 +6994,8 @@ function bookBoardSpend(threadId: string, costUsd: number | null): void {
     if (!task) return;
     const booked = bookSpend(task.id, costUsd);
     if (booked.paused || booked.warned) broadcast({ kind: "board", taskId: task.id } as never);
+    // a paused task asks with one card, not a form (budget-card.ts)
+    if (booked.paused) raiseBudgetCard(store, booked.task);
     if (booked.paused) console.error(`[omb-board] task ${task.id} ${BUDGET_PAUSED_REASON}: $${booked.task.spentUsd.toFixed(3)} of $${booked.task.budgetUsd?.toFixed(3)}`);
   } catch (error) {
     console.error(`[omb-board] could not book spend for ${threadId}: ${error instanceof Error ? error.message : String(error)}`);
@@ -7071,7 +7074,9 @@ const boardDispatch = createBotDispatch<BotRecord>({
     }),
   redact: redactSecretsInText,
   log: (message) => console.error(message),
-  defaultBudgetUsd: () => boardDefaultBudgetUsd(cfg),
+  // a configured default wins; otherwise a cap from the bot's own history
+  // (three times its median finished task, floored) — nobody guesses a number
+  defaultBudgetUsd: (task) => boardDefaultBudgetUsd(cfg) ?? suggestedBudgetUsd(task.assigneeBotId),
 });
 const boardDispatcher = createBoardDispatcher({
   maxRunning: boardMaxRunning(cfg),
@@ -15548,6 +15553,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         resolveQuotaSwitch(quotaSwitchBus, String(body.requestId), typeof body.message === "string" ? body.message : undefined)) {
         return json(res, 200, { ok: true, outcome: "answered" });
       }
+      // the board's pause card (budget-card.ts): one tap raises, removes or stops
+      if (resolveBudgetCard(store, String(body.requestId), typeof body.message === "string" ? body.message : undefined)) {
+        return json(res, 200, { ok: true, outcome: "answered" });
+      }
       const outcome = await answerRequest(bot.threadId, bot.modelSelection.instanceId, String(body.requestId), behavior, body.message, { id: bot.id, name: bot.name }, body.always === true);
       return json(res, 200, { ok: true, outcome });
     }
@@ -15628,6 +15637,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // quota-switch intercept (see /api/bots/:id/respond above).
       if (store.messagesFor(threadId).some((message) => message.card?.requestId === requestId) &&
         resolveQuotaSwitch(quotaSwitchBus, requestId, typeof body.message === "string" ? body.message : undefined)) {
+        return json(res, 200, { ok: true, outcome: "answered" });
+      }
+      if (resolveBudgetCard(store, requestId, typeof body.message === "string" ? body.message : undefined)) {
         return json(res, 200, { ok: true, outcome: "answered" });
       }
       const group = store.groupByThread(threadId);
