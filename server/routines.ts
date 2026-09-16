@@ -158,6 +158,8 @@ export interface RoutineRun {
   /** Phase 3 part 4: what the graph's check and judge nodes said about this
    * run, kept apart from the bot's own report. */
   verdict?: string;
+  /** Phase 4 part 4: the bot's "Note for next run:" line, if it wrote one. */
+  nextNote?: string;
   /** Human-readable reason the detached execution is waiting. */
   attention?: string;
   error?: string;
@@ -172,6 +174,24 @@ interface RoutineContinuityCarry {
   finishedAt: number;
   output: string;
   truncated: boolean;
+  /** Phase 4 part 4: the bot's own one-line note to its next run. */
+  note?: string;
+}
+
+/** Phase 4 part 4: a run may end its report with one line "Note for next
+ * run: …"; the next run of the same routine sees it. Text convention, so
+ * every engine can use it. */
+export const NEXT_RUN_NOTE_MAX = 500;
+export function extractNextRunNote(text: string | undefined): string | null {
+  if (!text) return null;
+  for (const line of text.split("\n")) {
+    const m = /^\s*(?:[-*]\s*)?\**\s*note for (?:the )?next run\s*\**\s*:\s*\**\s*(.+)$/i.exec(line);
+    if (m) {
+      const note = m[1].trim().replace(/\*+$/, "").trim();
+      if (note) return note.slice(0, NEXT_RUN_NOTE_MAX);
+    }
+  }
+  return null;
 }
 
 export interface RoutineRequestReceipt {
@@ -463,6 +483,10 @@ function fenceCarriedReport(output: string): string {
   return output.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+function normaliseRoutinePrompt(prompt: string): string {
+  return prompt.toLowerCase().replace(/\[\[omb:[^\]]+\]\]/g, "").replace(/[^\p{L}\p{N}\s]/gu, "").replace(/\s+/g, " ").trim();
+}
+
 function composeExecutionPrompt(
   prompt: string,
   attachments: readonly RoutineContextAttachment[] | undefined,
@@ -479,6 +503,7 @@ function composeExecutionPrompt(
         }>`,
         fenceCarriedReport(carry.output),
         "</previous-run>",
+        ...(carry.note ? [`<previous-run-note>${fenceCarriedReport(carry.note)}</previous-run-note>`] : []),
       ].join("\n"),
     );
   }
@@ -968,6 +993,19 @@ export class RoutineManager {
     const at = this.now();
     const clean = sanitizeInput(input, at);
     if (this.targetState(clean) === "missing") throw new Error(this.missingTargetMessage(clean.target));
+    // Phase 4 part 4: a bot proposing the same instructions on the same
+    // schedule for the same bot, still enabled, is told it is already
+    // scheduled instead of adding a twin. A person's own calendar edits
+    // (no request) stay free to duplicate on purpose.
+    const twin = request
+      ? this.routines.find((existing) => existing.enabled && existing.botId === clean.botId && existing.target === clean.target
+        && normaliseRoutinePrompt(existing.prompt) === normaliseRoutinePrompt(clean.prompt)
+        && JSON.stringify(existing.schedule) === JSON.stringify(clean.schedule))
+      : undefined;
+    if (twin) {
+      const when = twin.nextRunAt ? new Date(twin.nextRunAt).toISOString() : "when its schedule allows";
+      throw new Error(`already scheduled: "${twin.name}" runs these same instructions, next at ${when}. Edit that routine instead of adding another.`);
+    }
     const nextRunAt = clean.enabled ? this.initialOccurrence(clean.schedule, at) : null;
     if (clean.schedule.type === "interval" && clean.enabled && nextRunAt === null) {
       throw new Error("This interval has no future runs. Choose a later end date or turn it off.");
@@ -1274,6 +1312,7 @@ export class RoutineManager {
       finishedAt: latest.finishedAt ?? latest.createdAt,
       output: truncated ? `${redacted.slice(0, CONTINUITY_CHARS - 1).trimEnd()}…` : redacted,
       truncated,
+      ...(latest.nextNote ? { note: redactSecretsInText(latest.nextNote) } : {}),
     };
   }
 
@@ -1564,6 +1603,8 @@ export class RoutineManager {
       run.attention = undefined;
     } else if (event.type === "item.completed" && event.itemType === "assistant_text") {
       run.output = redactSecretsInText(event.text).trim().slice(0, 2_000);
+      const note = extractNextRunNote(run.output);
+      if (note) run.nextNote = note;
     } else if (event.type === "runtime.error") {
       run.error = redactSecretsInText(event.message).slice(0, 500);
     } else if (event.type === "turn.retrying") {
