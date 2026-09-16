@@ -93,9 +93,13 @@ async function runTask(engine: string, trial: number, bot: { id: string; model: 
   await api("PATCH", `/api/tasks/${filed.id}`, { status: "ready" });
   const deadline = Date.now() + 15 * 60_000;
   let t: any;
+  let reviewedAt = 0;
   for (;;) {
     t = await taskById(filed.id);
-    const settled = (t.status === "review" && t.verdict) || t.status === "blocked" || t.status === "done";
+    if (t.status === "review" && !reviewedAt) reviewedAt = Date.now();
+    // settled: a verdict landed, or the task sat in review for a minute
+    // without one (an engine with no one-shot call is never judged)
+    const settled = (t.status === "review" && (t.verdict || Date.now() - reviewedAt > 60_000)) || t.status === "blocked" || t.status === "done";
     if (settled) break;
     if (Date.now() > deadline) break;
     await new Promise((r) => setTimeout(r, 2_000));
