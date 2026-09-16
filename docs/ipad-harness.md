@@ -29,14 +29,36 @@ forwards port 8100 to loopback. Stop it with Ctrl-C.
 
 Then, in OpenMausBot, ask a bot something like "On the iPad, open Notes and
 write today's date". Mentioning the iPad selects the `ipad-harness` skill,
-which mounts the tools for that turn. Only one thread can drive the iPad at a
-time.
+which mounts the tools for that turn. Selection is per message, exactly like
+the Android phone tools: a follow-up such as "go ahead" without the word iPad
+gets no iPad tools and the bot will say the connection is gone, so keep
+"iPad" in every message that should touch the device. Only one thread can
+drive the iPad at a time.
 
 ## Tools
 
 `status`, `read_screen`, `screenshot`, `open_app`, `tap_text`, `tap`,
 `swipe`, `type_text`, `press`. Coordinates are iPad points; screenshots are
 downscaled so pixels equal points.
+
+## Verified on hardware
+
+2026-09-16, iPad Air (5th generation, iPad13,16) on iPadOS 26.6.1, Xcode 27.0,
+WebDriverAgent 16.12.8, Claude engine with claude-sonnet-5. A chat turn
+"On the iPad: open Notes, create a new note, type Hello from OpenMausBot"
+called `status`, `open_app`, `read_screen`, `tap_text`, `tap`, `type_text`,
+and `read_screen` again, and the note appeared on the device. Screenshots
+came back at 1180x820 for the landscape 1180x820-point screen.
+
+Two things found on the device and fixed in the proxy: WDA serves
+`/wda/homescreen` outside the session, and creating a second WDA session
+deletes the first mid-request, so the proxy shares one in-flight session
+creation and runs tool calls strictly in order.
+
+Setup gotchas from the same run: Developer Mode must be on, and the iPad
+must be registered on the Supamaus team before automatic signing can build
+the runner. Xcode cannot register it with an App Store Connect API key, but
+the App Store Connect API itself can (`POST /v1/devices`).
 
 ## Limitations
 
