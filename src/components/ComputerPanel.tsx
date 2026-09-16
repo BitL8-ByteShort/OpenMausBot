@@ -42,6 +42,9 @@ import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { RoutinesSection } from "./bot-settings/RoutinesSection";
 import { routineRunLabel, routineRunTone } from "@/lib/routine-display";
 import { AndroidDevicePanel, useAndroidUsbDevices } from "./AndroidDevicePanel";
+import { IpadDevicePanel, useIpadDevice } from "./IpadDevicePanel";
+import { ipadTabVisible, ipadTileState } from "@/lib/ipad-place";
+import { Tablet } from "lucide-react";
 import { BrowserPanel } from "./BrowserPanel";
 import { browserAvailable, browserUnavailableReason, builtInBrowserEnabled } from "@/lib/feature-flags";
 import { transitionComputerControlLease, type ComputerControlAction } from "@/lib/computer-control";
@@ -318,6 +321,9 @@ export function ComputerPanel({
   const [panelView, setPanelView] = useState<ComputerPanelView>(() => readComputerPanelView(bot.id));
   const androidStatus = useAndroidUsbDevices();
   const androidConnected = androidStatus.devices.length > 0;
+  const ipadStatus = useIpadDevice();
+  const ipadTile = ipadTileState(ipadStatus);
+  const ipadTab = ipadTabVisible(ipadStatus, profileBot.computer);
   // Keep installation reachable before the engine is ready. Actual browser
   // operations below still require browserAvailableHere.
   const browserAvailableHere = browserAvailable(state.config);
@@ -375,6 +381,7 @@ export function ComputerPanel({
     if (previous === viewerConnectionKey && !(bot.computer === "browser" && browserEnabled)) return;
     previousPanelTarget.current = viewerConnectionKey;
     setPanelView(bot.computer === "browser" && browserEnabled ? "browser"
+      : bot.computer === "ipad" ? "ipad"
       : previous === null ? readComputerPanelView(bot.id) : "computer");
   }, [viewerConnectionKey, bot.id, bot.computer, browserEnabled]);
 
@@ -401,11 +408,11 @@ export function ComputerPanel({
   }, [bot.id]);
 
   useEffect(() => {
-    if ((!androidConnected && panelView === "android") || (!browserEnabled && panelView === "browser")) {
+    if ((!androidConnected && panelView === "android") || (!browserEnabled && panelView === "browser") || (!ipadTab && panelView === "ipad")) {
       setPanelView("computer");
       writeComputerPanelView(bot.id, "computer");
     }
-  }, [androidConnected, bot.id, browserEnabled, panelView]);
+  }, [androidConnected, bot.id, browserEnabled, ipadTab, panelView]);
   useEffect(() => {
     vmReadinessAttempts.current = 0;
   }, [bot.id, bot.computer]);
@@ -1216,6 +1223,20 @@ export function ComputerPanel({
               <Smartphone size={13} /> {t("computer.tab.android")}
             </button>
             )}
+            {ipadTab && (
+            <button
+              type="button"
+              onClick={() => selectPanelView("ipad")}
+              aria-pressed={panelView === "ipad"}
+              className={cn(
+                "flex items-center gap-1.5 border-l border-hairline/40 px-2.5 py-1 text-[12.5px]",
+                panelView === "ipad" ? "bg-control text-ink" : "text-ink-secondary hover:text-ink",
+              )}
+            >
+              <Tablet size={13} /> {t("computer.tab.ipad")}
+              {placeLive && livePlace === "ipad" && <span className="size-1.5 animate-pulse rounded-full bg-success" role="img" aria-label={t("place.live")} data-testid="ipad-tab-live" />}
+            </button>
+            )}
             {browserEnabled && (
             <button
               data-tour="computer-browser"
@@ -1255,6 +1276,10 @@ export function ComputerPanel({
               {errorText}
             </div>
           )}
+        </div>
+      ) : panelView === "ipad" && ipadTab ? (
+        <div className="flex min-h-0 flex-1 flex-col px-4 pb-4 pt-2">
+          <IpadDevicePanel status={ipadStatus} />
         </div>
       ) : panelView === "android" && androidConnected ? (
         <div className="flex-1 overflow-y-auto px-4 pt-2">
@@ -1625,6 +1650,7 @@ export function ComputerPanel({
               ["vm", "vm.dest.vm", "computer.dest.vmDesc", Box],
               ["local", "vm.dest.local", "computer.dest.localDesc", Monitor],
               ["browser", "vm.dest.browser", "computer.dest.browserDesc", Globe],
+              ["ipad", "vm.dest.ipad", "computer.dest.ipadDesc", Tablet],
               ["off", "vm.dest.off", "computer.dest.offDesc", Power],
             ] as const).map(([mode, labelKey, descriptionKey, Icon]) => {
                 const selected = mode === null ? !profileBot.computer : profileBot.computer === mode;
@@ -1632,7 +1658,8 @@ export function ComputerPanel({
                   (mode === "cloud" && !cloudSupported) ||
                   (mode === "vm" && !vmSupported) ||
                   (mode === "local" && !localSelectable) ||
-                  (mode === "browser" && !browserSelectable);
+                  (mode === "browser" && !browserSelectable) ||
+                  (mode === "ipad" && !ipadTile.enabled);
                 const unavailableTitle =
                   mode === "vm" && !vmSupported
                     ? t("computer.unavailableVm")
@@ -1640,9 +1667,11 @@ export function ComputerPanel({
                       ? t("computer.unavailableCloud")
                       : mode === "local" && !localSelectable
                         ? localDisabledReason ?? t("computer.unavailableLocal")
-                        : mode === "browser"
-                          ? browserSelectable ? t("computer.browserOnlyTitle") : browserDisabledReason
-                          : undefined;
+                        : mode === "ipad"
+                          ? ipadTile.reason ?? undefined
+                          : mode === "browser"
+                            ? browserSelectable ? t("computer.browserOnlyTitle") : browserDisabledReason
+                            : undefined;
                 return (
               <button
                 key={mode ?? "auto"}
