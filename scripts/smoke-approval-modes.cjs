@@ -223,9 +223,14 @@ app.whenReady().then(async () => {
           return !state.busy && state;
         });
         const text = settled.messages.slice(before).map((message) => message.text ?? "").join("\n");
-        assert.match(text, /list_bots:/);
-        assert.match(text, /session_search:/);
-        assert.equal((text.match(/list_bots:/g) ?? []).length, 2, "Repeated reads complete without another prompt");
+        assert.match(text, /^list_bots:/m);
+        assert.match(text, /^session_search:/m);
+        // Count only the lines the fixture EMITS (fake-acp-cli.ts:799 writes
+        // `${name}: ${text}\n` per read, and hardcodes exactly two list_bots).
+        // Unanchored, this also counted list_bots: quoted back INSIDE a
+        // session_search result — since #1302 a bot recalls its own per-turn
+        // log lines, so a correct run reported three and read as a re-prompt.
+        assert.equal((text.match(/^list_bots:/gm) ?? []).length, 2, "Repeated reads complete without another prompt");
       } else {
         const card = await until(async () => pendingCard((await api("/api/bots")).body.bots.find((candidate) => candidate.id === bot.id)));
         assert.equal((await api(`/api/bots/${bot.id}/respond`, "POST", { requestId: card.requestId, behavior: "deny" })).status, 200);
