@@ -4838,10 +4838,17 @@ function reportIncident(input: { kind: IncidentKind; bot: BotRecord; threadId: s
   // a crash loop is one incident, not a storm
   if (count.muted) return;
   const chief = chiefForBot(store.bots, bot);
-  const tellThePerson = () => notify(buildNotification("incident", bot, threadId, incidentChip(incident), {
-    avatarUrl: bot.avatarUrl,
-    ...(group ? { group: { id: group.id, name: group.name } } : {}),
-  }));
+  // A run that could not start and a failed routine have already buzzed
+  // the person (turn-failed, routine-failed) by the time they get here; a
+  // failure or stall mid-run has not. One notification per failure, never two.
+  const alreadyNotified = input.kind === "could-not-start" || input.kind === "routine-failed";
+  const tellThePerson = () => {
+    if (alreadyNotified) return;
+    notify(buildNotification("incident", bot, threadId, incidentChip(incident), {
+      avatarUrl: bot.avatarUrl,
+      ...(group ? { group: { id: group.id, name: group.name } } : {}),
+    }));
+  };
   // no Chief on duty, or the Chief itself broke: the person is next
   if (!chief) {
     tellThePerson();

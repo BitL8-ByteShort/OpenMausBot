@@ -26,7 +26,9 @@ Limits, so a crash loop is one incident and not a storm: a thread may be
 retried twice; the third report tells the Chief to stop and explain; after
 five incidents in an hour the thread is muted until the hour passes. A
 Chief's own failures, and a bot with no Chief on duty, go to the person as a
-notification ("Ada hit a problem"). A thread another bot opened and is
+notification ("Ada hit a problem") — for a failure or stall mid-run; a run
+that could not start and a failed routine already notified, and are never
+announced twice. A thread another bot opened and is
 watching (a delegation) is that bot's to handle — it is woken with the
 failure already — so it raises no incident. A run the person stopped is not
 an incident.
