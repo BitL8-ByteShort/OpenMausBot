@@ -43,7 +43,7 @@ function runnerWith(extraRoutes: Record<string, Route> = {}, downscale: Downscal
     "GET /screenshot": () => ({ value: PNG_1X1.toString("base64") }),
     "POST /session/S1/wda/apps/launch": () => ({ value: null }),
     "POST /session/S1/wda/keys": () => ({ value: null }),
-    "POST /session/S1/wda/homescreen": () => ({ value: null }),
+    "POST /wda/homescreen": () => ({ value: null }),
     "POST /session/S1/actions": () => ({ value: null }),
     ...extraRoutes,
   });
@@ -119,7 +119,7 @@ describe("createToolRunner", () => {
     expect(text(await run("type_text", { text: "hello" }))).toBe("Typed text into the focused iPad field");
     expect(calls.find((c) => c.path === "/session/S1/wda/keys")?.body).toEqual({ value: ["hello"] });
     expect(text(await run("press", { key: "home" }))).toBe("Pressed home");
-    expect(calls.some((c) => c.path === "/session/S1/wda/homescreen")).toBe(true);
+    expect(calls.some((c) => c.path === "/wda/homescreen" && c.method === "POST")).toBe(true);
     expect(text(await run("press", { key: "enter" }))).toBe("Pressed enter");
     expect(calls.filter((c) => c.path === "/session/S1/wda/keys").at(-1)?.body).toEqual({ value: ["\n"] });
     const bad = await run("press", { key: "volume" });
@@ -180,11 +180,19 @@ describe("flattenSource", () => {
       ],
     });
     expect(flattenSource(root)).toEqual([
-      { type: "Application", label: "", name: "", value: "", rect: { x: 0, y: 0, width: 10, height: 10 } },
       { type: "Button", label: "Done", name: "", value: "", rect: { x: 10, y: 20, width: 30, height: 40 } },
       { type: "Cell", label: "", name: "row", value: "", rect: { x: 0, y: 0, width: 10, height: 10 } },
       { type: "StaticText", label: "", name: "", value: "Hello", rect: { x: 0, y: 0, width: 10, height: 10 } },
     ]);
+  });
+  it("drops untitled containers but keeps untitled interactive elements", () => {
+    const root = el("Application", {
+      children: [
+        el("Window", { children: [el("Other", { children: [el("TextField"), el("Other", { label: "titled" })] })] }),
+        el("Group", { name: "Notes" }),
+      ],
+    });
+    expect(flattenSource(root).map((e) => `${e.type}:${e.label || e.name}`)).toEqual(["TextField:", "Other:titled", "Group:Notes"]);
   });
   it("caps the list at MAX_ELEMENTS", () => {
     const root = el("Application", { children: Array.from({ length: 400 }, (_, i) => el("StaticText", { label: `t${i}` })) });
@@ -308,6 +316,17 @@ describe("createWdaClient", () => {
     await client.session("GET", "/window/size");
     expect(wda.calls.filter((c) => c.path === "/session")).toHaveLength(1);
     expect(wda.calls[0].body).toEqual({ capabilities: { alwaysMatch: {}, firstMatch: [{}] } });
+  });
+
+  it("shares one in-flight session creation between concurrent calls", async () => {
+    let sessions = 0;
+    const wda = fakeWda({
+      "POST /session": () => ({ value: { sessionId: `S${++sessions}` } }),
+      "GET /session/S1/window/size": () => ({ value: { width: 1024, height: 768 } }),
+    });
+    const client = createWdaClient({ fetch: wda.fetch, baseUrl: "http://127.0.0.1:8100" });
+    await Promise.all([client.session("GET", "/window/size"), client.session("GET", "/window/size"), client.session("GET", "/window/size")]);
+    expect(sessions).toBe(1);
   });
 
   it("recreates the session exactly once after invalid session id", async () => {
