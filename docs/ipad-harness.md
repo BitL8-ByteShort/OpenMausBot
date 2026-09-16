@@ -60,6 +60,14 @@ Two things found on the device and fixed in the proxy: WDA serves
 deletes the first mid-request, so the proxy shares one in-flight session
 creation and runs tool calls strictly in order.
 
+The **Works on → iPad** destination was verified the same day on the same
+device. A bot set to iPad answered "Open Notes and tell me the title of the
+most recent note" — no iPad wording at all — by calling `status`, `open_app`
+and `read_screen`, and named the place first ("Working on the iPad now").
+The panel's iPad tab mirrored the screen live throughout, which also proves
+the mirror's session-less capture does not disturb the session the turn's
+proxy holds. WebDriverAgent was started from the panel's own Start button.
+
 Setup gotchas from the same run: Developer Mode must be on, and the iPad
 must be registered on the Supamaus team before automatic signing can build
 the runner. Xcode cannot register it with an App Store Connect API key, but
