@@ -72,9 +72,14 @@ export interface BotDispatch {
  * or task_block tool in this scope yet — a bot cannot report progress on
  * a board task from inside its own turn — so this is deliberately honest
  * about that instead of promising a tool that is not wired up. */
-export function boardTaskPrompt(task: Pick<BoardTask, "title" | "body">): string {
+export function boardTaskPrompt(task: Pick<BoardTask, "title" | "body"> & { verdict?: BoardTask["verdict"] }): string {
   const detail = task.body.trim() ? `\n\n${task.body.trim()}` : "";
-  return `A task was filed on the shared task board: "${task.title}"${detail}\n\n${SCOPED_CLAIM_PROMPT.trim()}`;
+  // Phase 3 part 3: a retry after "not complete" starts from the verdict,
+  // not from scratch — what was missing and what to do next.
+  const previous = task.verdict && !task.verdict.isComplete
+    ? `\n\nA previous attempt at this task was judged not complete. ${task.verdict.evidenceAgainst.length ? `What was missing: ${task.verdict.evidenceAgainst.join("; ")}.` : ""}${task.verdict.nextAction ? ` Do this: ${task.verdict.nextAction}` : ""}`
+    : "";
+  return `A task was filed on the shared task board: "${task.title}"${detail}${previous}\n\n${SCOPED_CLAIM_PROMPT.trim()}`;
 }
 
 export function createBotDispatch<Bot extends DispatchBot>(deps: BotDispatchDeps<Bot>): BotDispatch {

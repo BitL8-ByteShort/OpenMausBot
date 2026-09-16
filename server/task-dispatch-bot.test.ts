@@ -94,6 +94,13 @@ describe("board dispatch policy", () => {
     expect(dispatch.hold(task("no-such-bot"))).toMatch(/no longer exists/);
   });
 
+  it("tells a retry what the verifier found missing (Phase 3 part 3)", () => {
+    const prompt = boardTaskPrompt({ title: "t", body: "b", verdict: { isComplete: false, confidence: 0.2, evidenceFor: [], evidenceAgainst: ["greeting.txt is missing"], nextAction: "create greeting.txt", attempt: 1, line: "x" } });
+    expect(prompt).toContain("judged not complete");
+    expect(prompt).toContain("greeting.txt is missing");
+    expect(prompt).toContain("Do this: create greeting.txt");
+    expect(boardTaskPrompt({ title: "t", body: "b", verdict: null })).not.toContain("judged not complete");
+  });
   it("says no while the board flag is off, whatever the assignee looks like", () => {
     const { dispatch } = harness({ boardEnabled: () => false });
     expect(dispatch.canDispatch(board.createTask({ title: "t", assigneeBotId: "bot-1" }))).toBe(false);
