@@ -51,6 +51,7 @@ export function verifierPrompt(input: VerifierInput): string {
     "Answer with one JSON object and nothing else:",
     '{"is_complete": true|false, "confidence": 0..1, "evidence_for": ["…"], "evidence_against": ["…"], "next_action": "one sentence, or empty when complete"}',
     "A claim without evidence in the result or the checks is not evidence. A failed check means not complete.",
+    "next_action must be something the bot can do on its own in one more attempt with nobody watching: never \"ask the user\", \"clarify\" or \"confirm\". If the request and the checks conflict, say which reading to take and why.",
   ].join("\n");
 }
 

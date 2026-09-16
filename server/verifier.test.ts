@@ -18,6 +18,7 @@ describe("the verifier's prompt", () => {
     expect(prompt).toContain("1 failed");
     expect(prompt).toContain("Created greeting.txt containing hello.");
     expect(prompt).toMatch(/"is_complete"/);
+    expect(prompt).toMatch(/never "ask the user"/);
   });
 });
 

@@ -369,8 +369,9 @@ import {
   TASK_TITLE_MAX,
   visibleTo as visibleBoardTasks,
   type BoardStatus,
+  type BoardTask,
   type TaskPatch as BoardTaskPatch, bookSpend, taskByThread, setResult, BUDGET_PAUSED_REASON, suggestedBudgetUsd, setGates, setVerdict } from "./task-board.ts";
-import { createBotDispatch } from "./task-dispatch-bot.ts";
+import { createBotDispatch, parkedOnCard } from "./task-dispatch-bot.ts";
 import { DEFAULT_STALE_AFTER_MS, createDispatcher as createBoardDispatcher } from "./task-dispatcher.ts";
 import { createTaskTurnWatch } from "./task-turn-watch.ts";
 import { BUILT_IN_BROWSER_SYSTEM_PROMPT } from "./browser-engine.ts";
@@ -7090,6 +7091,17 @@ async function runBoardVerifier(taskId: string, botId: string, threadId: string,
   }
 }
 
+/** Why a task is not moving, in words: the dispatcher's reasons for a task
+ * that has not started, or a running attempt parked on a card nobody will
+ * answer (Phase 3 part 3). */
+function boardHold(task: BoardTask): string | null {
+  const dispatchHold = boardDispatch.hold(task);
+  if (dispatchHold) return dispatchHold;
+  if (task.status !== "running" || !task.threadId) return null;
+  const last = store.activePath(task.threadId).at(-1);
+  return parkedOnCard(last as Parameters<typeof parkedOnCard>[0]);
+}
+
 function boardReady(): boolean {
   if (!boardEnabled(cfg)) return false;
   if (!boardOpened) {
@@ -11256,7 +11268,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         });
         // Say now if the board will not run it, rather than letting it sit
         // at "ready" with no message anywhere (found by hand, 2026-09-16).
-        return json(res, 201, { task, hold: boardDispatch.hold(task) });
+        return json(res, 201, { task, hold: boardHold(task) });
       }
       if (method === "POST" && path === "/api/internal/task-list") {
         if (!boardReady()) return json(res, 404, { error: "the task board is not enabled" });
@@ -11282,7 +11294,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             ...(body.mineOnly === true ? { assigneeBotId: internalSender.id } : {}),
           }),
           (botId) => reachable.has(botId),
-        ).map((task) => ({ ...task, hold: boardDispatch.hold(task) }));
+        ).map((task) => ({ ...task, hold: boardHold(task) }));
         return json(res, 200, { tasks });
       }
       if (method === "POST" && path === "/api/internal/browser/mcp") {
@@ -12816,7 +12828,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // every comment on every task, growing without limit as bots commented;
       // they are loaded per task through the route just below instead.
       // Phase 3 part 2: the board screen shows why an assigned task waits.
-      const tasks = listBoardTasks({ status: requestedStatus, assigneeBotId }).map((task) => ({ ...task, hold: boardDispatch.hold(task) }));
+      const tasks = listBoardTasks({ status: requestedStatus, assigneeBotId }).map((task) => ({ ...task, hold: boardHold(task) }));
       return json(res, 200, { tasks });
     }
     const taskCommentsListMatch = path.match(/^\/api\/tasks\/([\w-]+)\/comments$/);
