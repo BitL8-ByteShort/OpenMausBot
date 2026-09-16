@@ -141,6 +141,13 @@ describe("the task board routes through an isolated HTTP fixture", () => {
     const me = await asBot("/api/internal/task-create", { title: "again, as me", assigneeBotId: "me" });
     expect(me.status).toBe(201);
     expect(me.body.task.assigneeBotId).toBe(botId);
+    // Scout is on "Ask", so the board will not run this; the filing bot is
+    // told why, and task_list keeps saying so.
+    expect(me.body.hold).toMatch(/Scout.*Approve for me/);
+    const listed = await asBot("/api/internal/task-list", { mineOnly: true });
+    expect(listed.status).toBe(200);
+    const mine = listed.body.tasks.find((task: { id: string }) => task.id === me.body.task.id);
+    expect(mine.hold).toMatch(/Approve for me/);
   });
 
   it("refuses a bad assignee at creation and rejects an internal call without the comms token", async () => {

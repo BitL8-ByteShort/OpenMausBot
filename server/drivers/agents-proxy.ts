@@ -1824,8 +1824,9 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
     const assignment = typeof task.assigneeBotId === "string"
       ? `assigned to ${task.assigneeBotId}`
       : "unassigned — a human can assign it; to take it yourself, file with assignee_bot_id \"me\"";
+    const hold = typeof r.hold === "string" && r.hold ? ` It will not run yet: ${r.hold}` : "";
     return {
-      text: `Filed task ${task.id} “${task.title}”, status: ${task.status}, ${assignment}.`,
+      text: `Filed task ${task.id} “${task.title}”, status: ${task.status}, ${assignment}.${hold}`,
     };
   }
   if (name === "task_list") {
@@ -1846,7 +1847,8 @@ async function callTool(name: string, args: Json): Promise<{ text: string; isErr
         ? `, spent $${Number(task.spentUsd ?? 0).toFixed(3)} of $${task.budgetUsd.toFixed(3)}`
         : typeof task.spentUsd === "number" && task.spentUsd > 0 ? `, spent $${task.spentUsd.toFixed(3)}` : "";
       const result = typeof task.result === "string" && task.result ? `\n  result: ${task.result.slice(0, 200)}` : "";
-      return `- [${task.status}] ${task.title} (id: ${task.id})${assignee}${owner}${due}${budget}${attempts}${blocked}${result}`;
+      const hold = typeof task.hold === "string" && task.hold ? `\n  waiting: ${task.hold}` : "";
+      return `- [${task.status}] ${task.title} (id: ${task.id})${assignee}${owner}${due}${budget}${attempts}${blocked}${result}${hold}`;
     });
     return { text: `Board tasks:\n${lines.join("\n")}` };
   }

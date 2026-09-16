@@ -11175,7 +11175,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ...fields,
           parentIds,
         });
-        return json(res, 201, { task });
+        // Say now if the board will not run it, rather than letting it sit
+        // at "ready" with no message anywhere (found by hand, 2026-09-16).
+        return json(res, 201, { task, hold: boardDispatch.hold(task) });
       }
       if (method === "POST" && path === "/api/internal/task-list") {
         if (!boardReady()) return json(res, 404, { error: "the task board is not enabled" });
@@ -11201,7 +11203,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             ...(body.mineOnly === true ? { assigneeBotId: internalSender.id } : {}),
           }),
           (botId) => reachable.has(botId),
-        );
+        ).map((task) => ({ ...task, hold: boardDispatch.hold(task) }));
         return json(res, 200, { tasks });
       }
       if (method === "POST" && path === "/api/internal/browser/mcp") {
