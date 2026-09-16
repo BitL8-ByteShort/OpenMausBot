@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   KNOWN_APPS,
+  filterApps,
   MAX_ELEMENTS,
   MAX_TEXT,
   START_HINT,
@@ -17,16 +18,29 @@ import {
   tapActions,
   validatePoint,
   validateText,
+  matchInstalled,
   wdaBaseUrl,
   type Downscale,
   type FetchLike,
+  type InstalledApp,
+  type ListApps,
 } from "./ipad-proxy.ts";
 
 const PNG_1X1 = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
 
 const text = (r: { content: Array<{ type: string; text?: string }> }) => r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 
-function runnerWith(extraRoutes: Record<string, Route> = {}, downscale: Downscale = async (png) => png) {
+const INSTALLED = [
+  { name: "YouTube", bundleId: "com.google.ios.youtube" },
+  { name: "YouTube Music", bundleId: "com.google.ios.youtubemusic" },
+  { name: "Gmail", bundleId: "com.google.Gmail" },
+  { name: "Kindle", bundleId: "com.amazon.Lassen" },
+  { name: "Clock", bundleId: "com.apple.mobiletimer" },
+  { name: "Clock+", bundleId: "com.third.clockplus" },
+  { name: "BluetoothUIService", bundleId: "com.apple.BluetoothUIService" },
+];
+
+function runnerWith(extraRoutes: Record<string, Route> = {}, downscale: Downscale = async (png) => png, listApps: ListApps = async () => INSTALLED) {
   const source = {
     type: "XCUIElementTypeApplication", label: "", name: "Notes", value: "", isVisible: "1", rect: { x: 0, y: 0, width: 1024, height: 768 },
     children: [
@@ -48,12 +62,17 @@ function runnerWith(extraRoutes: Record<string, Route> = {}, downscale: Downscal
     ...extraRoutes,
   });
   const client = createWdaClient({ fetch: wda.fetch, baseUrl: "http://127.0.0.1:8100" });
-  return { run: createToolRunner({ client, downscale }), calls: wda.calls };
+  return { run: createToolRunner({ client, downscale, listApps }), calls: wda.calls };
 }
 
 describe("TOOLS", () => {
-  it("exposes the nine phone-shaped tools", () => {
-    expect(TOOLS.map((t) => t.name)).toEqual(["status", "read_screen", "screenshot", "open_app", "tap_text", "tap", "swipe", "type_text", "press"]);
+  it("exposes the phone-shaped tools, app discovery included", () => {
+    expect(TOOLS.map((t) => t.name)).toEqual(["status", "read_screen", "screenshot", "list_apps", "open_app", "tap_text", "tap", "swipe", "type_text", "press"]);
+  });
+  it("never implies only Apple apps can be opened", () => {
+    const openApp = TOOLS.find((t) => t.name === "open_app")!;
+    expect(openApp.description).toMatch(/any installed app/i);
+    expect(openApp.description).toMatch(/list_apps/);
   });
 });
 
@@ -66,7 +85,7 @@ describe("createToolRunner", () => {
 
   it("status explains how to start WDA when unreachable, without isError", async () => {
     const client = createWdaClient({ fetch: async () => { throw new Error("ECONNREFUSED"); }, baseUrl: "http://127.0.0.1:8100" });
-    const run = createToolRunner({ client, downscale: async (png) => png });
+    const run = createToolRunner({ client, downscale: async (png) => png, listApps: async () => INSTALLED });
     const result = await run("status", {});
     expect(result.isError).toBeUndefined();
     expect(text(result)).toContain("pnpm ipad:wda");
@@ -89,14 +108,58 @@ describe("createToolRunner", () => {
     expect(text(result)).toContain("1024x768 points");
   });
 
-  it("open_app launches a known name or bundle id and hints on unknown names", async () => {
+  it("open_app launches an Apple app by name or any raw bundle id", async () => {
     const { run, calls } = runnerWith();
     expect(text(await run("open_app", { name: "Notes" }))).toBe("Opened Notes (com.apple.mobilenotes)");
     expect(calls.find((c) => c.path === "/session/S1/wda/apps/launch")?.body).toEqual({ bundleId: "com.apple.mobilenotes" });
     expect(text(await run("open_app", { name: "org.mozilla.ios.Firefox" }))).toContain("org.mozilla.ios.Firefox");
+  });
+
+  it("open_app opens a third-party app the device actually has", async () => {
+    const { run, calls } = runnerWith();
+    expect(text(await run("open_app", { name: "YouTube" }))).toBe("Opened YouTube (com.google.ios.youtube)");
+    expect(calls.filter((c) => c.path === "/session/S1/wda/apps/launch").at(-1)?.body).toEqual({ bundleId: "com.google.ios.youtube" });
+    expect(text(await run("open_app", { name: "kindle" }))).toBe("Opened Kindle (com.amazon.Lassen)");
+  });
+
+  it("open_app resolves a partial name and names the candidates when ambiguous", async () => {
+    const { run } = runnerWith();
+    expect(text(await run("open_app", { name: "youtube m" }))).toBe("Opened YouTube Music (com.google.ios.youtubemusic)");
+    const ambiguous = await run("open_app", { name: "you" });
+    expect(ambiguous.isError).toBe(true);
+    expect(text(ambiguous)).toContain("YouTube Music");
+  });
+
+  it("open_app says how to discover apps when nothing matches", async () => {
+    const { run } = runnerWith();
     const unknown = await run("open_app", { name: "Fortnite" });
     expect(unknown.isError).toBe(true);
-    expect(text(unknown)).toMatch(/tap_text/);
+    expect(text(unknown)).toMatch(/list_apps/);
+  });
+
+  it("open_app explains itself when the device list cannot be read", async () => {
+    const { run } = runnerWith({}, async (png) => png, async () => { throw new Error("xcrun devicectl failed"); });
+    const failed = await run("open_app", { name: "YouTube" });
+    expect(failed.isError).toBe(true);
+    expect(text(failed)).toContain("xcrun devicectl failed");
+    expect(text(await run("open_app", { name: "Notes" }))).toBe("Opened Notes (com.apple.mobilenotes)");
+  });
+
+  it("filterApps shows every match, unlike the ranked open_app matcher", () => {
+    expect(filterApps("youtube", INSTALLED).map((a) => a.name)).toEqual(["YouTube", "YouTube Music"]);
+    expect(filterApps("com.google", INSTALLED).map((a) => a.name)).toEqual(["YouTube", "YouTube Music", "Gmail"]);
+    expect(filterApps("", INSTALLED)).toHaveLength(INSTALLED.length);
+  });
+
+  it("list_apps lists installed apps and filters by query", async () => {
+    const { run } = runnerWith();
+    const all = text(await run("list_apps", {}));
+    expect(all).toContain("YouTube — com.google.ios.youtube");
+    expect(all).toContain("Gmail — com.google.Gmail");
+    const filtered = text(await run("list_apps", { query: "youtube" }));
+    expect(filtered).toContain("YouTube Music — com.google.ios.youtubemusic");
+    expect(filtered).not.toContain("Gmail");
+    expect(text(await run("list_apps", { query: "nothingmatches" }))).toContain("No installed app matches");
   });
 
   it("tap_text touches the centre of the match", async () => {
@@ -260,6 +323,44 @@ describe("resolveApp", () => {
     for (const name of ["safari", "notes", "settings", "mail", "messages", "photos", "files", "calendar", "maps", "music", "reminders", "app store", "freeform", "clock", "camera", "books", "podcasts", "shortcuts"]) {
       expect(KNOWN_APPS[name], name).toMatch(/^com\.apple\./);
     }
+  });
+});
+
+describe("matchInstalled", () => {
+  const apps: InstalledApp[] = [
+    { name: "YouTube", bundleId: "com.google.ios.youtube" },
+    { name: "YouTube Music", bundleId: "com.google.ios.youtubemusic" },
+    { name: "Clock", bundleId: "com.apple.mobiletimer" },
+    { name: "Clock+", bundleId: "com.third.clockplus" },
+  ];
+  it("prefers an exact name over a prefix or substring match", () => {
+    expect(matchInstalled("YouTube", apps).map((a) => a.bundleId)).toEqual(["com.google.ios.youtube"]);
+    expect(matchInstalled("clock", apps).map((a) => a.bundleId)).toEqual(["com.apple.mobiletimer"]);
+  });
+  it("falls back to prefix, then substring, and is case- and space-insensitive", () => {
+    expect(matchInstalled("youtube mu", apps).map((a) => a.bundleId)).toEqual(["com.google.ios.youtubemusic"]);
+    expect(matchInstalled("YouTubeMusic", apps).map((a) => a.bundleId)).toEqual(["com.google.ios.youtubemusic"]);
+    expect(matchInstalled("music", apps).map((a) => a.bundleId)).toEqual(["com.google.ios.youtubemusic"]);
+  });
+  it("matches a bundle id exactly and returns nothing for an unknown name", () => {
+    expect(matchInstalled("com.third.clockplus", apps).map((a) => a.name)).toEqual(["Clock+"]);
+    expect(matchInstalled("Fortnite", apps)).toEqual([]);
+    expect(matchInstalled("", apps)).toEqual([]);
+  });
+  it("returns every candidate only when they tie at the same rank", () => {
+    const ambiguous = [
+      { name: "Maps", bundleId: "com.apple.Maps" },
+      { name: "Google Maps", bundleId: "com.google.Maps" },
+    ];
+    // "Maps" wins on exact name, and "map" on prefix — neither is ambiguous
+    expect(matchInstalled("maps", ambiguous).map((a) => a.bundleId)).toEqual(["com.apple.Maps"]);
+    expect(matchInstalled("map", ambiguous).map((a) => a.bundleId)).toEqual(["com.apple.Maps"]);
+    // only a substring that hits both with no better rank is a real tie
+    const tied = [
+      { name: "Google Maps", bundleId: "com.google.Maps" },
+      { name: "Apple Maps", bundleId: "com.apple.Maps" },
+    ];
+    expect(matchInstalled("maps", tied).map((a) => a.bundleId)).toEqual(["com.google.Maps", "com.apple.Maps"]);
   });
 });
 

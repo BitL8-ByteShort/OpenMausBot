@@ -11,8 +11,11 @@ other automation route.
 
 1. Call `status` before the first action. If WebDriverAgent is not running,
    stop and relay its instruction to the user; do not try to start it.
-2. Call `open_app` with the human app name or bundle id. For apps it does not
-   know, `press` home and `tap_text` the icon's name.
+2. Call `open_app` with the human app name. It opens ANY app installed on the
+   iPad, not only Apple's. If the name does not match, call `list_apps` (with a
+   query) to find it, then open it by name or bundle id. Never substitute a
+   website in Safari for an app the user asked for; if the app is genuinely not
+   installed, say so.
 3. Call `read_screen` before choosing a target and after every action. Prefer
    `tap_text`; use `screenshot` and point `tap` only when accessibility text
    cannot identify the target. Screenshot pixels equal points.
