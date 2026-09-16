@@ -61,7 +61,7 @@ interface Status {
 export interface LocalVmInventoryInstance {
   botId: string;
   name: string;
-  destination: "auto" | "cloud" | "vm" | "local" | "browser" | "off";
+  destination: "auto" | "cloud" | "vm" | "local" | "browser" | "ipad" | "off";
   container: "running" | "stopped";
   ready: boolean;
   managed: boolean;
@@ -127,6 +127,7 @@ const destinationLabelKeys: Record<LocalVmInventoryInstance["destination"], Loca
   vm: "vm.dest.vm",
   local: "vm.dest.local",
   browser: "vm.dest.browser",
+  ipad: "vm.dest.ipad",
   off: "vm.dest.off",
 };
 

@@ -272,7 +272,7 @@ export interface Task {
   /** where this conversation works, when pinned: by the person from the
    * composer, or by its first Auto turn to the place it reached. Wins over
    * the bot's Works on (except Off); absent = follows the bot. */
-  surface?: "cloud" | "vm" | "local" | "browser";
+  surface?: "cloud" | "vm" | "local" | "browser" | "ipad";
   /** set when a bot (not the person) started this thread — its own or a
    * teammate's; the sidebar shows a quiet "opened by <name>" under the title */
   openedBy?: ThreadOpener;
@@ -346,7 +346,7 @@ export interface Bot {
   modelSelection: ModelSelection;
   /** Where this bot works: a computer, only the built-in browser tab, or
    * nowhere; unset = auto (cloud box if one exists, else local). */
-  computer?: "cloud" | "vm" | "local" | "browser" | "off";
+  computer?: "cloud" | "vm" | "local" | "browser" | "ipad" | "off";
   /** Which cloud computer backs `computer: "cloud"`; absent means Box. */
   cloudBackend?: CloudBackend;
   /** Allow Auto to prepare/start the managed VPS container. Off by default. */

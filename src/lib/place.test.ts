@@ -44,4 +44,12 @@ describe("where a conversation works", () => {
     expect(toolSurfaceKind("Bash")).toBeNull();
     expect(toolSurfaceKind("mcp__agents__list_bots")).toBeNull();
   });
+
+  it("treats the iPad as a computer place with its own label key", () => {
+    expect(effectivePlace({ computer: "ipad" }, null)).toBe("ipad");
+    expect(effectivePlace({ computer: undefined }, { surface: "ipad" })).toBe("ipad");
+    expect(isComputerPlace("ipad")).toBe(true);
+    expect(placeLabelKey("ipad")).toBe("place.ipad");
+    expect(toolPlace("mcp__ipad__tap", "ipad")).toBe("ipad");
+  });
 });

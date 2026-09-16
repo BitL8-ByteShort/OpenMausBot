@@ -6,8 +6,8 @@ import { toolSurfaceKind } from "../../shared/tool-surface";
 import type { Bot, Task } from "@/state/store";
 import type { LocaleKey } from "@/locales";
 
-export type Place = "cloud" | "vm" | "local" | "browser";
-export const PLACES: readonly Place[] = ["cloud", "vm", "local", "browser"];
+export type Place = "cloud" | "vm" | "local" | "browser" | "ipad";
+export const PLACES: readonly Place[] = ["cloud", "vm", "local", "browser", "ipad"];
 /** What the chip shows: a place, the bot's Auto, or Off. */
 export type EffectivePlace = Place | "auto" | "off";
 
@@ -18,8 +18,8 @@ export function effectivePlace(bot: Pick<Bot, "computer">, task?: Pick<Task, "su
   return task?.surface ?? bot.computer ?? "auto";
 }
 
-export function isComputerPlace(place: EffectivePlace): place is "cloud" | "vm" | "local" {
-  return place === "cloud" || place === "vm" || place === "local";
+export function isComputerPlace(place: EffectivePlace): place is "cloud" | "vm" | "local" | "ipad" {
+  return place === "cloud" || place === "vm" || place === "local" || place === "ipad";
 }
 
 export function placeLabelKey(place: EffectivePlace): LocaleKey {

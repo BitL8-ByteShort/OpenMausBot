@@ -24,11 +24,14 @@ export function usePlaceAvailability(bot: Bot): PlaceAvailability {
     vm: Boolean(instance?.snapshot?.state === "available" && computerMcp && !boxAgent),
     local: localComputerSelectable({ capabilities, providerSupportsLocal: instanceSupportsLocalComputer(state.instances, bot) }),
     browser: builtInBrowserEnabled(state.config) && browserAvailable(state.config) && instance?.capabilities?.browserMcp === true && !boxAgent,
+    // The panel greys the tile from live WebDriverAgent status; a pin is
+    // always offered and the turn reports the device as unreachable itself.
+    ipad: true,
   };
 }
 
-const DESCRIPTION: Record<Place, "computer.dest.cloudDesc" | "computer.dest.vmDesc" | "computer.dest.localDesc" | "computer.dest.browserDesc"> = {
-  cloud: "computer.dest.cloudDesc", vm: "computer.dest.vmDesc", local: "computer.dest.localDesc", browser: "computer.dest.browserDesc",
+const DESCRIPTION: Record<Place, "computer.dest.cloudDesc" | "computer.dest.vmDesc" | "computer.dest.localDesc" | "computer.dest.browserDesc" | "computer.dest.ipadDesc"> = {
+  cloud: "computer.dest.cloudDesc", vm: "computer.dest.vmDesc", local: "computer.dest.localDesc", browser: "computer.dest.browserDesc", ipad: "computer.dest.ipadDesc",
 };
 
 /** Where this conversation works, always visible beside the send button.
