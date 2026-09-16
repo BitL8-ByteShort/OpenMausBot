@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { BOARD_COLUMNS, cardTone, groupByStatus, raiseStep, spendLabel, type BoardTaskView } from "./task-board-view";
+import { BOARD_COLUMNS, cardTone, dropTargets, groupByStatus, raiseStep, spendLabel, type BoardTaskView } from "./task-board-view";
 
 const task = (over: Partial<BoardTaskView>): BoardTaskView => ({
   id: "t", title: "x", body: "", status: "todo", assigneeBotId: null, createdByBotId: null, priority: 0, threadId: null,
@@ -31,5 +31,13 @@ describe("the board view", () => {
     expect(cardTone(task({ status: "review" }))).toBe("accent");
     expect(cardTone(task({ status: "review", gates: { results: [{ name: "test", status: "fail", seconds: 1, tail: "" }], scope: "Gates: test fail (1 s)." } }))).toBe("danger");
     expect(cardTone(task({ status: "todo" }))).toBe("none");
+  });
+  it("lets a card be dragged only onto columns the board would accept, the person's moves only", () => {
+    expect(dropTargets("todo")).toEqual(["ready"]);
+    expect(dropTargets("ready")).toEqual([]); // the dispatcher owns what happens next
+    expect(dropTargets("running")).toEqual([]);
+    expect(dropTargets("blocked")).toEqual(["ready"]);
+    expect(dropTargets("review")).toEqual(["done", "ready"]);
+    expect(dropTargets("done")).toEqual([]);
   });
 });

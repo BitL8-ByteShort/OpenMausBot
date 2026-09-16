@@ -416,6 +416,8 @@
   "board.new.submit": "File the task",
   "board.new.cancel": "Cancel",
   "board.refresh": "Refresh",
+  "board.close": "Back to chat",
+  "board.card.dragHint": "Drag onto a column to move it",
   "sidebar.nav.connectedApps": "Connected apps",
   "sidebar.appSettings": "App settings",
   "sidebar.tools": "Tools",

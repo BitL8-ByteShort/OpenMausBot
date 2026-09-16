@@ -3,7 +3,7 @@
 // and what came out. Every action goes through the board's existing routes;
 // this page never becomes a second scheduler.
 import { useCallback, useEffect, useState } from "react";
-import { ClipboardList, Loader2, Plus, RefreshCw } from "lucide-react";
+import { ClipboardList, Loader2, Plus, RefreshCw, X } from "lucide-react";
 import { api, useStore } from "@/state/store";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
@@ -11,6 +11,7 @@ import {
   BOARD_COLUMNS,
   BUDGET_PAUSED_REASON,
   cardTone,
+  dropTargets,
   groupByStatus,
   raiseStep,
   spendLabel,
@@ -28,9 +29,10 @@ const toneClass: Record<CardTone, string> = {
   danger: "border-danger/70",
 };
 
-export function TaskBoardPage() {
+export function TaskBoardPage({ onClose }: { onClose: () => void }) {
   const { state, dispatch } = useStore();
   const [tasks, setTasks] = useState<BoardTaskView[] | null>(null);
+  const [dragging, setDragging] = useState<BoardTaskView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [composing, setComposing] = useState(false);
@@ -80,6 +82,9 @@ export function TaskBoardPage() {
         <button type="button" onClick={() => setComposing(true)} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white hover:opacity-90">
           <Plus size={14} />{t("board.new.button")}
         </button>
+        <button type="button" onClick={onClose} title={t("board.close")} aria-label={t("board.close")} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink">
+          <X size={16} />
+        </button>
       </header>
       {error && <div className="mx-5 mt-3 rounded-lg bg-danger/10 px-3 py-2 text-[12px] text-danger">{t("board.error", { message: error })}</div>}
       {composing && (
@@ -95,11 +100,13 @@ export function TaskBoardPage() {
       ) : tasks.length === 0 ? (
         <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-ink-secondary">{t("board.empty")}</div>
       ) : (
-        <div className="flex min-h-0 flex-1 gap-3 overflow-x-auto px-5 py-4">
+        <div className="grid min-h-0 flex-1 grid-cols-2 gap-3 overflow-y-auto px-5 py-4 md:grid-cols-3 xl:grid-cols-6">
           {BOARD_COLUMNS.map((column) => (
             <BoardColumnView key={column} column={column} tasks={grouped[column]} botName={botName} busy={busy} patch={patch}
               openRun={(task) => { if (task.assigneeBotId && task.threadId) dispatch({ type: "switchTask", botId: task.assigneeBotId, threadId: task.threadId }); }}
-              bots={state.bots.map((bot) => ({ id: bot.id, name: bot.name }))} />
+              bots={state.bots.map((bot) => ({ id: bot.id, name: bot.name }))}
+              dragging={dragging} setDragging={setDragging}
+              onDrop={(task, status) => { setDragging(null); void patch(task, { status }); }} />
           ))}
         </div>
       )}
@@ -107,7 +114,7 @@ export function TaskBoardPage() {
   );
 }
 
-function BoardColumnView({ column, tasks, botName, busy, patch, openRun, bots }: {
+function BoardColumnView({ column, tasks, botName, busy, patch, openRun, bots, dragging, setDragging, onDrop }: {
   column: BoardColumn;
   tasks: BoardTaskView[];
   botName: (id: string | null) => string | null;
@@ -115,26 +122,44 @@ function BoardColumnView({ column, tasks, botName, busy, patch, openRun, bots }:
   patch: (task: BoardTaskView, body: Record<string, unknown>) => Promise<void>;
   openRun: (task: BoardTaskView) => void;
   bots: Array<{ id: string; name: string }>;
+  dragging: BoardTaskView | null;
+  setDragging: (task: BoardTaskView | null) => void;
+  onDrop: (task: BoardTaskView, status: BoardColumn) => void;
 }) {
+  const accepts = dragging !== null && dropTargets(dragging.status).includes(column);
+  const [over, setOver] = useState(false);
   return (
-    <section className="flex w-64 shrink-0 flex-col rounded-xl bg-raised/40" aria-label={t(`board.column.${column}`)}>
+    <section
+      className={cn("flex min-h-40 flex-col rounded-xl bg-raised/40 transition-shadow", accepts && "ring-1 ring-accent/60", accepts && over && "bg-accent/10", dragging && !accepts && dragging.status !== column && "opacity-50")}
+      aria-label={t(`board.column.${column}`)}
+      onDragOver={(event) => { if (accepts) { event.preventDefault(); setOver(true); } }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(event) => { setOver(false); if (accepts && dragging) { event.preventDefault(); onDrop(dragging, column); } }}
+    >
       <h2 className="flex items-center justify-between px-3 pt-3 pb-2 text-[12px] font-semibold uppercase tracking-wide text-ink-secondary">
         {t(`board.column.${column}`)}<span className="rounded-full bg-raised px-2 py-0.5 text-[11px] font-normal">{tasks.length}</span>
       </h2>
-      <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-2 pb-2">
-        {tasks.map((task) => <BoardCard key={task.id} task={task} botName={botName} busy={busy === task.id} patch={patch} openRun={openRun} bots={bots} />)}
+      <div className="flex min-h-0 flex-1 flex-col gap-2 px-2 pb-2">
+        {tasks.map((task) => (
+          <BoardCard key={task.id} task={task} botName={botName} busy={busy === task.id} patch={patch} openRun={openRun} bots={bots}
+            draggable={dropTargets(task.status).length > 0}
+            onDragStart={() => setDragging(task)} onDragEnd={() => setDragging(null)} />
+        ))}
       </div>
     </section>
   );
 }
 
-function BoardCard({ task, botName, busy, patch, openRun, bots }: {
+function BoardCard({ task, botName, busy, patch, openRun, bots, draggable, onDragStart, onDragEnd }: {
   task: BoardTaskView;
   botName: (id: string | null) => string | null;
   busy: boolean;
   patch: (task: BoardTaskView, body: Record<string, unknown>) => Promise<void>;
   openRun: (task: BoardTaskView) => void;
   bots: Array<{ id: string; name: string }>;
+  draggable: boolean;
+  onDragStart: () => void;
+  onDragEnd: () => void;
 }) {
   const [assigning, setAssigning] = useState(false);
   const assignee = botName(task.assigneeBotId);
@@ -142,7 +167,12 @@ function BoardCard({ task, botName, busy, patch, openRun, bots }: {
   const paused = task.status === "blocked" && task.blockedReason === BUDGET_PAUSED_REASON;
   const gateFailed = task.gates?.results.some((r) => r.status !== "pass") ?? false;
   return (
-    <article className={cn("rounded-lg border bg-canvas p-3 text-[12.5px] shadow-sm", toneClass[cardTone(task)], busy && "opacity-60")}>
+    <article
+      draggable={draggable}
+      onDragStart={(event) => { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", task.id); onDragStart(); }}
+      onDragEnd={onDragEnd}
+      title={draggable ? t("board.card.dragHint") : undefined}
+      className={cn("rounded-lg border bg-canvas p-3 text-[12.5px] shadow-sm", toneClass[cardTone(task)], busy && "opacity-60", draggable && "cursor-grab active:cursor-grabbing")}>
       <div className="font-medium text-ink">{task.title}</div>
       <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[11.5px] text-ink-secondary">
         <span>{assignee ?? t("board.card.unassigned")}</span>

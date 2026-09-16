@@ -265,7 +265,7 @@ function Shell() {
       {state.activeView === "team-map" ? (
         <TeamMapPage />
       ) : state.activeView === "board" ? (
-        <TaskBoardPage />
+        <TaskBoardPage onClose={() => dispatch({ type: "select", id: state.selectedId })} />
       ) : state.activeView === "routines" ? (
         <RoutinesPage onBack={closeCalendar} onOpenRoom={openCalendarRoom} />
       ) : !remoteClient && localVmWorkspaceBotId ? (

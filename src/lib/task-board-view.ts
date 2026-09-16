@@ -75,3 +75,15 @@ export function cardTone(task: Pick<BoardTaskView, "status" | "hold" | "gates" |
   if (task.status === "review") return "accent";
   return "none";
 }
+
+/** Where a person may drag a card: the board's legal moves a person makes
+ * by hand. The dispatcher owns running, the cap owns blocked, archive is a
+ * button, and a ready task has nowhere to go but into the dispatcher. */
+export function dropTargets(from: BoardStatus): BoardColumn[] {
+  switch (from) {
+    case "todo": return ["ready"];
+    case "blocked": return ["ready"];
+    case "review": return ["done", "ready"];
+    default: return [];
+  }
+}
