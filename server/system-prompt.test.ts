@@ -78,6 +78,13 @@ describe("buildSystemPrompt", () => {
 });
 
 describe("computerPrompt", () => {
+  it("tells an iPad bot to read the screen and never enter secrets", () => {
+    const prompt = computerPrompt("ipad");
+    expect(prompt).toContain("through the ipad tools");
+    expect(prompt).toContain("Never enter passwords");
+    expect(prompt).toContain(SIGN_IN_PROMPT);
+  });
+
   it("distinguishes background window control from foreground desktop input", () => {
     const prompt = computerPrompt("local");
     expect(prompt).toContain("background delivery");

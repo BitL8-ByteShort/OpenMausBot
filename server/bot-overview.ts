@@ -206,6 +206,8 @@ function computerReach(computer: BotRecord["computer"]): string | null {
       return "Computer preference: this computer.";
     case "browser":
       return "Computer preference: browser only.";
+    case "ipad":
+      return "Computer preference: the iPad.";
     case "off":
       return null;
     default:

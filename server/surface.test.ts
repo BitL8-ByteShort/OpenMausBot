@@ -188,3 +188,18 @@ describe("surface parsing", () => {
     expect(surfaceOfComputerKind(null)).toBeNull();
   });
 });
+
+describe("ipad surface", () => {
+  it("parses, resolves and labels the iPad like a local place", () => {
+    expect(parseSurface("ipad")).toBe("ipad");
+    const plan = resolveSurface({ destination: "ipad", browserOn: true });
+    expect(plan).toMatchObject({ computer: "ipad", browser: false, pinned: null });
+    expect(resolveSurface({ destination: undefined, pinnedSurface: "ipad", browserOn: true })).toMatchObject({ computer: "ipad", pinned: "ipad" });
+    expect(surfaceOfComputerKind("ipad")).toBe("ipad");
+    expect(surfacePrompt({ computer: "ipad", browser: false })).toContain("the iPad");
+  });
+  it("attributes ipad tools to the mounted computer", () => {
+    expect(surfaceForTool("mcp__ipad__tap", { computer: "ipad", browser: false })).toBe("ipad");
+    expect(surfaceForTool("mcp__ipad__tap", { computer: "ipad", browser: true })).toBe("ipad");
+  });
+});

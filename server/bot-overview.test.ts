@@ -238,6 +238,13 @@ describe("buildBotOverview", () => {
     expect(overview.wont).not.toContain("Can't use a computer.");
     expect(overview.wont).not.toContain("Won't contact other bots without asking.");
   });
+
+  it("names the iPad preference", () => {
+    const facts = baseFacts({ bot: { ...baseFacts().bot, computer: "ipad" } });
+    const overview = buildBotOverview(facts);
+    expect(overview.reaches).toContain("Computer preference: the iPad.");
+    expect(overview.wont).not.toContain("Can't use a computer.");
+  });
 });
 
 describe("soulLead", () => {

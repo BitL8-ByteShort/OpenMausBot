@@ -19,6 +19,8 @@ export const SCREEN_TOUCHING_TOOLS: ReadonlySet<string> = new Set([
   "agent_browser_select", "agent_browser_check", "agent_browser_screenshot",
   // Cua Driver (local Mac, Local VM, VPS)
   "double_click", "right_click", "drag", "hotkey", "move_cursor", "launch_app", "bring_to_front", "zoom",
+  // iPad (WebDriverAgent)
+  "tap", "tap_text", "swipe", "open_app", "press",
 ]);
 
 // Keep legacy MCP namespaces accepted; desktop server__tool names follow
@@ -39,7 +41,7 @@ export function screenTouchingTool(toolName: string): boolean {
  * server identity is checked before prefixes are stripped. */
 export function screenSurfaceForTool(toolName: string): "browser" | "computer" {
   const name = toolName.toLowerCase();
-  if (name.startsWith("mcp__computer__") || name.startsWith("computer_")) return "computer";
+  if (name.startsWith("mcp__computer__") || name.startsWith("computer_") || name.startsWith("mcp__ipad__")) return "computer";
   if (name.startsWith("mcp__browser__") || name.startsWith("browser__")) return "browser";
   const bare = name.replace(TOOL_NAMESPACE, "");
   if (bare === "browser_click" || bare === "browser_fill") return "computer";
@@ -52,7 +54,7 @@ export function screenSurfaceForTool(toolName: string): "browser" | "computer" {
 export function toolSurfaceKind(toolName: string): "browser" | "computer" | null {
   const name = toolName.toLowerCase();
   if (name.startsWith("mcp__browser__") || name.startsWith("browser__")) return "browser";
-  if (name.startsWith("mcp__computer__") || name.startsWith("computer__") || name.startsWith("computer_")) return "computer";
+  if (name.startsWith("mcp__computer__") || name.startsWith("computer__") || name.startsWith("computer_") || name.startsWith("mcp__ipad__")) return "computer";
   const bare = name.replace(TOOL_NAMESPACE, "");
   if (bare === "browser_click" || bare === "browser_fill") return "computer";
   if (bare.startsWith("agent_browser_") || bare.startsWith("browser_")) return "browser";

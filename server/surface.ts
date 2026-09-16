@@ -8,14 +8,14 @@
 
 /** A place a bot can act. `cloud` covers both the Box and VPS backends —
  * from the person's seat they are the same "cloud computer" panel. */
-export type Surface = "cloud" | "vm" | "local" | "browser";
+export type Surface = "cloud" | "vm" | "local" | "browser" | "ipad";
 
 /** The bot's "Works on" setting; undefined = Auto. */
 export type Destination = Surface | "off" | undefined;
 
 /** What the computer block of a dispatch aims for. Mirrors the old `wants`
  * local exactly, so its strict/auto branches keep their meaning. */
-export type ComputerWant = "cloud" | "vm" | "local" | "off" | undefined;
+export type ComputerWant = "cloud" | "vm" | "local" | "ipad" | "off" | undefined;
 
 /** What a turn actually mounted, in surface terms. */
 export interface MountedSurfaces {
@@ -34,7 +34,7 @@ export interface SurfacePlan {
   note: string;
 }
 
-const SURFACES: ReadonlySet<string> = new Set(["cloud", "vm", "local", "browser"]);
+const SURFACES: ReadonlySet<string> = new Set(["cloud", "vm", "local", "browser", "ipad"]);
 
 /** Parse a surface arriving over the wire; anything else is "not said". */
 export function parseSurface(value: unknown): Surface | undefined {
@@ -44,7 +44,7 @@ export function parseSurface(value: unknown): Surface | undefined {
 }
 
 /** The per-turn computer kinds the dispatch tracks, folded to a surface. */
-export function surfaceOfComputerKind(kind: "box" | "vps" | "vm" | "local" | null): Surface | null {
+export function surfaceOfComputerKind(kind: "box" | "vps" | "vm" | "local" | "ipad" | null): Surface | null {
   if (kind === "box" || kind === "vps") return "cloud";
   return kind;
 }
@@ -115,6 +115,8 @@ export function surfaceLabel(surface: Surface): string {
       return "this computer";
     case "browser":
       return "the built-in browser";
+    case "ipad":
+      return "the iPad";
   }
 }
 
@@ -170,6 +172,7 @@ const SCREEN_TOOL = /^(?:screenshot|click|type_text|press_key|scroll|open_url|wa
  * surface was mounted, because both servers expose `browser_snapshot`. */
 export function surfaceForTool(toolName: string, mounted: MountedSurfaces): Surface | null {
   if (toolName.startsWith("mcp__browser__")) return mounted.browser ? "browser" : null;
+  if (toolName.startsWith("mcp__ipad__")) return mounted.computer === "ipad" ? "ipad" : null;
   if (toolName.startsWith("mcp__computer__")) return mounted.computer;
   if (!SCREEN_TOOL.test(toolName)) return null;
   if (mounted.computer && !mounted.browser) return mounted.computer;
