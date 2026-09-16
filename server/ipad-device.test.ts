@@ -94,7 +94,8 @@ describe("createIpadDevice", () => {
     expect(spawn).toHaveBeenCalledWith(process.execPath, [import.meta.filename], expect.objectContaining({ cwd: expect.any(String) }));
     expect(device.start()).toEqual({ ok: false, status: 409, error: "WebDriverAgent launcher is already running" });
     children[0].stdout.emit("data", Buffer.from("iPad: iPad (3)\nBuilding...\n"));
-    expect(await device.status()).toMatchObject({ running: true, log: ["iPad: iPad (3)", "Building..."] });
+    children[0].stderr.emit("data", Buffer.from("Error connecting to device: Connection refused\nError connecting to device: Connection refused\n"));
+    expect(await device.status()).toMatchObject({ running: true, log: ["iPad: iPad (3)", "Building...", "Error connecting to device: Connection refused"] });
     device.stop();
     expect(children[0].killed).toBe("SIGINT");
     expect((await device.status()).running).toBe(false);

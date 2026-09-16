@@ -55,9 +55,13 @@ export function createIpadDevice(options: {
 
   const startable = () => existsSync(launcherPath);
   const pushLog = (chunk: Buffer) => {
-    for (const line of chunk.toString("utf8").split("\n")) {
+    for (const raw of chunk.toString("utf8").split("\n")) {
+      const line = raw.trimEnd();
       if (!line.trim()) continue;
-      log.push(line.trimEnd());
+      // iproxy prints "Connection refused" once a second until the runner
+      // answers; a repeat adds nothing and would push the useful lines out.
+      if (log.at(-1) === line) continue;
+      log.push(line);
       if (log.length > LOG_LINES) log = log.slice(-LOG_LINES);
     }
   };
