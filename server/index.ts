@@ -368,6 +368,7 @@ import { listenWebhookIngress, webhookCredential, type WebhookIngress } from "./
 import { assertModelVariantSupported, memberTurnSelection } from "./member-turn.ts";
 import { WebhookManager } from "./webhooks.ts";
 import { SPAWNED_PROXIES } from "./proxy-paths.ts";
+import { createIpadDevice } from "./ipad-device.ts";
 import { loadBundledSkills, loadUserSkills, mergeSkills, renderSkillInstructions, selectBundledSkills } from "./skill-library.ts";
 import { installedPlaybookInstructions } from "./installed-playbooks.ts";
 import { createBotPackageExport, type ExportablePackageSkill } from "./package-export.ts";
@@ -848,6 +849,9 @@ const phoneSecretEnvelopeSchema = z.object({
 const agentsProxyPath = SPAWNED_PROXIES.agents;
 const phoneProxyPath = SPAWNED_PROXIES.phone;
 const ipadProxyPath = SPAWNED_PROXIES.ipad;
+// The harness's own iPad view (status, mirror frames, launcher) for the
+// Computer panel; session-less, so it never disturbs a turn's proxy.
+const ipadDevice = createIpadDevice();
 // in the packaged app process.execPath is Electron — run the proxy as node
 const AGENTS_NODE_FLAG = { ELECTRON_RUN_AS_NODE: "1" };
 
@@ -5622,10 +5626,6 @@ async function startTurn(
         if (!claimTurnResource(resourceOwner, "computer:phone")) throw new Error("another thread is using the phone — wait for it to finish");
         integrations.phone = phoneIntegration();
       }
-      if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("ipadMcp"))) {
-        if (!claimTurnResource(resourceOwner, "computer:ipad")) throw new Error("another thread is using the iPad — wait for it to finish");
-        integrations.ipad = ipadIntegration();
-      }
       // the user's connected apps, but only to a driver that can mount
       // them — a key in the config says the connections exist, not that
       // this engine can reach them — and only to a bot the user has not
@@ -5707,7 +5707,7 @@ async function startTurn(
       const wants = plan.computer;
       let previewCapture: (() => Promise<{ png: string; format: string }>) | null = null;
       let browserCapture: (() => Promise<{ png: string; format: string }>) | null = null;
-      let computerKind: "box" | "vps" | "vm" | "local" | null = null;
+      let computerKind: "box" | "vps" | "vm" | "local" | "ipad" | null = null;
       let autoVpsProblem: string | null = null;
 
       // Explicit destinations are strict. In particular, Local VM must never
@@ -5793,6 +5793,25 @@ async function startTurn(
         bindTurnComputer(resourceOwner, "computer:host");
         integrations.localComputer = gatedLocalComputer(cua, controlIntegration(bot.id, threadId, dispatchClaimId));
         computerKind = "local";
+      } else if (wants === "ipad") {
+        // The iPad is a plain local surface: the proxy talks to WebDriverAgent
+        // over USB on loopback, and the harness's session-less device view
+        // pictures it for the panel and the transcript.
+        if (!claimTurnResource(resourceOwner, "computer:ipad")) throw new Error("another thread is using the iPad — wait for it to finish");
+        integrations.ipad = ipadIntegration();
+        computerKind = "ipad";
+        previewCapture = () => ipadDevice.previewCapture();
+      }
+      // A bot on Auto (or any other place) still gets the iPad tools when
+      // the message names the iPad. When nothing else was mounted, the turn
+      // counts as an iPad turn, so an Auto conversation pins itself there.
+      if (selectedSkills.some((skill) => skill.manifest.requiredCapabilities.includes("ipadMcp")) && !integrations.ipad) {
+        if (!claimTurnResource(resourceOwner, "computer:ipad")) throw new Error("another thread is using the iPad — wait for it to finish");
+        integrations.ipad = ipadIntegration();
+        if (computerKind === null) {
+          computerKind = "ipad";
+          previewCapture = () => ipadDevice.previewCapture();
+        }
       }
 
       // A VPS is a local-agent computer mount, never a remote agent runner.
@@ -6076,7 +6095,9 @@ async function startTurn(
               ? "vps"
               : computerKind === "local"
                 ? "local"
-                : null;
+                : computerKind === "ipad"
+                  ? "ipad"
+                  : null;
       const coordinationNode = opts?.coordination ? roomHandoffs.nodes.get(opts.coordination.id) : undefined;
       if (opts?.coordination && (!coordinationNode || coordinationNode.status !== "running" || roomHandoffProblem(coordinationNode,
         coordinationNode.parentId ? roomHandoffs.nodes.get(coordinationNode.parentId) : undefined))) {
@@ -7596,7 +7617,7 @@ async function runGroupMemberTurn(
   // Channels currently mount a team Box or a Local VM. Do not let an
   // explicitly selected, unsupported destination become a tool-free turn
   // that can claim to have acted on that screen.
-  if (!roomTeamComputer && (roomPlan.computer === "cloud" || roomPlan.computer === "local")) {
+  if (!roomTeamComputer && (roomPlan.computer === "cloud" || roomPlan.computer === "local" || roomPlan.computer === "ipad")) {
     throw new Error("This computer destination is not available in channels yet — open a bot thread to work on it, or use a Local VM, team computer, or Browser here");
   }
   // One place per room turn as well: a team computer reached on Auto means
@@ -13741,7 +13762,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           patch.computer = undefined;
         } else if (
           typeof body.computer === "string" &&
-          ["cloud", "vm", "local", "browser", "off"].includes(body.computer)
+          ["cloud", "vm", "local", "browser", "ipad", "off"].includes(body.computer)
         ) {
           requestedComputer = body.computer;
           patch.computer = body.computer;
@@ -15972,6 +15993,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
 
     // ── app config (API keys — never echoed back, booleans only) ──
+    if (path.startsWith("/api/ipad/")) {
+      if (await ipadDevice.handleRoute(method, path, res)) return;
+    }
     if (method === "GET" && path === "/api/config") {
       return json(res, 200, configForAccess(configStatus(), auth.scopes.includes("admin")));
     }
