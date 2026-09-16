@@ -142,6 +142,12 @@ export function createIpadDevice(options: {
       return true;
     }
     if (method === "POST" && path === "/api/ipad/start") {
+      // A second runner fights the live one for port 8100 and restarts the
+      // XCTest session under a working bot; only start when nothing answers.
+      if ((await status()).reachable) {
+        json(res, 409, { error: "WebDriverAgent is already running on the iPad" });
+        return true;
+      }
       const result = start();
       if (result.ok) json(res, 200, { ok: true });
       else json(res, result.status, { error: result.error });

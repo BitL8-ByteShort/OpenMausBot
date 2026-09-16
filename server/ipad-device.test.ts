@@ -106,7 +106,8 @@ describe("createIpadDevice", () => {
   });
 
   it("serves the four routes", async () => {
-    const wda = wdaFetch({ up: true });
+    const opts = { up: true };
+    const wda = wdaFetch(opts);
     const { spawn } = fakeSpawn();
     const device = createIpadDevice({ fetch: wda.fetch, spawn, launcherPath: import.meta.filename });
     let res = fakeRes();
@@ -118,6 +119,12 @@ describe("createIpadDevice", () => {
     expect(res.statusCode).toBe(200);
     expect(res.headers["content-type"]).toBe("image/png");
     expect(Buffer.isBuffer(res.body)).toBe(true);
+    // a live WebDriverAgent must not be restarted underneath a working bot
+    res = fakeRes();
+    await device.handleRoute("POST", "/api/ipad/start", res);
+    expect(res.statusCode).toBe(409);
+    expect(JSON.parse(String(res.body)).error).toContain("already running on the iPad");
+    opts.up = false;
     res = fakeRes();
     await device.handleRoute("POST", "/api/ipad/start", res);
     expect(res.statusCode).toBe(200);
