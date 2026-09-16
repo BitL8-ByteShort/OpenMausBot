@@ -223,9 +223,15 @@ app.whenReady().then(async () => {
           return !state.busy && state;
         });
         const text = settled.messages.slice(before).map((message) => message.text ?? "").join("\n");
-        assert.match(text, /list_bots:/);
-        assert.match(text, /session_search:/);
-        assert.equal((text.match(/list_bots:/g) ?? []).length, 2, "Repeated reads complete without another prompt");
+        // The fake writes each completed read as its own line. Count only
+        // lines that start that way: the session_search read in the middle
+        // returns the bot's own notes, and from the second turn on those
+        // notes quote the first turn's "list_bots: …" line — as a message
+        // hit, and as the daily-log line the harness appends after every
+        // turn. Both come back mid-line, inside a one-line snippet.
+        assert.match(text, /^list_bots:/m);
+        assert.match(text, /^session_search:/m);
+        assert.equal((text.match(/^list_bots:/gm) ?? []).length, 2, "Repeated reads complete without another prompt");
       } else {
         const card = await until(async () => pendingCard((await api("/api/bots")).body.bots.find((candidate) => candidate.id === bot.id)));
         assert.equal((await api(`/api/bots/${bot.id}/respond`, "POST", { requestId: card.requestId, behavior: "deny" })).status, 200);
