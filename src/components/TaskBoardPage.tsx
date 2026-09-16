@@ -69,17 +69,20 @@ export function TaskBoardPage({ onClose }: { onClose: () => void }) {
   const grouped = groupByStatus(tasks ?? []);
 
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col bg-canvas">
-      <header className="flex items-center gap-3 border-b border-border px-5 py-3">
-        <ClipboardList size={18} className="text-accent" />
-        <div className="min-w-0 flex-1">
+    // min-w-0 + overflow-hidden: the page must never be wider than the
+    // window. Without them a nowrap line inside (a subtitle, a long title)
+    // sets the page's minimum width and the right edge is cut off.
+    <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-canvas">
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-4 py-3 sm:px-5">
+        <ClipboardList size={18} className="shrink-0 text-accent" />
+        <div className="min-w-0 flex-1 basis-40">
           <h1 className="text-[15px] font-semibold text-ink">{t("board.title")}</h1>
-          <p className="truncate text-[12px] text-ink-secondary">{t("board.subtitle")}</p>
+          <p className="hidden text-[12px] text-ink-secondary md:block">{t("board.subtitle")}</p>
         </div>
         <button type="button" onClick={() => void load()} title={t("board.refresh")} aria-label={t("board.refresh")} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink">
           <RefreshCw size={16} />
         </button>
-        <button type="button" onClick={() => setComposing(true)} className="flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white hover:opacity-90">
+        <button type="button" onClick={() => setComposing(true)} className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg bg-accent px-3 py-1.5 text-[13px] font-medium text-white hover:opacity-90">
           <Plus size={14} />{t("board.new.button")}
         </button>
         <button type="button" onClick={onClose} title={t("board.close")} aria-label={t("board.close")} className="rounded-lg p-2 text-ink-secondary hover:bg-raised hover:text-ink">
@@ -100,7 +103,9 @@ export function TaskBoardPage({ onClose }: { onClose: () => void }) {
       ) : tasks.length === 0 ? (
         <div className="flex flex-1 items-center justify-center px-6 text-center text-[13px] text-ink-secondary">{t("board.empty")}</div>
       ) : (
-        <div className="grid min-h-0 flex-1 grid-cols-2 gap-3 overflow-y-auto px-5 py-4 md:grid-cols-3 xl:grid-cols-6">
+        // Columns fit the page's own width, not the window's: as many as
+        // fit at 200px each, so a narrow window shows two and a wide one six.
+        <div className="grid min-h-0 min-w-0 flex-1 grid-cols-[repeat(auto-fill,minmax(200px,1fr))] content-start gap-3 overflow-y-auto px-4 py-4 sm:px-5">
           {BOARD_COLUMNS.map((column) => (
             <BoardColumnView key={column} column={column} tasks={grouped[column]} botName={botName} busy={busy} patch={patch}
               openRun={(task) => { if (task.assigneeBotId && task.threadId) dispatch({ type: "switchTask", botId: task.assigneeBotId, threadId: task.threadId }); }}
@@ -130,7 +135,7 @@ function BoardColumnView({ column, tasks, botName, busy, patch, openRun, bots, d
   const [over, setOver] = useState(false);
   return (
     <section
-      className={cn("flex min-h-40 flex-col rounded-xl bg-raised/40 transition-shadow", accepts && "ring-1 ring-accent/60", accepts && over && "bg-accent/10", dragging && !accepts && dragging.status !== column && "opacity-50")}
+      className={cn("flex min-h-40 min-w-0 flex-col rounded-xl bg-raised/40 transition-shadow", accepts && "ring-1 ring-accent/60", accepts && over && "bg-accent/10", dragging && !accepts && dragging.status !== column && "opacity-50")}
       aria-label={t(`board.column.${column}`)}
       onDragOver={(event) => { if (accepts) { event.preventDefault(); setOver(true); } }}
       onDragLeave={() => setOver(false)}
@@ -172,8 +177,8 @@ function BoardCard({ task, botName, busy, patch, openRun, bots, draggable, onDra
       onDragStart={(event) => { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", task.id); onDragStart(); }}
       onDragEnd={onDragEnd}
       title={draggable ? t("board.card.dragHint") : undefined}
-      className={cn("rounded-lg border bg-canvas p-3 text-[12.5px] shadow-sm", toneClass[cardTone(task)], busy && "opacity-60", draggable && "cursor-grab active:cursor-grabbing")}>
-      <div className="font-medium text-ink">{task.title}</div>
+      className={cn("min-w-0 rounded-lg border bg-canvas p-3 text-[12.5px] shadow-sm", toneClass[cardTone(task)], busy && "opacity-60", draggable && "cursor-grab active:cursor-grabbing")}>
+      <div className="break-words font-medium text-ink">{task.title}</div>
       <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5 text-[11.5px] text-ink-secondary">
         <span>{assignee ?? t("board.card.unassigned")}</span>
         {task.owner && <span>· {t("board.card.owner", { name: botName(task.owner) ?? task.owner })}</span>}
@@ -181,9 +186,9 @@ function BoardCard({ task, botName, busy, patch, openRun, bots, draggable, onDra
         {spend && <span>· {spend}</span>}
         {task.attempts > 1 && <span>· {t("board.card.attempts", { count: task.attempts })}</span>}
       </div>
-      {task.hold && <p className="mt-2 rounded bg-warning/10 px-2 py-1 text-[11.5px] text-ink">{t("board.card.waiting", { reason: task.hold })}</p>}
-      {task.status === "blocked" && task.blockedReason && <p className="mt-2 rounded bg-danger/10 px-2 py-1 text-[11.5px] text-ink">{t("board.card.paused", { reason: task.blockedReason })}</p>}
-      {task.gates && <p className={cn("mt-2 text-[11.5px]", gateFailed ? "text-danger" : "text-ink-secondary")}>{task.gates.scope}</p>}
+      {task.hold && <p className="mt-2 break-words rounded bg-warning/10 px-2 py-1 text-[11.5px] text-ink">{t("board.card.waiting", { reason: task.hold })}</p>}
+      {task.status === "blocked" && task.blockedReason && <p className="mt-2 break-words rounded bg-danger/10 px-2 py-1 text-[11.5px] text-ink">{t("board.card.paused", { reason: task.blockedReason })}</p>}
+      {task.gates && <p className={cn("mt-2 break-words text-[11.5px]", gateFailed ? "text-danger" : "text-ink-secondary")}>{task.gates.scope}</p>}
       {task.result && (
         <details className="mt-2 text-[11.5px] text-ink-secondary">
           <summary className="cursor-pointer select-none">{t("board.card.result")}</summary>
