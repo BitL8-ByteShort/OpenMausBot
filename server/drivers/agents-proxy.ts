@@ -33,7 +33,7 @@
 //   OMB_BOT_ID       the calling bot's id (excluded from list_bots; sender)
 //   OMB_COMMS_TOKEN  shared secret for the localhost-only internal endpoints
 //   OMB_TURN_DEPTH   this turn's comms depth (the harness refuses recursion)
-import { isIdempotent, teachingError, TOOL_CALL_TIMEOUT_MS, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_MAX_CHARS, TOOL_RETRY_DELAY_MS } from "./agents-proxy-reliability.ts";
+import { coreToolNames, isIdempotent, teachingError, TOOL_CALL_TIMEOUT_MS, TOOL_RESULT_HEAD_CHARS, TOOL_RESULT_MAX_CHARS, TOOL_RETRY_DELAY_MS } from "./agents-proxy-reliability.ts";
 import readline from "node:readline";
 import { readTurnToken } from "../turn-token-read.ts";
 
@@ -936,7 +936,7 @@ const MOUNTED_TOOLS = COORDINATING
 // through use_tool on every engine, so nothing depends on an engine
 // honouring tools/list_changed.
 const TOOLS_DEFERRED = process.env.OMB_TOOLS_DEFERRED === "1";
-const CORE_TOOL_NAMES = new Set(["list_bots", "session_search", "session_read", "memory_update", "tool_result_read", "post_to_room"]);
+const CORE_TOOL_NAMES = coreToolNames(BOARD_ENABLED);
 const META_TOOLS = [
   {
     name: "search_tools",
