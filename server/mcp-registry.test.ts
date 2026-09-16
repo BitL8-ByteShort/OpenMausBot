@@ -23,6 +23,7 @@ describe("custom MCP registry", () => {
   it("refuses unsafe and reserved routing names", () => {
     expect(mcpServerNameError("Bad.Name")).toMatch(/lowercase/);
     expect(mcpServerNameError("computer")).toMatch(/reserved/);
+    expect(mcpServerNameError("ipad")).toMatch(/reserved/);
     expect(mcpServerNameError("safe-notes")).toBeNull();
   });
 

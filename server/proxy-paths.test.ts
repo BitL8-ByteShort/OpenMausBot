@@ -13,6 +13,11 @@ describe("local computer proxy runtime path", () => {
     expect(existsSync(SPAWNED_PROXIES.localComputer)).toBe(true);
   });
 
+  it("resolves the iPad proxy next to the phone proxy", () => {
+    expect(SPAWNED_PROXIES.ipad).toBe(join(SERVER_ROOT, "drivers", "ipad-proxy.ts"));
+    expect(existsSync(SPAWNED_PROXIES.ipad)).toBe(true);
+  });
+
   it("is included in the server bundle entry points", () => {
     const script = readFileSync(join(SERVER_ROOT, "../scripts/bundle-server.mjs"), "utf8");
     const entryPoints = script.match(/const ENTRY_POINTS = \[([\s\S]*?)\];/)?.[1];

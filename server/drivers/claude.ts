@@ -1191,6 +1191,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         mcpServers.phone = { ...turn.integrations.phone };
         allowed.push("mcp__phone");
       }
+      if (turn.integrations?.ipad) {
+        mcpServers.ipad = { ...turn.integrations.ipad };
+        allowed.push("mcp__ipad");
+      }
       if (turn.integrations?.browser) {
         mcpServers.browser = { ...turn.integrations.browser };
         allowed.push("mcp__browser");
@@ -1988,6 +1992,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           computerMcp: true,
           composioMcp: true,
           phoneMcp: true,
+          ipadMcp: true,
           browserMcp: true,
           images: true,
           nativeImageInput: true,

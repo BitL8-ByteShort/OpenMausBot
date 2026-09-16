@@ -89,6 +89,8 @@ const RESERVED_MCP_NAMES = new Set([
   "composio",
   "browser",
   "phone",
+  "ipad",
+  "openmausbot_ipad",
   "dweb",
   "openmausbot_connectors",
   "openmausbot_phone",

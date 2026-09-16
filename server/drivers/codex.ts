@@ -686,6 +686,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             "-c", `${prefix}.default_tools_approval_mode="auto"`,
           );
         }
+        if (turn.integrations?.ipad) {
+          const bridge = turn.integrations.ipad;
+          Object.assign(env, bridge.env);
+          const prefix = "mcp_servers.openmausbot_ipad";
+          appServerArgs.push(
+            "-c", `${prefix}.command=${JSON.stringify(bridge.command)}`,
+            "-c", `${prefix}.args=${JSON.stringify(bridge.args)}`,
+            "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(bridge.env))}`,
+            "-c", `${prefix}.default_tools_approval_mode="auto"`,
+          );
+        }
 
         const child = spawnCli(config.cli, appServerArgs, {
           cwd: turn.cwd ?? homedir(),
@@ -1509,6 +1520,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         agentsMcp: true,
       customMcp: true,
         phoneMcp: true,
+        ipadMcp: true,
         browserMcp: true,
         images: true,
         nativeImageInput: true,
