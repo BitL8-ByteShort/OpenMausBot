@@ -27,13 +27,18 @@ under `.omb-scratch/wda-derived` (`pnpm ipad:wda -- --rebuild` forces a new
 build). Leave the command running: it keeps the runner alive on the iPad and
 forwards port 8100 to loopback. Stop it with Ctrl-C.
 
-Then, in OpenMausBot, ask a bot something like "On the iPad, open Notes and
-write today's date". Mentioning the iPad selects the `ipad-harness` skill,
-which mounts the tools for that turn. Selection is per message, exactly like
-the Android phone tools: a follow-up such as "go ahead" without the word iPad
-gets no iPad tools and the bot will say the connection is gone, so keep
-"iPad" in every message that should touch the device. Only one thread can
-drive the iPad at a time.
+Then, in OpenMausBot, either set the bot's **Works on** to **iPad** in the
+Computer panel (the iPad tile is enabled while WebDriverAgent answers or can
+be started from this checkout) or leave it on Auto and mention the iPad in
+your message. An iPad bot has the tools on every turn and the panel's iPad
+tab mirrors the screen. An Auto conversation that started with "on the iPad"
+stays on the iPad for its follow-ups; an Auto conversation that never named
+the iPad gets no iPad tools. Only one thread can drive the iPad at a time.
+
+The iPad tab also has a **Start WebDriverAgent** button when the app runs
+from a source checkout; the packaged app shows the manual instruction. The
+phone apps show an iPad bot like any other; changing the destination stays
+on the desktop.
 
 ## Tools
 
