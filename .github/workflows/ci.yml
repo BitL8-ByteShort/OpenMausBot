@@ -148,7 +148,9 @@ jobs:
       - name: Verify app permissions and guarded display capture
         run: node scripts/smoke-app-permissions.mjs
       - name: Verify paired phone authorization against packaged harness
-        run: pnpm build:companion && pnpm exec electron scripts/smoke-phone-relay-auth.cjs
+        # Forks dist-server/index.js: the bundle the packaged-server job
+        # builds in ITS checkout. This job builds its own copy.
+        run: pnpm build:server && pnpm build:companion && pnpm exec electron scripts/smoke-phone-relay-auth.cjs
 
   gate:
     # The branch ruleset requires exactly these three check names — they were
