@@ -36,6 +36,78 @@ final class ThreadNavigationTests: XCTestCase {
         XCTAssertNil(groups.last?.project)
     }
 
+    func testAttentionFloatsAboveIdleThreadsAndIdleThreadsKeepStoredOrder() {
+        var unread = task("unread")
+        unread.unread = true
+        var working = task("working")
+        working.busy = true
+        let bot = makeBot(tasks: [task("idle-a"), unread, task("idle-b"), working, task("idle-c")])
+
+        XCTAssertEqual(
+            bot.threadGroups().flatMap(\.tasks).map(\.threadId),
+            ["working", "unread", "idle-a", "idle-b", "idle-c"]
+        )
+    }
+
+    func testAttentionRanksWaitingOnYouAboveWorkingAndQueuedAboveUnread() {
+        var unread = task("unread")
+        unread.unread = true
+        var queued = task("queued")
+        queued.activity = "queued"
+        var working = task("working")
+        working.activity = "working"
+        working.busy = false
+        var waiting = task("waiting")
+        waiting.activity = "waiting-on-you"
+        let bot = makeBot(tasks: [unread, queued, working, waiting])
+
+        XCTAssertEqual(
+            bot.threadGroups().flatMap(\.tasks).map(\.threadId),
+            ["waiting", "working", "queued", "unread"]
+        )
+    }
+
+    func testTheThreadOpenHereRidesAboveIdleButBelowAttentionTiers() {
+        var waiting = task("waiting")
+        waiting.activity = "waiting-on-you"
+        let bot = makeBot(tasks: [task("idle"), task("current"), waiting])
+
+        XCTAssertEqual(
+            bot.threadGroups().flatMap(\.tasks).map(\.threadId),
+            ["waiting", "current", "idle"]
+        )
+    }
+
+    func testAttentionOrderingIsStableWithinATier() {
+        var unreadB = task("unread-b")
+        unreadB.unread = true
+        var unreadA = task("unread-a")
+        unreadA.unread = true
+        let bot = makeBot(tasks: [unreadB, unreadA])
+
+        XCTAssertEqual(bot.threadGroups().flatMap(\.tasks).map(\.threadId), ["unread-b", "unread-a"])
+    }
+
+    func testEqualAttentionRanksKeepStoredOrderAndSearchKeepsRelevanceOrder() {
+        var busy = task("busy")
+        busy.busy = true
+        var bot = makeBot(tasks: [
+            task("idle-b"), busy, task("idle-a"),
+            task("current"), task("in-folder", project: "plans"),
+        ])
+        bot.projects = [project("plans")]
+
+        XCTAssertEqual(
+            bot.threadGroups().first { $0.id == "unfiled" }?.tasks.map(\.threadId),
+            ["busy", "current", "idle-b", "idle-a"]
+        )
+        XCTAssertEqual(bot.threadGroups(matching: "idle").map(\.id), ["unfiled"])
+        XCTAssertEqual(
+            bot.threadGroups(matching: "idle").flatMap(\.tasks).map(\.threadId),
+            ["idle-b", "idle-a"]
+        )
+    }
+
     func testOrphansStayUnfiledAndEmptyOrDuplicateFoldersDoNotDuplicateRows() {
         var bot = makeBot(tasks: [task("orphan", project: "deleted"), task("filed", project: "a"), task("loose")])
         bot.projects = [project("empty"), project("a"), project("a")]
@@ -63,6 +135,7 @@ final class ThreadNavigationTests: XCTestCase {
         var bot = makeBot()
         bot.busy = true
         bot.unread = true
+        bot.waitingOnTeammate = true
         bot.approvalMode = "custom"
         bot.autoApprove = false
         bot.alwaysAllow = ["Bash:git"]
@@ -73,6 +146,8 @@ final class ThreadNavigationTests: XCTestCase {
         XCTAssertEqual(fallback.createdAt, bot.createdAt)
         XCTAssertEqual(fallback.modelSelection, bot.modelSelection)
         XCTAssertEqual(fallback.busy, true)
+        XCTAssertEqual(fallback.waitingOnTeammate, true)
+        XCTAssertTrue(fallback.isWaitingOnTeammate, "a legacy bot's wait must reach the thread row")
         XCTAssertEqual(fallback.unread, true)
         XCTAssertEqual(fallback.approvalMode, "custom")
         XCTAssertEqual(fallback.autoApprove, false)
@@ -147,6 +222,72 @@ final class ThreadNavigationTests: XCTestCase {
         closedCurrent.closedBy = closer
         bot.tasks = [closedCurrent, task("plan")]
         XCTAssertEqual(bot.threadGroups().flatMap(\.tasks).map(\.threadId), ["current", "plan"])
+    }
+
+    func testArchivedThreadsDecodeByPresenceIncludingZeroStamp() throws {
+        let decoded = try JSONDecoder().decode(Bot.self, from: Data("""
+        {"id":"bot","threadId":"current","name":"Scout","title":"Researcher",
+         "description":"","notifications":true,"color":"green","unread":false,
+         "modelSelection":{"instanceId":"engine","model":"default"},"createdAt":1,
+         "tasks":[
+           {"threadId":"put-away","title":"Put away","createdAt":1,"archivedAt":5},
+           {"threadId":"zero","title":"Zero stamp","createdAt":1,"archivedAt":0},
+           {"threadId":"live","title":"Live","createdAt":1},
+           {"threadId":"cleared","title":"Cleared","createdAt":1,"archivedAt":null}
+         ]}
+        """.utf8))
+        let tasks = try XCTUnwrap(decoded.tasks)
+        XCTAssertEqual(tasks.map(\.isArchived), [true, true, false, false], "Zero is a valid timestamp at the API boundary.")
+        XCTAssertEqual(tasks[0].archivedAt, 5)
+        XCTAssertEqual(tasks[1].archivedAt, 0)
+    }
+
+    func testArchivedBylineYieldsToCloserAndBeatsOpener() {
+        var putAway = task("put-away")
+        putAway.archivedAt = 5
+        XCTAssertEqual(putAway.bylineLabel, "Archived")
+
+        var opened = putAway
+        opened.openedBy = ThreadOpener(botId: "scout", name: "Scout", at: 1)
+        XCTAssertEqual(opened.bylineLabel, "Archived")
+
+        var closed = opened
+        closed.closedBy = ThreadCloser(botId: "pm", name: "Parker", at: 2)
+        XCTAssertEqual(closed.bylineLabel, "closed by Parker")
+    }
+
+    func testArchivedThreadsFoldOutOfTheTreeButResurfaceOnAttention() {
+        var putAway = task("put-away", title: "Put away")
+        putAway.archivedAt = 5
+        var zero = task("zero", title: "Zero stamp")
+        zero.archivedAt = 0
+        var waiting = task("waiting", title: "Waiting")
+        waiting.archivedAt = 5
+        waiting.activity = "waiting-on-you"
+        var running = task("running", title: "Still running")
+        running.archivedAt = 5
+        running.activity = "running"
+        XCTAssertTrue(running.isWorking, "a running thread is work, exactly as its row labels it")
+        var held = task("held", title: "Plain waiting")
+        held.archivedAt = 5
+        held.activity = "waiting"
+        XCTAssertFalse(held.isWorking)
+        XCTAssertTrue(held.demandsAttention, "a plain waiting thread still needs the person")
+        var active = task("current")
+        active.archivedAt = 7
+        var bot = makeBot(tasks: [putAway, zero, waiting, running, held, active, task("plan")])
+
+        XCTAssertEqual(
+            bot.threadGroups().flatMap(\.tasks).map(\.threadId),
+            ["waiting", "current", "running", "held", "plan"]
+        )
+        XCTAssertEqual(bot.threadGroups(includingClosed: true).flatMap(\.tasks).count, 7)
+        XCTAssertEqual(bot.threadGroups(matching: "put away").flatMap(\.tasks).map(\.threadId), ["put-away"])
+
+        // Unarchiving clears the stamp; the thread returns to the default tree.
+        bot.tasks?[0].archivedAt = nil
+        XCTAssertFalse(bot.tasks?[0].isArchived ?? true)
+        XCTAssertEqual(bot.threadGroups().flatMap(\.tasks).count, 6)
     }
 
     func testSiblingNavigationProjectionsKeepTheirOwnThreadAndRuntime() throws {

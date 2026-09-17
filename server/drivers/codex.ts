@@ -13,37 +13,55 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 
 import { stripWorkspaceCredentialEnv } from "../config.ts";
-import { computerProxyEnv } from "../container-computer.ts";
 import { describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
-import { SPAWNED_PROXIES } from "../proxy-paths.ts";
 import { isHarnessOwnedMcpEnvName } from "../mcp-registry.ts";
 
 import type {
   DriverCreateInput,
+  McpServerSpec,
   ProviderDriver,
   ProviderInstance,
   ProviderSnapshot,
   RuntimeEvent,
   RuntimeEventListener,
   SendTurnInput,
+  SteerOutcome,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 import { codexLocalProviderArgs } from "./local-inject.ts";
 import { augmentedPath, splitCliString } from "../env-path.ts";
-import { classifyError, computeBackoff, RETRY_MAX_ATTEMPTS } from "./retry.ts";
+import { classifyError, computeBackoff, interruptibleDelay, RETRY_MAX_ATTEMPTS } from "./retry.ts";
 import { appendNative } from "./native.ts";
 import { commandSummary, toolDetailPreview } from "../tool-summary.ts";
 import { codexDeveloperInstructions, syncCodexInstructions } from "./codex-instructions.ts";
 import type { ApprovalMode } from "../../shared/approval-mode.ts";
 import { CodexDeviceAuthController } from "./codex-device-auth.ts";
 import { codexAccountEmail } from "./codex-identity.ts";
+import { classifyResumeFailure, mayReplay, recoveryPromptFor } from "../resume-recovery.ts";
 
 export { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
 
 const DRIVER_KIND = "codex";
 const ASTRA_MODEL_ID = "gpt-6-astra";
 const ASTRA_MIN_CODEX_VERSION = [0, 153, 1] as const;
+
+class CodexRpcError extends Error {
+  code: unknown;
+
+  constructor(error: { code?: unknown; message?: string }) {
+    super(error.message ?? JSON.stringify(error));
+    this.code = error.code;
+  }
+}
+
+function missingNativeCodexThread(error: unknown, cursor: string): boolean {
+  // Codex's local thread/resume rejection, verified with an empty native home.
+  // A generic 404, auth error, timeout or prose mentioning a missing thread is
+  // not evidence that the native history was lost. Unknown versions fail closed.
+  return error instanceof CodexRpcError && error.code === -32600 &&
+    error.message === `no rollout found for thread id ${cursor}`;
+}
 
 /** Whether an installed Codex predates the release that exposes GPT-6 Astra
  * through app-server. Unknown version formats stay quiet: a bad guess should
@@ -100,6 +118,8 @@ function codexAstraUpdate(
 export interface CodexConfig {
   cli: string;
   fullAuto: boolean;
+  /** Ephemeral Company routing, supplied by the trusted desktop parent. */
+  managed?: { url: string; models: string[] };
 }
 
 function decodeConfig(raw: unknown): CodexConfig {
@@ -107,14 +127,54 @@ function decodeConfig(raw: unknown): CodexConfig {
   return {
     cli: typeof o.cli === "string" ? o.cli : "codex",
     fullAuto: o.fullAuto === true,
+    ...(o.managed && typeof o.managed === "object" ? { managed: decodeManagedCodex(o.managed) } : {}),
   };
+}
+
+function decodeManagedCodex(raw: object): NonNullable<CodexConfig["managed"]> {
+  const value = raw as { url?: unknown; models?: unknown };
+  if (typeof value.url !== "string" || !Array.isArray(value.models) || !value.models.length || value.models.some(model => typeof model !== "string" || !/^[\w][\w./+-]*$/.test(model))) {
+    throw new Error("Invalid Company Codex configuration.");
+  }
+  const url = new URL(value.url);
+  // Plain HTTP leaks the Company API key; allow it only on loopback hosts,
+  // where a local proxy terminates TLS on the trusted machine instead.
+  const loopback = url.hostname === "localhost" || url.hostname === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(url.hostname);
+  if (url.username || url.password || url.search || url.hash || (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))) throw new Error("Invalid Company Codex endpoint.");
+  return { url: url.href.replace(/\/$/, ""), models: value.models as string[] };
+}
+
+export function managedCodexArgs(config: NonNullable<CodexConfig["managed"]>): string[] {
+  // Credential stays in the instance environment, never argv or config.toml.
+  // https://learn.chatgpt.com/docs/config-file/config-reference
+  return [
+    "-c", 'model_provider="openmaus_company"',
+    "-c", 'model_providers.openmaus_company.name="Company"',
+    "-c", `model_providers.openmaus_company.base_url=${JSON.stringify(config.url)}`,
+    "-c", 'model_providers.openmaus_company.env_key="OPENMAUSBOT_COMPANY_API_KEY"',
+    "-c", 'model_providers.openmaus_company.wire_api="responses"',
+    "-c", "model_providers.openmaus_company.requires_openai_auth=false",
+    "-c", 'cli_auth_credentials_store="ephemeral"',
+    "-c", "shell_environment_policy.ignore_default_excludes=false",
+  ];
 }
 
 const QUESTION_TIMEOUT_NOTE = "No answer was given — use your best judgment.";
 const DENY_TIMEOUT_NOTE =
   "OpenMausBot: nobody answered this permission request in time. Skip this action and finish what you can without it.";
 
-type StdioMcpServer = { command: string; args: string[]; env: Record<string, string> };
+const skippedSseServers = new Set<string>();
+function noteSkippedSseServer(name: string): void {
+  if (skippedSseServers.has(name)) return;
+  skippedSseServers.add(name);
+  console.error(`codex: MCP server ${JSON.stringify(name)} uses the SSE transport, which codex does not speak — it is available to Claude bots only`);
+}
+
+/** A TOML inline table for a `-c key=value` override; JSON string quoting
+ * is valid TOML basic-string quoting. */
+function tomlInlineTable(entries: Record<string, string>): string {
+  return `{ ${Object.entries(entries).map(([key, value]) => `${JSON.stringify(key)} = ${JSON.stringify(value)}`).join(", ")} }`;
+}
 
 interface CodexApprovalParams {
   thread: Record<string, unknown>;
@@ -430,18 +490,44 @@ function mountMcpServer(
   appServerArgs: string[],
   env: Record<string, string | undefined>,
   name: string,
-  server: StdioMcpServer,
+  server: McpServerSpec,
   preApproved = true,
 ): void {
-  Object.assign(env, server.env);
   const prefix = `mcp_servers.${name}`;
-  appServerArgs.push(
-    "-c", `${prefix}.command=${JSON.stringify(server.command)}`,
-    "-c", `${prefix}.args=${JSON.stringify(server.args)}`,
-    // Values stay in the child environment; argv contains names only so
-    // credentials never appear in process listings or diagnostics.
-    "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
-  );
+  if ("url" in server) {
+    // A remote server: codex connects itself. Header values are credentials
+    // (Authorization: Bearer …) and travel like env values — the child env
+    // holds them under harness-generated names, argv names only the variables.
+    // A bearer token goes through codex's own bearer setting, the path its
+    // remote servers are documented and exercised with; any other header
+    // rides env_http_headers.
+    appServerArgs.push("-c", `${prefix}.url=${JSON.stringify(server.url)}`);
+    const stem = `OMB_MCP_HEADER_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+    const variables: Record<string, string> = {};
+    Object.entries(server.headers).forEach(([header, value], index) => {
+      const bearer = header.toLowerCase() === "authorization" ? /^Bearer\s+(\S+)$/i.exec(value) : null;
+      if (bearer) {
+        env[`${stem}_BEARER`] = bearer[1];
+        appServerArgs.push("-c", `${prefix}.bearer_token_env_var=${JSON.stringify(`${stem}_BEARER`)}`);
+        return;
+      }
+      const variable = `${stem}_${index}`;
+      env[variable] = value;
+      variables[header] = variable;
+    });
+    if (Object.keys(variables).length) {
+      appServerArgs.push("-c", `${prefix}.env_http_headers=${tomlInlineTable(variables)}`);
+    }
+  } else {
+    Object.assign(env, server.env);
+    appServerArgs.push(
+      "-c", `${prefix}.command=${JSON.stringify(server.command)}`,
+      "-c", `${prefix}.args=${JSON.stringify(server.args)}`,
+      // Values stay in the child environment; argv contains names only so
+      // credentials never appear in process listings or diagnostics.
+      "-c", `${prefix}.env_vars=${JSON.stringify(Object.keys(server.env))}`,
+    );
+  }
   // Harness-owned servers are pre-quieted; a user-configured server keeps
   // codex's on-request policy so its tool calls become approval cards.
   if (preApproved) {
@@ -484,8 +570,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       return env;
     };
     const catalogEnv = childEnv();
-    let models = STATIC_CODEX_MODELS;
+    let models = config.managed ? { default: config.managed.models[0], options: config.managed.models.map(id => ({ id, label: id })) } : STATIC_CODEX_MODELS;
     const refreshModels = async () => {
+      if (config.managed) return;
       try {
         const resolved = await readCodexModelCatalog(catalogEnv, fetch, config.cli);
         if (resolved.options.length) models = resolved;
@@ -502,6 +589,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     const listeners = new Set<RuntimeEventListener>();
     interface Turn {
       stop: () => Promise<boolean>;
+      /** Fold new user input into the running native turn (turn/steer).
+       * "refused" when this attempt has nothing steerable; the caller
+       * queues. "indeterminate" when delivery happened but the answer did
+       * not come back — the caller must not re-queue those words. */
+      steer?: (text: string) => Promise<SteerOutcome>;
       turnId: string;
       asks: Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>;
     }
@@ -519,15 +611,37 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     });
 
     const sendTurn = async (turn: SendTurnInput) => {
+      if (config.managed) {
+        // One blanket refusal hides which prerequisite broke; name it so the
+        // person can fix the actual gap instead of reconnecting blind.
+        if (!turn.model) {
+          throw new Error("Company model access is unavailable: no model is selected. Reconnect your organization; personal billing will not be used.");
+        }
+        if (!config.managed.models.includes(turn.model)) {
+          throw new Error("Company model access is unavailable: " + turn.model + " is not approved for your organization. Reconnect your organization; personal billing will not be used.");
+        }
+        if (!input.environment.OPENMAUSBOT_COMPANY_API_KEY) {
+          throw new Error("Company model access is unavailable: OPENMAUSBOT_COMPANY_API_KEY is missing. Reconnect your organization; personal billing will not be used.");
+        }
+        if (!input.environment.CODEX_HOME) {
+          throw new Error("Company model access is unavailable: CODEX_HOME is missing. Reconnect your organization; personal billing will not be used.");
+        }
+      }
       // One driver instance serves many threads. Interrupt state belongs to
       // this turn so activity elsewhere cannot cancel or revive its retry.
       let stopRequested = false;
+      let promptSubmitted = false;
+      let recoveredMissingSession = false;
+      // Wakes a retry backoff the moment Stop arrives, so the turn settles
+      // now rather than after the full wait.
+      const stopSignal = new AbortController();
       const { threadId } = turn;
       // Direct adapter callers predating the per-bot selector retain the
       // instance's legacy fullAuto setting. Harness turns always send an
       // explicit mode, which takes precedence.
       const approvalMode: ApprovalMode = turn.approvalMode ?? (config.fullAuto ? "full" : "ask");
       for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+        if ("url" in server) continue;
         const reserved = Object.keys(server.env).find(isHarnessOwnedMcpEnvName);
         if (reserved) {
           throw new Error(`Custom MCP server “${name}” cannot set reserved environment variable “${reserved}”`);
@@ -542,29 +656,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
 
       const launchAttempt = async (attempt: number): Promise<void> => {
         const env = childEnv();
-        const appServerArgs = ["app-server", ...codexLocalProviderArgs(env, turn.model)];
+        const appServerArgs = ["app-server", ...(config.managed ? managedCodexArgs(config.managed) : codexLocalProviderArgs(env, turn.model))];
         if (turn.integrations?.composio) {
           mountMcpServer(appServerArgs, env, "openmausbot_connectors", turn.integrations.composio);
         }
         if (turn.integrations?.agents) {
           mountMcpServer(appServerArgs, env, "agents", turn.integrations.agents);
         }
-        if (turn.integrations?.computer) {
-          const proxyEnv = computerProxyEnv(turn.integrations.computer);
-          mountMcpServer(appServerArgs, env, "computer", {
-            command: process.execPath,
-            args: [SPAWNED_PROXIES.computer],
-            env: {
-              ELECTRON_RUN_AS_NODE: "1",
-              OGB_BOX_ID: proxyEnv.OGB_BOX_ID ?? "",
-              OGB_BOX_TOKEN: proxyEnv.OGB_BOX_TOKEN ?? "",
-              // who-is-driving endpoint, so a person taking the wheel in the
-              // panel pauses this bot's hands mid-turn
-              OMB_CONTROL_URL: proxyEnv.OMB_CONTROL_URL ?? "",
-              OMB_CONTROL_TOKEN: proxyEnv.OMB_CONTROL_TOKEN ?? "",
-            },
-          });
-        } else if (turn.integrations?.localComputer) {
+        if (turn.integrations?.localComputer) {
           // The host daemon and isolated Local VM both arrive as a direct Cua
           // Driver stdio MCP server. Codex sees the same computer tool surface.
           mountMcpServer(appServerArgs, env, "computer", turn.integrations.localComputer);
@@ -573,6 +672,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           mountMcpServer(appServerArgs, env, "browser", turn.integrations.browser);
         }
         for (const [name, server] of Object.entries(turn.integrations?.custom ?? {})) {
+          // codex speaks streamable HTTP to a remote server, not the older
+          // SSE transport: such an entry still reaches Claude bots, and is
+          // left out here rather than mounted as something it is not
+          if ("url" in server && server.type === "sse") {
+            noteSkippedSseServer(name);
+            continue;
+          }
           mountMcpServer(appServerArgs, env, name, server, false);
         }
         if (turn.integrations?.phone) {
@@ -603,9 +709,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         lastError: "",
         lastText: "",
         sawStreamDelta: false,
-        // codex reports token usage as a running THREAD total; the harness
-        // wants this turn's figure, so the last report is banked on settle
+        // codex reports token usage as a running total for this app-server
+        // process. The harness wants this turn's figure: the total minus
+        // whatever the process already carried before turn/start (a resumed
+        // thread may restore earlier usage), banked on settle.
         usage: undefined as { input: number; output: number; cachedInput?: number } | undefined,
+        usageBaseline: undefined as { input: number; output: number; cachedInput: number } | undefined,
       };
 
       const asks = new Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>();
@@ -639,6 +748,16 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           rpcPending.set(id, {
             resolve: (v) => {
               clearTimeout(timer);
+              if (method === "thread/start" || method === "thread/resume") {
+                // Notifications can follow the thread response in the same
+                // stdout chunk, before the handshake await resumes.
+                const returnedId = v?.thread?.id;
+                const requestedId = method === "thread/resume"
+                  && params && typeof params === "object" && "threadId" in params
+                  ? params.threadId : null;
+                if (typeof returnedId === "string" && returnedId) codexThreadId = returnedId;
+                else if (typeof requestedId === "string" && requestedId) codexThreadId = requestedId;
+              }
               if (method === "turn/start") {
                 if (typeof v?.turn?.id !== "string" || !v.turn.id) {
                   reject(new Error("Codex did not return a native turn id"));
@@ -669,8 +788,31 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         return stopped;
       });
       let completeStoppedTurn: (() => void) | undefined;
+      // Stop asks the app-server to end the turn itself before any process
+      // signal. Killing first surfaced routine stops as "codex exited null
+      // (signal SIGTERM) before turn/completed"; the protocol interrupt keeps
+      // the session the authority, and the kill below is only escalation for
+      // a server that will not answer. settle() runs with state.settled
+      // already true, so ordinary completion still tears down immediately.
+      let interruptRequested = false;
       const stop = async () => {
         stopRequested = true;
+        stopSignal.abort();
+        if (!state.settled && !interruptRequested && codexThreadId && codexTurnId &&
+            child.exitCode === null && child.signalCode === null) {
+          interruptRequested = true;
+          const graceMs = Math.max(1, Number(process.env.FAKE_CODEX_INTERRUPT_GRACE_MS ?? 750) || 750);
+          try {
+            await request("turn/interrupt", { threadId: codexThreadId, turnId: codexTurnId }, graceMs);
+          } catch {
+            // Old CLI without the method, or a wedged server: escalate below.
+          }
+          const deadline = Date.now() + graceMs;
+          while (!state.settled && Date.now() < deadline) {
+            await new Promise((wake) => setTimeout(wake, 15));
+          }
+          if (state.settled) return true;
+        }
         const stopped = await terminate();
         if (stopped) completeStoppedTurn?.();
         return stopped;
@@ -690,6 +832,32 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         completeStoppedTurn = complete;
         if (!(await stop())) {
           emit({ ...base(threadId, turnId), type: "runtime.error", message: "codex did not shut down after termination was requested" });
+        }
+      };
+
+      // Live steering folds new input into the running turn without ending
+      // it. expectedTurnId is the protocol's precondition: a turn that moved
+      // on (or a CLI without turn/steer) answers with an explicit RPC error,
+      // which becomes "refused" here so the caller queues for the next turn —
+      // the child is never killed to steer. A timeout after delivery, a dead
+      // transport, or a turn that settles while the answer is in flight is
+      // "indeterminate": the words may already be running, so the caller must
+      // not re-queue them.
+      const steerActiveTurn = async (text: string): Promise<SteerOutcome> => {
+        if (state.settled || abandoned || stopRequested || !codexThreadId || !codexTurnId) return "refused";
+        if (child.exitCode !== null || child.signalCode !== null) return "refused";
+        try {
+          const steerTimeoutMs = Math.max(1, Number(process.env.FAKE_CODEX_STEER_TIMEOUT_MS ?? 10_000) || 10_000);
+          await request("turn/steer", {
+            threadId: codexThreadId,
+            input: [{ type: "text", text }],
+            expectedTurnId: codexTurnId,
+          }, steerTimeoutMs);
+          return "steered";
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (state.settled || message.includes("timed out")) return "indeterminate";
+          return "refused";
         }
       };
 
@@ -727,6 +895,27 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               error: { code: -32601, message: `Unsupported server request: ${method}` },
             });
           }
+          return;
+        }
+        // One ask card carries one question honestly: its choices would come
+        // from the first question alone and its one reply (including the
+        // timeout note) would be copied into every question id (#1237).
+        // Refuse the bundled call with a teaching error instead of
+        // fabricating per-question answers.
+        if (isQuestion && (!Array.isArray(params.questions) || params.questions.length !== 1)) {
+          const bundled = Array.isArray(params.questions) && params.questions.length > 1;
+          send({
+            jsonrpc: "2.0",
+            id: msg.id,
+            error: {
+              code: -32602,
+              message: bundled
+                ? `ask supports one question per call; this request bundled ${params.questions.length}. Split it into separate asks, one question each.`
+                : Array.isArray(params.questions)
+                ? "ask supports one question per call; this request sent none."
+                : "ask supports one question per call; params.questions must be an array with exactly one question.",
+            },
+          });
           return;
         }
         const mcpTool = isLegacyMcpPermission
@@ -822,6 +1011,17 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           !("threadId" in p) && !("turnId" in p);
         if (!connectionError) {
           if (!codexThreadId || p.threadId !== codexThreadId) return;
+          if (!codexTurnId && msg.method === "thread/tokenUsage/updated" && p.tokenUsage?.total) {
+            // A total reported before this turn exists is what the process
+            // carried in — a resumed thread restoring earlier usage. It is the
+            // baseline this turn's figure is measured from, never a reading to
+            // buffer and replay as if this turn produced it. (Codex names the
+            // turn before any model call, so a genuine first reading cannot
+            // land here.)
+            const t = p.tokenUsage.total;
+            state.usageBaseline = { input: t.inputTokens ?? 0, output: t.outputTokens ?? 0, cachedInput: t.cachedInputTokens ?? 0 };
+            return;
+          }
           if (!codexTurnId) {
             // Some servers stream before acknowledging turn/start. Retain a
             // bounded prefix, then filter against the authoritative response.
@@ -922,32 +1122,43 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             break;
           }
           case "thread/tokenUsage/updated": {
-            // `last` is the most recent turn when the server sends it;
-            // `total` is the thread so far — a fresh app-server per turn
-            // makes that this turn's figure too
-            const turnUsage = p.tokenUsage?.last ?? p.tokenUsage?.total;
-            // codex's inputTokens already includes cachedInputTokens; the
-            // cached share is carried alongside so the UI can say how much
-            // of a turn was context re-read rather than new text
-            if (turnUsage) {
-              state.usage = {
-                input: turnUsage.inputTokens ?? 0,
-                output: turnUsage.outputTokens ?? 0,
-                ...(typeof turnUsage.cachedInputTokens === "number"
-                  ? { cachedInput: turnUsage.cachedInputTokens }
-                  : {}),
-              };
-            }
+            // `total` is everything this app-server process has used; `last`
+            // is the most recent model call. This turn's figure is the total
+            // minus what the process carried before turn/start went out (a
+            // resumed thread can restore earlier usage), so it never grows by
+            // the whole thread per message and never counts only the final
+            // call of a multi-step turn. codex's inputTokens already includes
+            // cachedInputTokens; the cached share rides alongside so the UI
+            // can say how much was context re-read rather than new text.
             const t = p.tokenUsage?.total;
+            const last = p.tokenUsage?.last;
+            const shape = (u: { inputTokens?: number; outputTokens?: number; cachedInputTokens?: number }) => ({
+              input: u.inputTokens ?? 0, output: u.outputTokens ?? 0, cachedInput: u.cachedInputTokens ?? 0,
+            });
+            // (A total that arrived before this turn was named became the
+            // baseline upstream and never reaches this switch.)
             if (t) {
+              const b = state.usageBaseline ?? { input: 0, output: 0, cachedInput: 0 };
+              const now = shape(t);
+              state.usage = {
+                input: Math.max(0, now.input - b.input),
+                output: Math.max(0, now.output - b.output),
+                ...(typeof t.cachedInputTokens === "number" ? { cachedInput: Math.max(0, now.cachedInput - b.cachedInput) } : {}),
+              };
+            } else if (last) {
+              state.usage = { input: last.inputTokens ?? 0, output: last.outputTokens ?? 0, ...(typeof last.cachedInputTokens === "number" ? { cachedInput: last.cachedInputTokens } : {}) };
+            }
+            if (t) {
+              const window = p.tokenUsage?.modelContextWindow;
               emit({
                 ...base(threadId, turnId),
                 type: "thread.token-usage.updated",
                 input: t.inputTokens ?? 0,
                 output: t.outputTokens ?? 0,
-                ...(typeof t.cachedInputTokens === "number"
-                  ? { cachedInput: t.cachedInputTokens }
-                  : {}),
+                ...(typeof t.cachedInputTokens === "number" ? { cachedInput: t.cachedInputTokens } : {}),
+                // the last call's prompt is what fills the window
+                ...(last && typeof last.inputTokens === "number" ? { contextTokens: last.inputTokens } : {}),
+                ...(typeof window === "number" && window > 0 ? { contextWindow: window } : {}),
               });
             }
             break;
@@ -997,13 +1208,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           } catch {
             continue;
           }
+          stderrSinceOutput = "";
           const loggedMessage = codexNativeIncomingLogMessage(msg, sensitiveResponseIds);
           appendNative(threadId, { dir: "in", source: "codex.app-server", msg: loggedMessage });
           if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined)) {
             const pend = rpcPending.get(msg.id);
             if (pend) {
               rpcPending.delete(msg.id);
-              if (msg.error) pend.reject(new Error(msg.error.message ?? JSON.stringify(msg.error)));
+              if (msg.error) pend.reject(new CodexRpcError(msg.error));
               else pend.resolve(msg.result);
             }
           } else if (msg.id !== undefined && msg.method) {
@@ -1015,16 +1227,25 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       });
 
       let stderr = "";
+      // Stderr that arrived after the last parsed protocol message. The
+      // full buffer accumulates for the whole process lifetime, so its
+      // tail can name a long-past event (a websocket 426 logged at turn
+      // start, echoed half an hour later when something else kills the
+      // process). Only this slice can explain an exit; older bytes are
+      // context, not cause.
+      let stderrSinceOutput = "";
       child.stderr.on("data", (c) => {
         stderr += c;
+        stderrSinceOutput += c;
         if (stderr.length > 8192) stderr = stderr.slice(-8192);
+        if (stderrSinceOutput.length > 2048) stderrSinceOutput = stderrSinceOutput.slice(-2048);
       });
       child.on("error", (e) => {
         if (abandoned) return;
         emit({ ...base(threadId, turnId), type: "runtime.error", ...describeSpawnFailure(e, config.cli) });
         void settle(false, "spawn_error");
       });
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
         if (abandoned) return;
         if (state.settled) {
           // Root exit alone cannot release a turn after an uncertain stop.
@@ -1032,17 +1253,79 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           void stop();
           return;
         }
-        if (!state.settled) {
+        // An intentional stop killed (or outlived) the child before the
+        // turn acknowledged its own end. That is the stop doing its job, not
+        // a crash: settle quietly so Stop never reports the raw signal.
+        if (stopRequested) {
+          void settle(false, "interrupted");
+          return;
+        }
+        // The child died before the turn completed. Attribute the exit
+        // honestly: name the signal when it was killed, and only quote
+        // stderr that arrived after the last protocol message. A stale
+        // tail here once misattributed a whole day of killed turns to a
+        // websocket 426 logged at turn start.
+        const recentStderr = stderrSinceOutput.trim();
+        const hadStreamedOutput = codexTurnId !== null || state.sawStreamDelta;
+        // A signal exit is terminal no matter what the stderr says:
+        // something killed the process (OOM, kill -9), and classifyError
+        // cannot see the signal — with code null, transient-looking recent
+        // stderr could still mark a killed attempt retryable.
+        // Classification also reads only stderr received after the last
+        // protocol output; the lifetime buffer's tail can name a
+        // long-past event (the websocket-426 misattribution).
+        const verdict =
+          signal !== null
+            ? { transient: false, reason: "interrupted" }
+            : classifyError({ exitCode: code, stderr: recentStderr });
+        // Safe re-dispatch: relaunch only when the app-server never
+        // acknowledged turn/start — no native turn began, nothing was
+        // streamed, so replaying the input cannot duplicate work. After
+        // any acknowledgement (or any buffered pre-ack event) the turn
+        // settles instead: a replay could re-run tools the user saw.
+        if (
+          !stopRequested && codexTurnId === null && earlyNotifications.length === 0 &&
+          verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1
+        ) {
+          const delayMs = computeBackoff(attempt);
+          attempt++;
           emit({
             ...base(threadId, turnId),
-            type: "runtime.error",
-            message: `codex exited ${code} before turn/completed${stderr ? `: ${stderr.trim().slice(-300)}` : ""}`,
+            type: "turn.retrying",
+            attempt,
+            delayMs,
+            reason: verdict.reason,
           });
-          void settle(false, "exit_before_result");
+          // Retire this attempt before anything async runs, so a late
+          // rpc timer rejection in the handshake catch cannot relaunch
+          // a second time on top of this one.
+          abandoned = true;
+          void (async () => {
+            const alreadyDead = child.exitCode !== null || child.signalCode !== null;
+            if (!alreadyDead && !(await terminate())) {
+              void settle(false, "shutdown_timeout");
+              return;
+            }
+            await interruptibleDelay(Math.max(1, Math.round(delayMs * retryScale)), stopSignal.signal).promise;
+            if (!stopRequested) {
+              void launchAttempt(attempt).catch(() => {});
+            } else {
+              await settle(false, "interrupted");
+            }
+          })().catch(() => {});
+          return;
         }
+        emit({
+          ...base(threadId, turnId),
+          type: "runtime.error",
+          message: `codex exited ${code}${signal ? ` (signal ${signal})` : ""} before turn/completed${
+            recentStderr ? `: ${recentStderr.slice(-300)}` : hadStreamedOutput && stderr.trim() ? "; no stderr after the last app-server output" : ""
+          }`,
+        });
+        void settle(false, "exit_before_result");
       });
 
-      active.set(threadId, { stop, turnId, asks });
+      active.set(threadId, { stop, turnId, asks, steer: steerActiveTurn });
       // Relaunching the app-server is still the same logical turn. Keep the
       // active process current on every attempt, but announce the turn once.
       if (attempt === 0) emit({ ...base(threadId, turnId), type: "turn.started" });
@@ -1094,33 +1377,51 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         // Removed bot rules are cleared without dropping native configured rules.
         const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
         let startedModel: string | null = null;
+        let resumedNativeThread = false;
+        let rebuiltFromReplay = false;
+        let promptText = turn.text;
         if (cursor) {
+          const resumeThread = () => request("thread/resume", {
+            threadId: cursor,
+            developerInstructions,
+            ...approvalParams.thread,
+          });
           try {
-            const resumed = await request("thread/resume", {
-              threadId: cursor,
-              developerInstructions,
-              ...approvalParams.thread,
-            });
-            codexThreadId = resumed?.thread?.id ?? cursor;
-          } catch (error) {
-            if (approvalParams.fallback && permissionProfileUnsupported(error)) {
-              // A server can understand config/read before it understands the
-              // profile selector. Retry the same resume safely rather than
-              // losing the native thread or inheriting its previous mode.
+            let resumed;
+            try {
+              resumed = await resumeThread();
+            } catch (error) {
+              if (!approvalParams.fallback || !permissionProfileUnsupported(error)) throw error;
+              // Older servers may require the legacy permission selector, but
+              // still resume the same native thread before any user submission.
               approvalParams = approvalParams.fallback;
-              const resumed = await request("thread/resume", {
-                threadId: cursor,
-                developerInstructions,
-                ...approvalParams.thread,
-              });
-              codexThreadId = resumed?.thread?.id ?? cursor;
-            } else {
-              throw error;
+              resumed = await resumeThread();
             }
+            codexThreadId = resumed?.thread?.id ?? cursor;
+            resumedNativeThread = true;
+          } catch (error) {
+            const failure = classifyResumeFailure({
+              attempted: true,
+              rejected: error instanceof CodexRpcError,
+              promptSubmitted,
+              producedOutput: state.sawStreamDelta,
+            });
+            if ((!config.managed && !turn.recoveryIsReplay) || recoveredMissingSession || stopRequested || state.settled ||
+                !turn.recoveryText?.trim() || !missingNativeCodexThread(error, cursor) || !mayReplay(failure)) throw error;
+            // The prompt has never been submitted. Rebuild missing Company
+            // histories, and a personal thread only for a turn whose recovery
+            // text is the replay it would have had anyway; once, through the
+            // same approved model/provider below.
+            recoveredMissingSession = true;
+            const rebuild = recoveryPromptFor({ recoveryText: turn.recoveryText, currentText: turn.text, failure });
+            // Announced as rebuilt only when the replacement really carries the
+            // replay; otherwise it holds no more than the turn text.
+            rebuiltFromReplay = rebuild.replayed;
+            promptText = rebuild.text;
           }
         }
         if (!codexThreadId) {
-          const selection = decodeCodexSelection(turn.model);
+          const selection = config.managed ? { model: turn.model, modelProvider: "openmaus_company" } : decodeCodexSelection(turn.model);
           const startThread = () => request("thread/start", {
               developerInstructions,
               cwd: turn.cwd ?? homedir(),
@@ -1141,14 +1442,14 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           startedModel = started?.model ?? null;
         }
         if (!codexThreadId) throw new Error("Codex did not return a native thread id");
-        await syncCodexInstructions(threadId, codexThreadId, developerInstructions, Boolean(cursor), request);
-        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null });
-        const promptText = turn.text;
+        await syncCodexInstructions(threadId, codexThreadId, developerInstructions, resumedNativeThread, request);
+        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null, ...(rebuiltFromReplay ? { rebuilt: true } : {}) });
         const turnInput = [
           ...(promptText ? [{ type: "text" as const, text: promptText }] : []),
           ...(turn.images ?? []).map((image) => ({ type: "localImage" as const, path: image.path })),
         ];
         const startTurn = () => {
+          promptSubmitted = true;
           startingNativeTurn = true;
           return request("turn/start", {
             threadId: codexThreadId,
@@ -1178,7 +1479,10 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const message = e instanceof Error ? e.message : String(e);
         const needsAuth = /(?:\b401\b|unauthorized|missing bearer|authentication required)/i.test(message);
         const verdict = classifyError(failure);
-        if (!state.settled && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
+        // Three guards hold here: main's abandoned attempt never retries,
+        // neither does a Company session already recovered once from canonical
+        // history, and a Stop already asked for must not be undone by a relaunch.
+        if (!state.settled && !abandoned && !recoveredMissingSession && !stopRequested && !needsAuth && verdict.transient && attempt < RETRY_MAX_ATTEMPTS - 1 && state.sawStreamDelta === false) {
           const delayMs = computeBackoff(attempt);
           attempt++;
           emit({
@@ -1195,10 +1499,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             void settle(false, "shutdown_timeout");
             return;
           }
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, Math.max(1, Math.round(delayMs * retryScale)));
-            timer.unref?.();
-          });
+          await interruptibleDelay(Math.max(1, Math.round(delayMs * retryScale)), stopSignal.signal).promise;
           if (!stopRequested) {
             void launchAttempt(attempt).catch(() => {});
           } else {
@@ -1206,7 +1507,9 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           }
           return;
         }
-        if (!state.settled) {
+        // abandoned marks an attempt retired by a retry; its late rpc
+        // timeouts must neither report a spurious error nor relaunch again
+        if (!state.settled && !abandoned) {
           emit({
             ...base(threadId, turnId),
             type: "runtime.error",
@@ -1230,6 +1533,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       );
     });
     if (!version) return { state: "unavailable", reason: `\`${config.cli}\` CLI not found` };
+    if (config.managed) return { state: "available", version, authenticated: Boolean(input.environment.OPENMAUSBOT_COMPANY_API_KEY && input.environment.CODEX_HOME), billing: "metered" };
     const authenticated = await new Promise<boolean>((resolve) => {
       execCli(config.cli, ["login", "status"], { timeout: 8000, env }, (err, stdout, stderr) =>
         resolve(!err && /^logged in\b/im.test(`${stdout}\n${stderr ?? ""}`)),
@@ -1267,6 +1571,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       provider: DRIVER_KIND,
       capabilities: {
         sessionModelSwitch: "unsupported",
+        queueing: true,
         computerMcp: true,
         localComputerMcp: true,
         composioMcp: true,
@@ -1277,10 +1582,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         images: true,
         nativeImageInput: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        strictResume: true,
       },
       sendTurn,
       interruptTurn: async (threadId) => {
         await active.get(threadId)?.stop();
+      },
+      steer: async (threadId, text) => {
+        const turn = active.get(threadId);
+        return turn?.steer ? await turn.steer(text) : "refused";
       },
       respondToRequest: async (threadId, requestId, decision) => {
         const turn = active.get(threadId);

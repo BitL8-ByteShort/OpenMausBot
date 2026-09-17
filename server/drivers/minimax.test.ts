@@ -41,11 +41,16 @@ describe("MinimaxDriver", () => {
     expect(MinimaxDriver.models).toEqual({
       default: "MiniMax-M3",
       options: [
-        { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000 },
-        { id: "MiniMax-M2.7", label: "MiniMax M2.7", contextWindow: 204_800 },
-        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800 },
+        { id: "MiniMax-M3", label: "MiniMax M3", contextWindow: 1_000_000, custom: true },
+        { id: "MiniMax-M2.7", label: "MiniMax M2.7", contextWindow: 204_800, custom: true },
+        { id: "MiniMax-M2.7-highspeed", label: "MiniMax M2.7 Highspeed", contextWindow: 204_800, custom: true },
       ],
     });
+  });
+
+  it("flags every catalog model custom so the picker's custom-access pane lists them", () => {
+    expect(MinimaxDriver.metadata.access).toBe("custom");
+    expect(MinimaxDriver.models.options.every((option) => option.custom === true)).toBe(true);
   });
 
   it("normalizes custom API roots", () => {
@@ -149,4 +154,12 @@ describe("MinimaxDriver", () => {
     recorder.stop();
     await instance.dispose();
   });
+});
+
+
+it("minimax preserves an explicit tools-off connection and rejects ambiguous flags", () => {
+  expect(MinimaxDriver.decodeConfig({})).not.toHaveProperty("tools");
+  expect(MinimaxDriver.decodeConfig({ tools: false })).toMatchObject({ tools: false });
+  expect(MinimaxDriver.decodeConfig({ tools: true })).toMatchObject({ tools: true });
+  expect(() => MinimaxDriver.decodeConfig({ tools: "false" })).toThrow("tools must be a boolean");
 });

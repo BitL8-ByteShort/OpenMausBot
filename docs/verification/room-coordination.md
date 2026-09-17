@@ -45,6 +45,13 @@ resumes it. That turn's context names what is still outstanding, so the bot
 answers the new instruction without assuming its fan-out died or sending the
 same work again.
 
+Direct-chat parking is a per-bot opt-in. When it is on, a message that arrives
+while teammates are still working waits in the composer queue — the same
+pending chip a busy thread shows — and runs as its own follow-up turn once
+every outstanding assignment has settled and the resumed coordination has
+finished. Steering stays the default; Stop keeps its conversation-scoped
+behavior either way.
+
 Stop is scoped to the conversation it was pressed in. It ends that bot's turn
 and stops the conversation awaiting its teammates, so nothing resumes into a
 stopped chat. An assignment that had not started yet is cancelled, since
@@ -92,6 +99,15 @@ with ordinary tool chips hidden. Screenshots and JSON are retained beside the
 fixture's printed server log; all fixture processes and temporary data are closed.
 Follow-up checks cover retained report context and withholding after peer access
 is revoked, without mirroring a second visible transcript.
+Addressing checks cover what a bot may put in a `bot_ids` slot: an id is always
+an id; a name that means exactly one reachable teammate resolves to it and the
+work runs as if the id had been sent; a name nobody has is refused with the
+argument echoed and `list_bots` named (`No bot with id or name "…"`); a hidden
+teammate's id is refused as no longer available; a name two reachable teammates
+share is refused with the count and the way to the ids, never guessed. The same
+resolution serves `ask_bot` and `delegate_bot`, and every roster line the Chief
+and its peers read carries the teammate's `[id: …]`, so the tools can be called
+straight from the prompt.
 Unit checks cover bounded depth/fan-out, idempotent retry, original request
 retention, automatic return, cancellation and restart without replay, and the
 scoped stop: unstarted work cancelled, a running teammate left with its

@@ -29,7 +29,7 @@ import {
   getSnippetFileName,
 } from "../lib/code-block";
 import { repairMarkdownTables } from "../lib/markdown-tables";
-import { remarkThreadRefs } from "../lib/thread-refs";
+import { looksLikeThreadRefUrl, parseThreadRefUrl, resolveThreadRefAddress, remarkThreadRefs } from "../lib/thread-refs";
 import { MarkdownImagePreview, useLocalFileSave, type MessageAttachmentContext } from "./AttachmentPreview";
 import { ThreadLink, threadLinkFromProps, useThreadRefs } from "./ThreadRefs";
 
@@ -94,6 +94,9 @@ export const localFilePath = (href?: string): string | null => {
 /** Keep only the local URL spellings our message-scoped file renderer knows
  * about; all ordinary links still use react-markdown's protocol allow-list. */
 export function chatUrlTransform(value: string): string {
+  // thread links render as chips below, never as external anchors; the
+  // scheme must survive the allow-list so the anchor component sees it
+  if (looksLikeThreadRefUrl(value)) return value;
   if (/^file:\/\//i.test(value) || WINDOWS_PATH.test(value) || value.startsWith("\\\\")) {
     return localFilePath(value) ? value : "";
   }
@@ -546,6 +549,13 @@ function ChatMarkdownComponent({ text, streaming = false, message, mentionPeers 
             return <span {...rest}>{children}</span>;
           },
           a({ href, children }: { href?: string; children?: ReactNode }) {
+            // a canonical thread link is a chip whatever text carries it;
+            // a dead one keeps its label as plain text rather than handing
+            // the app's own scheme to the shell
+            const address = href ? parseThreadRefUrl(href) : null;
+            const ref = address ? resolveThreadRefAddress(threads, address, currentBotId) : null;
+            if (ref) return <ThreadLink target={ref} ambiguous={ref.ambiguous}>{children}</ThreadLink>;
+            if (address || (href && looksLikeThreadRefUrl(href))) return <span className="break-words">{children}</span>;
             const localPath = localFilePath(href);
             if (localPath) return <LocalFileLink filePath={localPath} message={message}>{children}</LocalFileLink>;
             return (
@@ -621,9 +631,24 @@ function ChatMarkdownComponent({ text, streaming = false, message, mentionPeers 
   );
 }
 
+/** Compare the roster by the fields that actually change the render, not by
+ * identity. Both callers derive this list from `state.bots` / group members
+ * with `useMemo`, and the reducer rebuilds those arrays with `.map()` on every
+ * bot patch — so a reference test fails on events that changed nothing here,
+ * and every mounted bubble re-parses its markdown. Rosters are small; this
+ * walk is far cheaper than the re-render it prevents. */
+export function samePeers(previous: readonly MentionPeer[], next: readonly MentionPeer[]): boolean {
+  if (previous === next) return true;
+  if (previous.length !== next.length) return false;
+  return previous.every((peer, index) => {
+    const other = next[index]!;
+    return peer.name === other.name && peer.hidden === other.hidden && peer.color === other.color;
+  });
+}
+
 export const ChatMarkdown = memo(ChatMarkdownComponent, (previous, next) => (
   previous.text === next.text
-  && previous.mentionPeers === next.mentionPeers
+  && samePeers(previous.mentionPeers ?? NO_MENTION_PEERS, next.mentionPeers ?? NO_MENTION_PEERS)
   && previous.everyone === next.everyone
   && Boolean(previous.streaming) === Boolean(next.streaming)
   && previous.message?.threadId === next.message?.threadId

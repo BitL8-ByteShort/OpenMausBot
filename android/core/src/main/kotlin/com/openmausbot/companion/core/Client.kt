@@ -226,6 +226,22 @@ class CompanionClient(
 
     suspend fun config(): ConfigStatus = send(makeRequest("GET", "/api/config"))
 
+    /**
+     * The engine is a setting, not a secret, so it rides the ordinary config
+     * write — the same one `VoiceSettings.tsx` sends from its Voice engine
+     * group. Only the provider field is written; keys and server addresses
+     * stay on the computer.
+     */
+    suspend fun updateVoiceProvider(provider: VoiceProvider): ConfigStatus = send(
+        makeRequest(
+            "PUT",
+            "/api/config",
+            body = buildJsonObject {
+                put("tts", buildJsonObject { put("provider", provider.wire) })
+            },
+        ),
+    )
+
     suspend fun connectorCatalog(): ConnectorCatalog =
         send(makeRequest("GET", "/api/connectors/catalog"))
 
@@ -581,6 +597,17 @@ class CompanionClient(
             "PATCH",
             "/api/bots/${segment(botId)}/tasks/${segment(threadId)}",
             body = jsonBody("title" to title),
+        ))
+    }
+
+    /** The unarchive PATCH carries an explicit null, so jsonBody's skip-nulls
+     * rule cannot be used here. Stamps are whole milliseconds: a Double would
+     * serialize large ones in scientific notation. */
+    suspend fun setTaskArchived(botId: String, threadId: String, archivedAt: Double?) {
+        sendUnit(makeRequest(
+            "PATCH",
+            "/api/bots/${segment(botId)}/tasks/${segment(threadId)}",
+            body = buildJsonObject { put("archivedAt", JsonPrimitive(archivedAt?.toLong())) },
         ))
     }
 

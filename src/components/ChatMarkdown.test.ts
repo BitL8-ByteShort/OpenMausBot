@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ChatMarkdown,
   CodeBlock,
+  samePeers,
   chatUrlTransform,
   markdownImageName,
   markdownImageOpenUrl,
@@ -160,6 +161,21 @@ describe("#Title thread links in markdown", () => {
     const markup = renderToStaticMarkup(createElement(StoreProvider, null, createElement(ChatMarkdown, { text: "#QA PR 245" })));
     expect(markup).not.toContain("data-thread-link");
     expect(markup).toContain("#QA PR 245");
+  });
+
+  it("renders a sent canonical link as a chip that opens the thread", () => {
+    const markup = render("done in [QA PR 245](openmausbot://thread/qa-245?bot=scout) today");
+    expect(markup).toContain('<button type="button" data-thread-link="qa-245"');
+    expect(markup).toContain(">QA PR 245</button>");
+    expect(markup).not.toContain('href="openmausbot://');
+  });
+
+  it("keeps a dead thread link as plain text, never an external anchor", () => {
+    const markup = render("see [Gone](openmausbot://thread/dead?bot=scout)");
+    expect(markup).toContain(">Gone<");
+    expect(markup).not.toContain("data-thread-link");
+    expect(markup).not.toContain('href="openmausbot://');
+    expect(markup).not.toContain('target="_blank"');
   });
 });
 
@@ -493,5 +509,28 @@ describe("bidi: message content carries its own direction", () => {
       message: { threadId: "thread-1", messageId: "message-1" },
     }));
     expect(path).toContain('<span dir="ltr"');
+  });
+});
+
+describe("mention roster comparison", () => {
+  const roster = [{ name: "Eve" }, { name: "Scout", color: "teal" as const }];
+
+  it("treats a rebuilt array with the same roster as unchanged", () => {
+    // The reducer rebuilds state.bots with .map() on every bot patch, so the
+    // bubble's useMemo hands ChatMarkdown a fresh array that renders
+    // identically. Reference equality said "changed" and re-parsed the whole
+    // transcript; this is the regression guard for that.
+    expect(samePeers(roster, roster.map((peer) => ({ ...peer })))).toBe(true);
+  });
+
+  it("notices a renamed, newly hidden, or recoloured peer", () => {
+    expect(samePeers(roster, [{ name: "Eve" }, { name: "Scout-2", color: "teal" as const }])).toBe(false);
+    expect(samePeers(roster, [{ name: "Eve", hidden: true }, roster[1]!])).toBe(false);
+    expect(samePeers(roster, [{ name: "Eve" }, { name: "Scout", color: "coral" as const }])).toBe(false);
+  });
+
+  it("notices a peer joining or leaving", () => {
+    expect(samePeers(roster, [...roster, { name: "Kim" }])).toBe(false);
+    expect(samePeers(roster, [roster[0]!])).toBe(false);
   });
 });

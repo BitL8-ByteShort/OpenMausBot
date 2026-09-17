@@ -26,24 +26,36 @@ import com.openmausbot.companion.core.BotTask
 import com.openmausbot.companion.core.bylineLabel
 import com.openmausbot.companion.core.displayTitle
 import com.openmausbot.companion.core.isClosed
+import com.openmausbot.companion.core.isArchived
+import com.openmausbot.companion.core.isWaitingOnTeammate
+import com.openmausbot.companion.core.isWorking
+
+/** The quiet status under a title: waiting states are never painted as work. */
+internal fun BotTask.runtimeLabel(): String? = when {
+    activity == "waiting-on-you" -> "Waiting on you"
+    isWaitingOnTeammate -> "Waiting on teammate"
+    isWorking -> "Working"
+    activity == "queued" -> "Queued"
+    else -> null
+}
 
 /** Shared by Home and the thread picker, with status taken from this thread alone. */
 @Composable
 internal fun BotThreadRow(task: BotTask, selected: Boolean = false, modifier: Modifier = Modifier) {
-    val runtime = when (task.activity) {
-        "waiting-on-you" -> "Waiting on you"
-        "queued" -> "Queued"
-        "working", "running" -> "Working"
-        else -> if (task.busy == true) "Working" else null
+    val runtime = task.runtimeLabel()
+    val dimmed = (task.isClosed || task.isArchived) && runtime == null && task.unread != true
+    val foldedState = when {
+        task.isClosed -> "Closed"
+        task.isArchived -> "Archived"
+        else -> null
     }
-    val dimmed = task.isClosed && runtime == null && task.unread != true
     val now = remember(task.createdAt) { System.currentTimeMillis() }
     Row(
         modifier = modifier
             .fillMaxWidth()
             .semantics(mergeDescendants = true) {
                 this.selected = selected
-                if (dimmed) stateDescription = "Closed"
+                if (dimmed) foldedState?.let { stateDescription = it }
             }
             .padding(vertical = 3.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -67,6 +79,7 @@ internal fun BotThreadRow(task: BotTask, selected: Boolean = false, modifier: Mo
                             fontWeight = FontWeight.Medium,
                             color = when (runtime) {
                                 "Waiting on you" -> MaterialTheme.colorScheme.error
+                                "Waiting on teammate" -> secondaryTint
                                 "Queued" -> secondaryTint
                                 else -> MaterialTheme.colorScheme.primary
                             },
