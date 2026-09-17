@@ -287,17 +287,23 @@ function Shell() {
           )}
         </main>
       )}
+      {/* The panels below are siblings, so their keys must differ even
+          though each is remounted per bot. Two siblings keyed `bot.id`
+          collide in React's keyed reconciliation whenever both are open
+          (Computer panel, then the usage chip): every re-render mounts a
+          fresh settings panel and never removes the previous one, so the
+          panels pile up and Close stops working. */}
       {state.settingsOpen && bot && (
         remoteClient
           ? <RemoteAgentSettingsPanel bot={bot} />
-          : <BotSettingsDialog key={bot.id} bot={bot} />
+          : <BotSettingsDialog key={`settings:${bot.id}`} bot={bot} />
       )}
       {state.computerOpen && bot && (
         remoteClient ? (
-          <RemoteDesktopPanel key={bot.id} bot={bot} />
+          <RemoteDesktopPanel key={`computer:${bot.id}`} bot={bot} />
         ) : (
           <ComputerPanel
-            key={bot.id}
+            key={`computer:${bot.id}`}
             bot={bot}
             onOpenVmWorkspace={openLocalVmWorkspace}
           />
@@ -343,9 +349,9 @@ function WelcomeGate() {
       remoteClient: window.ogb?.remoteClient?.active === true,
       legacyDone: emailGateDone(),
     });
-  // A fresh desktop can connect to an existing hosted workspace without
-  // completing local provider onboarding. Closing Settings resumes the tour.
-  if (state.appSettingsOpen && state.appSettingsSection === "desktopWorkspaces") return null;
+  // Explicit desktop connection Settings need no local provider onboarding.
+  // Organisation remains optional; closing Settings resumes the normal tour.
+  if (state.appSettingsOpen && ["desktopWorkspaces", "organization"].includes(state.appSettingsSection)) return null;
   if (!state.welcomeOpen && !due) return null;
   const bot = state.bots.find((b) => !b.hidden) ?? null;
   const replay = state.welcomeOpen && !due;

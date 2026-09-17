@@ -8,8 +8,10 @@ import { z } from "zod";
 import { normalizeImageGenerationUrl, type ImageGenerationConfig } from "../shared/image-generation.ts";
 
 import { writeFileAtomic } from "./atomic.ts";
-import { EFFORT_LEVELS, type InstanceConfigMap, type ModelSelection } from "./contracts.ts";
-import { parseStoredMcpServer } from "./mcp-registry.ts";
+import { EFFORT_LEVELS } from "../shared/wire.ts";
+import { isModelVariant, type InstanceConfigMap, type ModelSelection } from "./contracts.ts";
+import type { McpServerSpec } from "./contracts.ts";
+import { isRemoteMcpServer, parseStoredMcpServer } from "./mcp-registry.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
 
 const optionalText = z.string().optional();
@@ -20,8 +22,16 @@ const BROWSER_PROFILE_ID = /^[a-z0-9_-]{1,40}$/;
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
+export const DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES = 30;
+export const DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES = 10;
+export const DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES = 240;
 export const DEFAULT_MAX_CONCURRENT_BOT_THREADS = 3;
 export const MAX_CONCURRENT_BOT_THREADS = 10;
+/** Bounds for threads.eventLogMaxBytes: the floor keeps the kept tail large
+ * enough to still serve the event inspector's recent-line window; the
+ * ceiling just rejects absurd hand edits. */
+export const MIN_THREAD_EVENT_LOG_BYTES = 256 * 1024;
+export const MAX_THREAD_EVENT_LOG_BYTES = 4 * 1024 * 1024 * 1024;
 export const DEFAULT_LOCAL_VM_MODE = "shared" as const;
 export const DEFAULT_LOCAL_VM_MAX_INSTANCES = 2;
 export const MIN_LOCAL_VM_MAX_INSTANCES = 1;
@@ -56,7 +66,19 @@ const roomConfigSchema = z.object({
     .int()
     .min(MIN_ROOM_TURN_TIMEOUT_MINUTES)
     .max(MAX_ROOM_TURN_TIMEOUT_MINUTES),
-});
+  /** Room handoff tree lifetime. Active execution pauses this clock; the
+   * hard cap is wall-clock and bounds trees that never stop executing. */
+  handoffLifetimeMinutes: z.number().int().min(1).max(MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+  handoffMinRunwayMinutes: z.number().int().min(1).max(MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+  handoffHardCapMinutes: z.number().int().min(1).max(7 * MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+}).refine(
+  (rooms) =>
+    (rooms.handoffMinRunwayMinutes ?? DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES) <=
+      (rooms.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) &&
+    (rooms.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) <=
+      (rooms.handoffHardCapMinutes ?? DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES),
+  { message: "rooms handoff bounds must satisfy handoffMinRunwayMinutes <= handoffLifetimeMinutes <= handoffHardCapMinutes" },
+);
 const localVmConfigSchema = z.object({
   mode: z.enum(["shared", "per-bot"]).optional(),
   maxInstances: z
@@ -232,6 +254,10 @@ const featureConfigSchema = z.object({
    * computer control to a workspace). Off until explicitly enabled; there is
    * no Settings toggle — see sharedComputersEnabled. */
   sharedComputers: z.boolean().optional(),
+  /** Claude bots also load the MCP servers and connectors from this
+   * machine's own Claude Code setup (Plugins → MCP servers switch). Off by
+   * default: each extra tool costs tokens on every model call. */
+  claudeUserMcp: z.boolean().optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -258,7 +284,9 @@ const defaultModelSelectionSchema = z.object({
   instanceId: z.string().trim().min(1),
   model: z.string().trim().min(1),
   effort: z.enum(EFFORT_LEVELS).optional(),
-});
+  variant: z.string().refine(isModelVariant, "invalid model variant").optional(),
+}).refine((selection) => selection.variant === undefined || selection.effort === undefined,
+  "choose either a model variant or an effort level");
 const appConfigSchema = z.object({
   /** Verified by the dedicated domain endpoint, never a generic config patch. */
   customDomain: z.string().optional(),
@@ -314,10 +342,25 @@ const appConfigSchema = z.object({
   vps: vpsConfigSchema.optional(),
   /** Optional OpenCode key; persisted write-only and passed only to its child. */
   opencodeGo: z.object({ apiKey: optionalText }).optional(),
-  /** Voice credentials and the selected voice id. `provider` picks the
-   * engine: "elevenlabs" (default; needs a key) or "system" (the Mac's
-   * built-in voices, no key). */
-  tts: z.object({ key: optionalText, voice: optionalText, provider: z.enum(["elevenlabs", "system"]).optional() }).optional(),
+  /** Voice settings and the selected voice id. `provider` picks the
+   * engine: "elevenlabs" (default; needs `key`), "fish" (needs its own
+   * `fishKey`), "system" (the Mac's built-in voices, no key), or
+   * "chatterbox" (a local OpenAI-compatible Chatterbox server; `baseUrl`
+   * and `model` are settings, not secrets). Cloud keys stay separate so
+   * switching providers never overwrites or misuses the other key. */
+  tts: z.object({
+    key: optionalText,
+    fishKey: optionalText,
+    voice: optionalText,
+    provider: z.enum(["elevenlabs", "fish", "system", "chatterbox"]).optional(),
+    baseUrl: z
+      .string()
+      .trim()
+      .max(2048)
+      .refine((value) => !value || /^https?:\/\//i.test(value), "the Chatterbox server address must start with http:// or https://")
+      .optional(),
+    model: optionalText,
+  }).optional(),
   /** Avatar provider credentials stay separate; choosing a router never reuses a cloud key. */
   imageGen: z.object({
     provider: z.enum(["openai", "xai", "custom"]).optional(),
@@ -341,7 +384,15 @@ const appConfigSchema = z.object({
    * system language. Unknown tags degrade to English in the renderer. */
   language: optionalText,
   rooms: roomConfigSchema.optional(),
-  threads: z.object({ maxConcurrentPerBot: z.number().int().min(1).max(MAX_CONCURRENT_BOT_THREADS) }).strict().optional(),
+  threads: z.object({
+    maxConcurrentPerBot: z.number().int().min(1).max(MAX_CONCURRENT_BOT_THREADS),
+    /** Cap each per-thread events/ and native/ NDJSON log at this many
+     * bytes; absent (the default) keeps today's unbounded growth (#1280). */
+    eventLogMaxBytes: z.number().int().min(MIN_THREAD_EVENT_LOG_BYTES).max(MAX_THREAD_EVENT_LOG_BYTES).optional(),
+    /** Days a closed or archived thread's event logs survive (#1280).
+     * Absent keeps them forever. */
+    eventLogRetentionDays: z.number().int().min(1).max(3650).optional(),
+  }).strict().optional(),
   localVm: localVmConfigSchema.optional(),
   features: featureConfigSchema.optional(),
   onboarding: onboardingConfigSchema.optional(),
@@ -381,16 +432,16 @@ export interface AppConfig {
   /** A named host from the user's SSH config. Authentication stays with SSH. */
   vps?: { sshAlias?: string };
   opencodeGo?: { apiKey?: string };
-  tts?: { key?: string; voice?: string; provider?: "elevenlabs" | "system" };
+  tts?: { key?: string; fishKey?: string; voice?: string; provider?: "elevenlabs" | "fish" | "system" | "chatterbox"; baseUrl?: string; model?: string };
   imageGen?: ImageGenerationConfig;
   profile?: { name?: string; email?: string };
-  rooms?: { turnTimeoutMinutes: number };
-  threads?: { maxConcurrentPerBot: number };
+  rooms?: { turnTimeoutMinutes: number; handoffLifetimeMinutes?: number; handoffMinRunwayMinutes?: number; handoffHardCapMinutes?: number };
+  threads?: { maxConcurrentPerBot: number; eventLogMaxBytes?: number; eventLogRetentionDays?: number };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean };
+  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean };
   /** First-run progress; see onboardingConfigSchema. */
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
   /** Named browser sessions any bot can be pointed at. */
@@ -510,8 +561,39 @@ export function roomTurnTimeoutMinutes(cfg: AppConfig): number {
   return cfg.rooms?.turnTimeoutMinutes ?? DEFAULT_ROOM_TURN_TIMEOUT_MINUTES;
 }
 
+export interface RoomHandoffLimitsMs {
+  lifetimeMs: number;
+  minRunwayMs: number;
+  hardCapMs: number;
+}
+
+/** Room handoff tree budgets in milliseconds. The tree lifetime pauses
+ * while a node is actively executing; the hard cap is wall-clock and bounds
+ * trees that never stop. Read when the server starts. */
+export function roomHandoffLimits(cfg: AppConfig): RoomHandoffLimitsMs {
+  return {
+    lifetimeMs: (cfg.rooms?.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) * 60_000,
+    minRunwayMs: (cfg.rooms?.handoffMinRunwayMinutes ?? DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES) * 60_000,
+    hardCapMs: (cfg.rooms?.handoffHardCapMinutes ?? DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES) * 60_000,
+  };
+}
+
 export function maxConcurrentBotThreads(cfg: AppConfig): number {
   return cfg.threads?.maxConcurrentPerBot ?? DEFAULT_MAX_CONCURRENT_BOT_THREADS;
+}
+
+/** Size cap for each per-thread events/ and native/ NDJSON log. Null (the
+ * default) means unbounded growth — rotation is strictly opt-in (#1280). */
+export function threadEventLogMaxBytes(cfg: AppConfig): number | null {
+  const cap = cfg.threads?.eventLogMaxBytes;
+  return typeof cap === "number" && Number.isFinite(cap) && cap > 0 ? cap : null;
+}
+
+/** Days a closed or archived bot thread's event logs survive before the
+ * retention sweep removes them (#1280). Null — the default — keeps them
+ * forever. */
+export function threadEventLogRetentionDays(cfg: AppConfig): number | null {
+  return cfg.threads?.eventLogRetentionDays ?? null;
 }
 
 export function localVmMode(cfg: AppConfig): "shared" | "per-bot" {
@@ -549,6 +631,15 @@ export function builtInBrowserEnabled(cfg: AppConfig): boolean {
  * (`{"features": {"sharedComputers": true}}`) and restarts the server. */
 export function sharedComputersEnabled(cfg: AppConfig): boolean {
   return cfg.features?.sharedComputers === true;
+}
+
+/** Claude bots also see the MCP servers of this machine's own Claude Code
+ * setup — the way Codex bots already read ~/.codex/config.toml. Off unless
+ * the person switched it on under Plugins → MCP servers; the Claude driver
+ * then omits --strict-mcp-config while keeping skills, hooks and the
+ * personal CLAUDE.md out. */
+export function claudeUserMcpEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.claudeUserMcp === true;
 }
 
 /** Config sections no provider driver reads. A write that touches only
@@ -657,6 +748,7 @@ export function loadConfig(): AppConfig {
   if (process.env.OPENCODE_API_KEY !== undefined) cfg.opencodeGo.apiKey = process.env.OPENCODE_API_KEY;
   cfg.tts = { ...cfg.tts };
   if (process.env.OMB_TTS_KEY !== undefined) cfg.tts.key = process.env.OMB_TTS_KEY;
+  if (process.env.OMB_FISH_AUDIO_API_KEY !== undefined) cfg.tts.fishKey = process.env.OMB_FISH_AUDIO_API_KEY;
   cfg.imageGen = { ...cfg.imageGen };
   if (process.env.OMB_OPENAI_IMAGE_KEY !== undefined) cfg.imageGen.key = process.env.OMB_OPENAI_IMAGE_KEY;
   if (process.env.OMB_CUSTOM_IMAGE_KEY !== undefined) cfg.imageGen.customApiKey = process.env.OMB_CUSTOM_IMAGE_KEY;
@@ -687,6 +779,7 @@ export function syncCredentialEnv(patch: Partial<AppConfig>): void {
     [patch.box?.token, "BOX_TOKEN"],
     [patch.opencodeGo?.apiKey, "OPENCODE_API_KEY"],
     [patch.tts?.key, "OMB_TTS_KEY"],
+    [patch.tts?.fishKey, "OMB_FISH_AUDIO_API_KEY"],
     [patch.imageGen?.key, "OMB_OPENAI_IMAGE_KEY"],
     [patch.imageGen?.customApiKey, "OMB_CUSTOM_IMAGE_KEY"],
   ];
@@ -724,6 +817,7 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "BOX_TOKEN",
   "OPENCODE_API_KEY",
   "OMB_TTS_KEY",
+  "OMB_FISH_AUDIO_API_KEY",
   "OMB_OPENAI_IMAGE_KEY",
   "OMB_CUSTOM_IMAGE_KEY",
   "COMPOSIO_API_KEY",
@@ -837,6 +931,25 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
     }
     disk.instances = diskInstances;
   }
+  // Settings edits the workspace connection. Older fleet saves could freeze
+  // its inherited URL in the default instance, sending a replacement key to
+  // the previous endpoint. An explicit URL save reconnects that shared-key
+  // instance; custom connections and explicit instance patches stay intact.
+  if (checkedPatch.openaiCompat?.url !== undefined && checkedPatch.instances?.openaiCompat === undefined) {
+    const instances = jsonObjectSchema.safeParse(disk.instances);
+    const entry = jsonObjectSchema.safeParse(instances.success ? instances.data.openaiCompat : undefined);
+    const config = jsonObjectSchema.safeParse(entry.success ? entry.data.config : undefined);
+    const environment = jsonObjectSchema.safeParse(entry.success ? entry.data.environment : undefined);
+    if (entry.success && entry.data.driver === "openai-compat" && config.success
+      && !config.data.key
+      && (!config.data.apiKeyEnv || config.data.apiKeyEnv === "OPENAI_COMPAT_API_KEY")
+      && !(environment.success && Object.hasOwn(environment.data, "OPENAI_COMPAT_API_KEY"))) {
+      const nextConfig = { ...config.data };
+      delete nextConfig.url;
+      // Preserve raw extension fields elsewhere in this saved instance.
+      (disk.instances as JsonObject).openaiCompat = { ...entry.data, config: nextConfig };
+    }
+  }
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
 }
@@ -878,13 +991,16 @@ export function withInstanceCli(
   return { ok: true, config: next };
 }
 
-/** Materialize defaults without copying injected workspace secrets to disk. */
+/** Materialize defaults without freezing injected workspace settings or secrets. */
 export function persistableInstanceConfigs(cfg: AppConfig): InstanceConfigMap {
   const map = instanceConfigs(cfg);
   for (const [id, entry] of Object.entries(map)) {
     const environment = cfg.instances?.[id]?.environment;
     if (environment) entry.environment = { ...environment };
     else delete entry.environment;
+    const config = cfg.instances?.[id]?.config;
+    if (config !== undefined) entry.config = structuredClone(config);
+    else delete entry.config;
   }
   return map;
 }
@@ -1016,15 +1132,13 @@ export function instanceConfigs(cfg: AppConfig): InstanceConfigMap {
 
 // ── user-configured MCP servers ─────────────────────────────────────────
 // config.json: { "mcpServers": { "notes": { "command": "npx", "args":
-// ["-y", "@x/notes-mcp"], "env": { "NOTES_TOKEN": "…" } } } }
-// stdio only for now; validate-with-skip so one bad entry never takes the
-// fleet down, and each skip is logged once with a sentence that teaches.
+// ["-y", "@x/notes-mcp"], "env": { "NOTES_TOKEN": "…" } },
+//                                "docs": { "type": "http", "url": "https://…/mcp",
+// "headers": { "Authorization": "Bearer …" } } } }
+// Validate-with-skip so one bad entry never takes the fleet down, and each
+// skip is logged once with a sentence that teaches.
 
-export interface CustomMcpServer {
-  command: string;
-  args: string[];
-  env: Record<string, string>;
-}
+export type CustomMcpServer = McpServerSpec;
 
 const reportedMcpSkips = new Set<string>();
 function skipMcpEntry(name: string, why: string): void {
@@ -1041,21 +1155,15 @@ export function customMcpServers(cfg: AppConfig, only?: string[]): Record<string
     // a bot with its own list gets exactly those names; a bot without one
     // keeps getting every enabled server, as before this field existed
     if (only && !only.includes(name)) continue;
-    if (raw && typeof raw === "object" && "url" in raw) {
-      skipMcpEntry(name, 'only stdio servers ("command") are supported so far — HTTP transports are a planned follow-up');
-      continue;
-    }
     const parsed = parseStoredMcpServer(name, raw);
     if (!parsed.ok) {
-      skipMcpEntry(name, `${parsed.error} Expected { "command": "npx", "args": [...], "env": { ... } }`);
+      skipMcpEntry(name, `${parsed.error} Expected { "command": "npx", "args": [...], "env": { ... } } or { "type": "http", "url": "https://…", "headers": { ... } }`);
       continue;
     }
     if (!parsed.server.enabled) continue;
-    out[name] = {
-      command: parsed.server.command,
-      args: parsed.server.args,
-      env: parsed.server.env,
-    };
+    out[name] = isRemoteMcpServer(parsed.server)
+      ? { type: parsed.server.type, url: parsed.server.url, headers: parsed.server.headers }
+      : { command: parsed.server.command, args: parsed.server.args, env: parsed.server.env };
   }
   return out;
 }

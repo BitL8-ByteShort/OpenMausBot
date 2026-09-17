@@ -1090,6 +1090,29 @@ public struct CompanionClient: Sendable {
         try await send(try makeRequest("GET", "/api/tts/voices"), as: VoiceListResponse.self).voices
     }
 
+    /// Switch the voice engine. A provider is a setting, not a secret: it
+    /// rides the ordinary config write, and whichever credential the newly
+    /// selected engine needs appears beside it in settings.
+    public func setVoiceProvider(_ provider: VoiceProvider) async throws -> ConfigStatus {
+        try await send(
+            try makeRequest("PUT", "/api/config", body: ["tts": ["provider": provider.wireValue]]),
+            as: ConfigStatus.self
+        )
+    }
+
+    /// Save the Chatterbox address and model id in one write — an address
+    /// without its model (or the reverse) is half a setting, exactly as on
+    /// the desktop.
+    public func saveChatterboxServer(baseURL: String, model: String) async throws -> ConfigStatus {
+        try await send(
+            try makeRequest(
+                "PUT", "/api/config",
+                body: ["tts": ["baseUrl": baseURL, "model": model]]
+            ),
+            as: ConfigStatus.self
+        )
+    }
+
     public func routines() async throws -> (routines: [Routine], runs: [RoutineRun]) {
         let response = try await send(try makeRequest("GET", "/api/routines"), as: RoutinesResponse.self)
         return (response.routines, response.runs)
@@ -1478,6 +1501,15 @@ public struct CompanionClient: Sendable {
 
     public func renameTask(botId: String, threadId: String, title: String) async throws {
         try await send(try makeRequest("PATCH", "/api/bots/\(botId)/tasks/\(threadId)", body: ["title": title]))
+    }
+
+    /// Archive puts a thread away without deleting it; `nil` brings it
+    /// back. The server accepts any epoch timestamp to archive and JSON null
+    /// to unarchive, matching the desktop's thread row action.
+    public func archiveTask(botId: String, threadId: String, archivedAt: Double?) async throws {
+        try await send(try makeRequest("PATCH", "/api/bots/\(botId)/tasks/\(threadId)", body: [
+            "archivedAt": archivedAt ?? NSNull(),
+        ]))
     }
 
     public func deleteTask(botId: String, threadId: String) async throws -> Bot {

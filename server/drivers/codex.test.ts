@@ -43,6 +43,17 @@ describe("CodexDriver.decodeConfig", () => {
     // anything non-true is off — a truthy string must not enable full auto
     expect(CodexDriver.decodeConfig({ fullAuto: "yes" }).fullAuto).toBe(false);
   });
+
+  it("allows Company endpoints over HTTPS, and over HTTP only on loopback", () => {
+    expect(CodexDriver.decodeConfig({ managed: { url: "https://company.example/v1", models: ["m"] } }))
+      .toMatchObject({ managed: { url: "https://company.example/v1", models: ["m"] } });
+    expect(CodexDriver.decodeConfig({ managed: { url: "http://127.0.0.1:1/v1", models: ["m"] } }))
+      .toMatchObject({ managed: { url: "http://127.0.0.1:1/v1" } });
+    expect(CodexDriver.decodeConfig({ managed: { url: "http://localhost:1/v1", models: ["m"] } }))
+      .toMatchObject({ managed: { url: "http://localhost:1/v1" } });
+    expect(() => CodexDriver.decodeConfig({ managed: { url: "http://company.example/v1", models: ["m"] } }))
+      .toThrow("Invalid Company Codex endpoint.");
+  });
 });
 
 describe("Codex native diagnostic sanitization", () => {
@@ -73,15 +84,22 @@ describe("CodexDriver turns (fake app-server)", () => {
   let scratch: string;
 
   const create = async (
-    opts: { mode?: string; fullAuto?: boolean; environment?: Record<string, string> } = {},
+    opts: { mode?: string; fullAuto?: boolean; environment?: Record<string, string>; managed?: boolean } = {},
   ) => {
     if (opts.mode) process.env.FAKE_CODEX_MODE = opts.mode;
     instance = await CodexDriver.create({
       instanceId: "codex-test",
       displayName: "Codex Test",
-      environment: opts.environment ?? {},
+      environment: {
+        ...(opts.managed ? { HOME: scratch, USERPROFILE: scratch, CODEX_HOME: join(scratch, ".codex"), OPENMAUSBOT_COMPANY_API_KEY: "synthetic-company-fixture" } : {}),
+        ...opts.environment,
+      },
       enabled: true,
-      config: { cli: FAKE_CLI, fullAuto: opts.fullAuto ?? false },
+      config: {
+        cli: FAKE_CLI,
+        fullAuto: opts.fullAuto ?? false,
+        ...(opts.managed ? { managed: { url: "http://127.0.0.1:1/v1", models: ["company-codex-model"] } } : {}),
+      },
     });
     recorder = recordEvents(instance.adapter);
   };
@@ -94,13 +112,28 @@ describe("CodexDriver turns (fake app-server)", () => {
   afterEach(async () => {
     delete process.env.FAKE_CODEX_MODE;
     delete process.env.FAKE_CODEX_DUMP;
+    delete process.env.FAKE_CODEX_ASK_HOLD;
     delete process.env.FAKE_CODEX_TRANSIENTS;
     delete process.env.FAKE_CODEX_PARTIAL_FAILS;
     delete process.env.FAKE_CODEX_STATE;
     delete process.env.FAKE_CODEX_RETRY_SCALE;
+    delete process.env.FAKE_CODEX_LAUNCH_CRASHES;
+    delete process.env.FAKE_CODEX_LAUNCH_KILLS;
+    delete process.env.FAKE_CODEX_LAUNCH_SILENT;
+    delete process.env.FAKE_CODEX_ACK_CRASH;
+    delete process.env.FAKE_CODEX_EXIT_MID_TURN;
+    delete process.env.FAKE_CODEX_EXIT_MID_TURN_KILL;
     delete process.env.FAKE_CODEX_VERSION;
     delete process.env.FAKE_CODEX_ASTRA;
     delete process.env.FAKE_CODEX_INSTRUCTIONS;
+    delete process.env.FAKE_CODEX_RESUME_ERROR;
+    delete process.env.FAKE_CODEX_START_ERROR;
+    delete process.env.FAKE_CODEX_STEER_ERROR;
+    delete process.env.FAKE_CODEX_STEER_ERROR_FILE;
+    delete process.env.FAKE_CODEX_STEER_HANG;
+    delete process.env.FAKE_CODEX_STEER_TIMEOUT_MS;
+    delete process.env.FAKE_CODEX_INTERRUPT_SILENT;
+    delete process.env.FAKE_CODEX_INTERRUPT_GRACE_MS;
     delete process.env.OPENAI_API_KEY;
     delete process.env.BOX_TOKEN;
     delete process.env.OMB_TTS_KEY;
@@ -172,6 +205,9 @@ describe("CodexDriver turns (fake app-server)", () => {
       input: 7,
       output: 3,
       cachedInput: 4,
+      // the last call's prompt and the window it sat in
+      contextTokens: 7,
+      contextWindow: 272000,
     });
     expect(recorder.events.filter((event) => event.itemId === "w1")).toMatchObject([
       { type: "item.started", itemType: "tool", title: "web_search" },
@@ -607,6 +643,39 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(argv).not.toContain('mcp_servers.notes.default_tools_approval_mode');
   });
 
+  it("mounts a url server for codex to connect to, header values off argv", async () => {
+    await create();
+    const dump = join(scratch, "remote-mcp.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-remote-mcp",
+      text: "go",
+      integrations: {
+        custom: {
+          docs: { type: "http", url: "https://docs.example/mcp", headers: { Authorization: "Bearer tok-docs", "X-Org": "acme" } },
+          // codex has no SSE transport; the entry stays with Claude bots
+          legacy: { type: "sse", url: "https://old.example/sse", headers: {} },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    const argv = seen.argv.join(" ");
+    expect(seen.argv).toContain('mcp_servers.docs.url="https://docs.example/mcp"');
+    // header values are credentials: the child env holds them under
+    // harness names, argv names only the variables — the bearer token via
+    // codex's own bearer setting, other headers via env_http_headers
+    expect(seen.argv).toContain('mcp_servers.docs.bearer_token_env_var="OMB_MCP_HEADER_DOCS_BEARER"');
+    expect(seen.argv).toContain('mcp_servers.docs.env_http_headers={ "X-Org" = "OMB_MCP_HEADER_DOCS_1" }');
+    expect(argv).not.toContain("tok-docs");
+    expect(seen.env.OMB_MCP_HEADER_DOCS_BEARER).toBe("tok-docs");
+    expect(seen.env.OMB_MCP_HEADER_DOCS_1).toBe("acme");
+    // a user server keeps codex's on-request approval policy
+    expect(argv).not.toContain("mcp_servers.docs.default_tools_approval_mode");
+    expect(argv).not.toContain("mcp_servers.legacy");
+  });
+
   it("does not let a custom MCP server capture a built-in capability variable", async () => {
     await create();
     await expect(instance.adapter.sendTurn({
@@ -665,6 +734,42 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(instance.adapter.capabilities.agentsMcp).toBe(true);
   });
 
+  it.each(["ask", "auto"] as const)("pre-allows the built-in browser while preserving the native %s reviewer", async (approvalMode) => {
+    await create();
+    const dump = join(scratch, "browser.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-browser",
+      text: "open the built-in browser",
+      approvalMode,
+      integrations: {
+        browser: {
+          command: process.execPath,
+          args: ["/tmp/browser-proxy.js"],
+          env: {
+            OMB_HARNESS_URL: "http://127.0.0.1:8799",
+            OMB_BROWSER_TOKEN: "browser-capability-secret",
+          },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.argv.join(" ")).toContain("mcp_servers.browser.command");
+    expect(seen.argv).toContain('mcp_servers.browser.default_tools_approval_mode="auto"');
+    expect(seen.argv.join(" ")).toContain("/tmp/browser-proxy.js");
+    expect(seen.argv.join(" ")).not.toContain("browser-capability-secret");
+    expect(seen.env.OMB_BROWSER_TOKEN).toBe("browser-capability-secret");
+    for (const method of ["thread/start", "turn/start"]) {
+      expect(seen.calls.find((call: { method: string }) => call.method === method)?.params).toMatchObject({
+        approvalPolicy: "on-request",
+        approvalsReviewer: approvalMode === "auto" ? "auto_review" : "user",
+      });
+    }
+  });
+
   it("mounts the Local VM computer MCP server without placing credentials in argv", async () => {
     await create();
     const dump = join(scratch, "local-computer.json");
@@ -692,28 +797,6 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(seen.env.OMB_VM_TOKEN).toBe("vm-secret");
   });
 
-  it("mounts the remote computer proxy without placing its token in argv", async () => {
-    await create();
-    const dump = join(scratch, "remote-computer.json");
-    process.env.FAKE_CODEX_DUMP = dump;
-
-    await instance.adapter.sendTurn({
-      threadId: "t-remote-computer",
-      text: "take a screenshot",
-      integrations: {
-        computer: { boxId: "box-123", token: "remote-secret" },
-      },
-    });
-    await recorder.until((event) => event.type === "turn.completed");
-
-    const seen = JSON.parse(readFileSync(dump, "utf8"));
-    expect(seen.argv.join(" ")).toContain("mcp_servers.computer.command");
-    expect(seen.argv.join(" ")).toContain("computer-proxy");
-    expect(seen.argv.join(" ")).toContain("OGB_BOX_TOKEN");
-    expect(seen.argv.join(" ")).not.toContain("remote-secret");
-    expect(seen.env.OGB_BOX_ID).toBe("box-123");
-    expect(seen.env.OGB_BOX_TOKEN).toBe("remote-secret");
-  });
 
   it("sends the local provider when the picker id is custom-encoded", async () => {
     await create({ environment: { UNSLOTH_STUDIO_AUTH_TOKEN: "unsloth-secret" } });
@@ -790,9 +873,173 @@ describe("CodexDriver turns (fake app-server)", () => {
 
   it("fails a rejected resume without silently replacing native history", async () => {
     await create(); // fake rejects thread/resume outside resume mode
-    await instance.adapter.sendTurn({ threadId: "t-fallback", text: "go", resumeCursor: "gone-thread" });
+    const dump = join(scratch, "personal-missing-thread.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "t-fallback", text: "go", resumeCursor: "gone-thread", recoveryText: "Previous messages\nUser: go" });
     await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: false });
     expect(recorder.events.some((e) => e.type === "session.started")).toBe(false);
+    expect(JSON.parse(readFileSync(dump, "utf8")).calls.map((call: { method: string }) => call.method)).not.toContain("thread/start");
+  });
+
+  it("names the missing Company model prerequisites instead of one blanket refusal", async () => {
+    await create({ managed: true });
+    await expect(instance.adapter.sendTurn({ threadId: "company-no-model", text: "hi" }))
+      .rejects.toThrow("no model is selected");
+    await expect(instance.adapter.sendTurn({ threadId: "company-off-list-model", text: "hi", model: "personal-model" }))
+      .rejects.toThrow("personal-model is not approved for your organization");
+  });
+
+  it("names a missing Company API key or CODEX_HOME instead of one blanket refusal", async () => {
+    await create({ managed: true, environment: { OPENMAUSBOT_COMPANY_API_KEY: "" } });
+    await expect(instance.adapter.sendTurn({ threadId: "company-no-key", text: "hi", model: "company-codex-model" }))
+      .rejects.toThrow("OPENMAUSBOT_COMPANY_API_KEY is missing");
+    await create({ managed: true, environment: { CODEX_HOME: "" } });
+    await expect(instance.adapter.sendTurn({ threadId: "company-no-home", text: "hi", model: "company-codex-model" }))
+      .rejects.toThrow("CODEX_HOME is missing");
+  });
+
+  it("rebuilds a missing Company native thread once with its approved model and canonical history", async () => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-missing-thread.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    const recoveryText = "User: Remember ALPHA.\nAssistant: Remembered.\nUser: What did I say?";
+    const imagePath = join(scratch, "current-image.png");
+    await instance.adapter.sendTurn({
+      threadId: "company-missing-thread", text: "What did I say?", resumeCursor: "gone-company-thread",
+      recoveryText, model: "company-codex-model", system: "Keep current bot rules.", approvalMode: "full",
+      cwd: scratch, images: [{ path: imagePath, mime: "image/png", bytes: 1 }],
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.calls.map((call: { method: string }) => call.method)).toEqual([
+      "initialize", "initialized", "config/read", "thread/resume", "thread/start", "turn/start",
+    ]);
+    expect(seen.calls.find((call: { method: string }) => call.method === "thread/start").params).toMatchObject({
+      model: "company-codex-model", modelProvider: "openmaus_company", cwd: scratch,
+      developerInstructions: expect.stringContaining("Keep current bot rules."),
+      approvalPolicy: "never", sandbox: "danger-full-access", ephemeral: false,
+    });
+    expect(seen.calls.find((call: { method: string }) => call.method === "turn/start").params).toMatchObject({
+      threadId: "codex-thread-1",
+      input: [{ type: "text", text: recoveryText }, { type: "localImage", path: imagePath }],
+    });
+    expect(seen.argv).toContain('model_provider="openmaus_company"');
+    expect(JSON.stringify(seen.argv)).not.toContain("synthetic-company-fixture");
+    expect(recorder.events.filter((event) => event.type === "session.started")).toMatchObject([{ sessionId: "codex-thread-1", rebuilt: true }]);
+  });
+
+  it("rebuilds a missing personal thread only for a turn whose recovery text is the replay it would have had", async () => {
+    await create();
+    const dump = join(scratch, "personal-missing-replay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    const recoveryText = "[This conversation received an update outside your provider session.]\nUser: go";
+    await instance.adapter.sendTurn({ threadId: "t-personal-replay", text: "go", resumeCursor: "gone-thread", recoveryText, recoveryIsReplay: true });
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(calls.find((call: { method: string }) => call.method === "turn/start").params.input).toEqual([{ type: "text", text: recoveryText }]);
+    expect(recorder.events.filter((e) => e.type === "session.started")).toMatchObject([{ rebuilt: true }]);
+  });
+
+  it("does not announce a rebuilt Company thread when the recovery text is the turn itself", async () => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-no-replay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "company-no-replay", text: "Continue", resumeCursor: "gone-company-thread",
+      recoveryText: "Continue", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(recorder.events.filter((event) => event.type === "session.started").at(-1)).not.toMatchObject({ rebuilt: true });
+  });
+
+  it("keeps successful Company resumes native without replaying the canonical transcript", async () => {
+    await create({ managed: true, mode: "resume" });
+    const dump = join(scratch, "company-resume.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "company-resume", text: "Continue", resumeCursor: "company-existing-thread",
+      recoveryText: "Old history must not be replayed", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).not.toContain("thread/start");
+    expect(calls.find((call: { method: string }) => call.method === "turn/start").params.input).toEqual([{ type: "text", text: "Continue" }]);
+  });
+
+  it.each([undefined, "", "  \n"])("does not replace missing Company native history without canonical recovery text (%j)", async (recoveryText) => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-no-recovery.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({ threadId: "company-no-recovery", text: "Continue", resumeCursor: "gone-thread", recoveryText, model: "company-codex-model" });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: false });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.some((call: { method: string }) => ["thread/start", "turn/start"].includes(call.method))).toBe(false);
+  });
+
+  it.each([
+    { code: -32603, message: "401 Unauthorized: missing bearer" },
+    { code: -32603, message: "503: This task was blocked by our safety systems." },
+    { code: -32603, message: "network error: connection reset" },
+    { code: -32600, message: "404 endpoint not found" },
+    { code: -32600, message: "no rollout found for thread id another-thread" },
+    { code: -32603, message: "no rollout found for thread id gone-thread" },
+    { code: -32600, message: "thread not found in an unrelated provider response" },
+  ])("does not rebuild Company history on an unrelated resume rejection: $message", async (error) => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-rejected-resume.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_RESUME_ERROR = JSON.stringify(error);
+    process.env.FAKE_CODEX_RETRY_SCALE = "0.001";
+    await instance.adapter.sendTurn({
+      threadId: "company-rejected-resume", text: "Continue", resumeCursor: "gone-thread",
+      recoveryText: "History\nUser: Continue", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: false });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.some((call: { method: string }) => ["thread/start", "turn/start"].includes(call.method))).toBe(false);
+    expect(recorder.events.some((event) => event.type === "session.started")).toBe(false);
+  });
+
+  it("does not repeatedly rebuild Company history when the replacement start fails", async () => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-failed-recovery.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_START_ERROR = JSON.stringify({ code: -32603, message: "503: unavailable" });
+    process.env.FAKE_CODEX_RETRY_SCALE = "0.001";
+    await instance.adapter.sendTurn({
+      threadId: "company-failed-recovery", text: "Continue", resumeCursor: "gone-thread",
+      recoveryText: "History\nUser: Continue", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: false });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.filter((call: { method: string }) => call.method === "thread/start")).toHaveLength(1);
+    expect(calls.some((call: { method: string }) => call.method === "turn/start")).toBe(false);
+    expect(recorder.events.some((event) => event.type === "turn.retrying")).toBe(false);
+  });
+
+  it.each(["happy", "resume-then-missing"])("never rebuilds Company history again after user submission (%s)", async (mode) => {
+    await create({ managed: true, mode });
+    const dump = join(scratch, "company-submitted-turn.json");
+    const attempts = join(scratch, "company-submitted-attempts");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_TRANSIENTS = "1";
+    process.env.FAKE_CODEX_STATE = attempts;
+    process.env.FAKE_CODEX_RETRY_SCALE = "0.001";
+    await instance.adapter.sendTurn({
+      threadId: "company-submitted-turn", text: "Continue", resumeCursor: "gone-thread",
+      recoveryText: "History\nUser: Continue", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: false });
+    expect(readFileSync(attempts, "utf8")).toBe("1");
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    // happy first rebuilds then fails at turn/start; resume-then-missing first
+    // submits against native history, so its later missing-thread error cannot
+    // justify replaying that potentially accepted prompt into a fresh session.
+    expect(calls.filter((call: { method: string }) => call.method === "thread/start")).toHaveLength(mode === "happy" ? 1 : 0);
+    expect(recorder.events.filter((event) => event.type === "turn.retrying")).toHaveLength(mode === "happy" ? 0 : 1);
   });
 
   it("fails before user submission if native instruction updates are unsupported", async () => {
@@ -890,6 +1137,116 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "turn.completed");
     // legacy method name → legacy decision vocabulary
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
+  });
+
+  it("answers a single-question ask and keeps its reply scoped to that question", async () => {
+    await create({ mode: "question" });
+    const dump = join(scratch, "question-single.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-question-single", text: "ask me" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "question",
+      tool: "ask_user",
+      summary: "Ship today?",
+      // six options offered; the card keeps its five-row ceiling
+      choices: ["Yes", "No", "Maybe", "Later", "Soon"],
+    });
+
+    await instance.adapter.respondToRequest("t-question-single", opened.requestId!, { behavior: "answer", message: "Yes" });
+    const resolved = await recorder.until((e) => e.type === "request.resolved");
+    expect(resolved).toMatchObject({ behavior: "answer", source: "user" });
+
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({
+      answers: { "q-ship": { answers: ["Yes"] } },
+    });
+  });
+
+  it("refuses a bundled multi-question ask instead of copying one answer into every question (#1237)", async () => {
+    await create({ mode: "multi-question" });
+    const dump = join(scratch, "question-multi.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-question-multi", text: "ask me twice" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    // no card may open: one card cannot carry two questions honestly
+    expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
+    const decision = JSON.parse(readFileSync(dump, "utf8")).decision;
+    expect(decision.error.code).toBe(-32602);
+    expect(decision.error.message).toContain("one question");
+    expect(decision.error.message).toContain("2");
+  });
+
+  it("refuses an empty ask instead of opening a card with nothing to answer", async () => {
+    await create({ mode: "empty-question" });
+    const dump = join(scratch, "question-empty.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-question-empty", text: "ask me nothing" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    // no card may open: there is no question to answer
+    expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
+    const decision = JSON.parse(readFileSync(dump, "utf8")).decision;
+    expect(decision.error.code).toBe(-32602);
+    expect(decision.error.message).toContain("sent none");
+  });
+
+  it("refuses a malformed ask payload instead of opening an empty card", async () => {
+    await create({ mode: "malformed-question" });
+    const dump = join(scratch, "question-malformed.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-question-malformed", text: "ask me wrongly" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    // no card may open: there is no honest question shape to answer
+    expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
+    const decision = JSON.parse(readFileSync(dump, "utf8")).decision;
+    expect(decision.error.code).toBe(-32602);
+    expect(decision.error.message).toContain("must be an array");
+  });
+
+  it("maps a timed-out ask to the timeout note for its one question", async () => {
+    // Hold the ask reply without completing the turn: a completed turn
+    // starts the driver's child-reap loop, whose 25ms setTimeout poll would
+    // freeze on the fake clock and strand the teardown.
+    process.env.FAKE_CODEX_ASK_HOLD = "1";
+    await create({ mode: "question" });
+    const dump = join(scratch, "question-timeout.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-question-timeout", text: "ask me" });
+      const opened = await recorder.until((e) => e.type === "request.opened");
+      await vi.advanceTimersByTimeAsync(15 * 60_000);
+
+      const resolved = await recorder.until((e) => e.type === "request.resolved" && e.requestId === opened.requestId);
+      expect(resolved).toMatchObject({ behavior: "answer", source: "timeout" });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // The held fake records the answers it received once real time lets the
+    // child parse the reply; the turn is still open by design.
+    let decision: unknown = null;
+    for (let i = 0; i < 80 && (decision === null || decision === undefined); i++) {
+      try {
+        decision = JSON.parse(readFileSync(dump, "utf8")).decision;
+      } catch {
+        // The fake has not written the dump yet.
+      }
+      if (decision === null || decision === undefined) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    }
+    expect(decision).toEqual({
+      answers: { "q-ship": { answers: ["No answer was given — use your best judgment."] } },
+    });
   });
 
   it("answers Codex 0.149 MCP elicitation with the MCP result shape", async () => {
@@ -1079,6 +1436,140 @@ describe("CodexDriver turns (fake app-server)", () => {
     await instance.adapter.interruptTurn("t-busy");
     await recorder.until((e) => e.type === "turn.completed");
   });
+
+  it("steers the running turn through turn/steer without killing the child", async () => {
+    const dump = join(scratch, "codex-steer.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await create({ mode: "approval" }); // parks the turn open mid-flight
+    expect(instance.adapter.capabilities.queueing).toBe(true);
+
+    await instance.adapter.sendTurn({ threadId: "t-codex-steer", text: "one" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    await expect(instance.adapter.steer?.("t-codex-steer", "and also this")).resolves.toBe("steered");
+
+    const snapshot = JSON.parse(readFileSync(dump, "utf8"));
+    expect(snapshot.calls.find((c: any) => c.method === "turn/steer")?.params).toEqual({
+      threadId: "codex-thread-1",
+      input: [{ type: "text", text: "and also this" }],
+      expectedTurnId: "turn-1",
+    });
+    // steering is mid-turn input, never a kill: the child survives it
+    expect(processIsAlive(snapshot.pid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+
+    // the steered turn still settles through its own protocol flow
+    await instance.adapter.respondToRequest("t-codex-steer", opened.requestId!, { behavior: "deny" });
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    await expect.poll(() => processIsAlive(snapshot.pid), { timeout: 5_000 }).toBe(false);
+  }, 20_000);
+
+  it("reports an explicitly refused steer as refused so the caller queues, and keeps the child alive", async () => {
+    const dump = join(scratch, "codex-steer-refused.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_STEER_ERROR = JSON.stringify({ code: -32000, message: "active turn is not steerable" });
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-steer-refused", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await expect(instance.adapter.steer?.("t-codex-steer-refused", "queued words")).resolves.toBe("refused");
+    expect(processIsAlive(JSON.parse(readFileSync(dump, "utf8")).pid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+
+    await instance.adapter.interruptTurn("t-codex-steer-refused");
+    await recorder.until((e) => e.type === "turn.completed");
+  }, 20_000);
+
+  it("a refused steer queues, and the follow-up turn needs no mid-turn kill", async () => {
+    // killCliTree legitimately reaps the catalog probe and a finished turn server;
+    // a queue path must never kill the child that owns the running turn.
+    const dump = join(scratch, "codex-queue-nokill.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_STEER_ERROR = JSON.stringify({ code: -32000, message: "active turn is not steerable" });
+    const kills = vi.spyOn(procs, "killCliTree");
+    const killed = (pid: number) => kills.mock.calls.some((c: any[]) => c[0]?.pid === pid);
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-queue-nokill", text: "one" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    const turnPid = JSON.parse(readFileSync(dump, "utf8")).pid;
+    // the queue trigger is a refused steer: the turn child stays alive, unkilled
+    await expect(instance.adapter.steer?.("t-codex-queue-nokill", "queued words")).resolves.toBe("refused");
+    expect(killed(turnPid)).toBe(false);
+    expect(processIsAlive(turnPid)).toBe(true);
+    await instance.adapter.respondToRequest("t-codex-queue-nokill", opened.requestId!, { behavior: "deny" });
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    // the drained queue runs as its own turn: fresh child, still no mid-turn kill
+    await instance.adapter.sendTurn({ threadId: "t-codex-queue-nokill", text: "queued words" });
+    await recorder.until((e) => e.type === "turn.started");
+    // the fresh app-server writes its dump pid only once it serves a message.
+    // Take the pid from inside the wait: a second, un-polled read here raced
+    // the fake's next rewrite of the dump and blew up on Windows.
+    let drainPid = turnPid;
+    await expect.poll(() => (drainPid = JSON.parse(readFileSync(dump, "utf8")).pid), { timeout: 5_000 }).not.toBe(turnPid);
+    expect(killed(drainPid)).toBe(false);
+    expect(processIsAlive(drainPid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    await instance.adapter.interruptTurn("t-codex-queue-nokill");
+    await recorder.until((e) => e.type === "turn.completed");
+    kills.mockRestore();
+  }, 20_000);
+
+  it("steer is refused with no running turn", async () => {
+    await create();
+    await expect(instance.adapter.steer?.("t-codex-idle", "hi")).resolves.toBe("refused");
+  });
+
+  it("a steer that times out after delivery is indeterminate, never a re-queueable refusal", async () => {
+    const dump = join(scratch, "codex-steer-hang.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    // The fake accepts turn/steer and never answers: delivery happened, the
+    // reply is lost. Re-queueing these words would run them twice.
+    process.env.FAKE_CODEX_STEER_HANG = "1";
+    process.env.FAKE_CODEX_STEER_TIMEOUT_MS = "150";
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-steer-hang", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await expect(instance.adapter.steer?.("t-codex-steer-hang", "maybe folded words")).resolves.toBe("indeterminate");
+    // nothing was killed and no error surfaced: the turn keeps running
+    expect(processIsAlive(JSON.parse(readFileSync(dump, "utf8")).pid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+
+    await instance.adapter.interruptTurn("t-codex-steer-hang");
+    await recorder.until((e) => e.type === "turn.completed");
+  }, 20_000);
+
+  it("Stop interrupts through the protocol and reports no signal error", async () => {
+    const dump = join(scratch, "codex-interrupt.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-stop-clean", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await instance.adapter.interruptTurn("t-codex-stop-clean");
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({
+      ok: false,
+      stopReason: "interrupted",
+    });
+    expect(JSON.parse(readFileSync(dump, "utf8")).calls.some((c: any) => c.method === "turn/interrupt")).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+  }, 20_000);
+
+  it("escalates to a kill when the server ignores turn/interrupt, still without the signal error", async () => {
+    process.env.FAKE_CODEX_DUMP = join(scratch, "codex-interrupt-silent.json");
+    process.env.FAKE_CODEX_INTERRUPT_SILENT = "1";
+    process.env.FAKE_CODEX_INTERRUPT_GRACE_MS = "60";
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-stop-wedged", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await instance.adapter.interruptTurn("t-codex-stop-wedged");
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({
+      ok: false,
+      stopReason: "interrupted",
+    });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+  }, 20_000);
 
   it.each([false, true])("keeps ownership after an uncertain stop even when root close arrives (before failure: %s)", async (closeFirst) => {
     await create();
@@ -1293,6 +1784,24 @@ describe("CodexDriver turns (fake app-server)", () => {
     await Promise.allSettled([first, second]);
   }, 20_000);
 
+  it("an interrupt during the retry backoff settles the turn at once, not after the wait", async () => {
+    process.env.FAKE_CODEX_TRANSIENTS = "9";
+    process.env.FAKE_CODEX_STATE = join(scratch, "codex-launches-cancel-backoff");
+    process.env.FAKE_CODEX_RETRY_SCALE = "60"; // long backoff — we cancel inside it
+    await create();
+    const turn = instance.adapter.sendTurn({ threadId: "t-codex-cancel-backoff", text: "hi" });
+    await recorder.until((e) => e.type === "turn.retrying");
+    await instance.adapter.interruptTurn("t-codex-cancel-backoff");
+
+    const done = await Promise.race([
+      recorder.until((e) => e.type === "turn.completed"),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+    ]);
+    expect(done).toMatchObject({ ok: false, stopReason: "interrupted" });
+    expect(recorder.events.filter((e) => e.type === "turn.retrying")).toHaveLength(1);
+    await turn;
+  }, 20_000);
+
   it("never retries after agent text already streamed (duplicate-text hazard)", async () => {
     process.env.FAKE_CODEX_TRANSIENTS = "1";
     process.env.FAKE_CODEX_PARTIAL_FAILS = "1";
@@ -1307,6 +1816,181 @@ describe("CodexDriver turns (fake app-server)", () => {
   }, 20_000);
 
 
+  it("retries a transient app-server crash before the turn starts", async () => {
+    process.env.FAKE_CODEX_LAUNCH_CRASHES = "1";
+    process.env.FAKE_CODEX_STATE = join(scratch, "codex-launch-crash");
+    process.env.FAKE_CODEX_RETRY_SCALE = "0.001";
+    try {
+      await create();
+      await instance.adapter.sendTurn({ threadId: "t-codex-launch-crash", text: "hi" });
+      await recorder.until((e) => e.type === "turn.completed" && e.ok === true);
+      const retries = recorder.events.filter((e) => e.type === "turn.retrying");
+      expect(retries.map((e) => e.attempt)).toEqual([1]);
+      expect(recorder.events.filter((e) => e.type === "turn.started")).toHaveLength(1);
+      // exactly one settled reply across both app-server launches
+      const replies = recorder.events.filter((e) => e.type === "item.completed" && e.itemType === "assistant_text");
+      expect(replies).toHaveLength(1);
+    } finally {
+      delete process.env.FAKE_CODEX_LAUNCH_CRASHES;
+      delete process.env.FAKE_CODEX_STATE;
+      delete process.env.FAKE_CODEX_RETRY_SCALE;
+    }
+  }, 20_000);
+  it("never replays a turn after turn/start was acknowledged, even for a transient-looking exit", async () => {
+    const ackGate = join(scratch, "ack-crash-gate");
+    process.env.FAKE_CODEX_ACK_CRASH = ackGate;
+    // The fake holds its crash until the test confirms the driver parsed
+    // the ack. stdout and stderr are separate pipes, so only the reader
+    // can order them: this listener runs in the same synchronous dispatch
+    // as the driver's own stdout handler, and the fake polls the gate file
+    // on a later turn — the crash stderr can never overtake the parsed ack,
+    // no matter how loaded the runner is.
+    const realSpawnCli = procs.spawnCli;
+    const spawnSpy = vi.spyOn(procs, "spawnCli").mockImplementation((...args: Parameters<typeof procs.spawnCli>) => {
+      const child = realSpawnCli(...args);
+      let stdoutSeen = "";
+      child.stdout.on("data", (c: Buffer) => {
+        stdoutSeen += c.toString();
+        if (stdoutSeen.includes(`"result":{"turn":{"id":"turn-1"}}`)) writeFileSync(ackGate, "");
+      });
+      return child;
+    });
+    try {
+      await create();
+      await instance.adapter.sendTurn({ threadId: "t-codex-ack-crash", text: "hi" });
+      const done = await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
+      expect(done).toMatchObject({ stopReason: "exit_before_result" });
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+      const error = recorder.events.find((e) => e.type === "runtime.error");
+      expect(error?.message).toContain("connection reset");
+    } finally {
+      spawnSpy.mockRestore();
+      delete process.env.FAKE_CODEX_ACK_CRASH;
+    }
+  }, 20_000);
+  it("does not blame stale stderr when the app-server is killed mid-turn", async () => {
+    const stderrGate = join(scratch, "exit-mid-turn-stderr-gate");
+    const killGate = join(scratch, "exit-mid-turn-kill-gate");
+    process.env.FAKE_CODEX_EXIT_MID_TURN = stderrGate;
+    process.env.FAKE_CODEX_EXIT_MID_TURN_KILL = killGate;
+    // The fake writes the stale 426 first, then holds its stdout until this
+    // test confirms the driver read that stderr chunk, and finally holds the
+    // kill until the reasoning delta was parsed. The gate file is only
+    // visible to the fake on a later event-loop turn, by which time the
+    // driver's own stderr listener (same synchronous dispatch) has run —
+    // the stale line is consumed before any stdout parse can reset the
+    // recent-stderr window, deterministically.
+    const realSpawnCli = procs.spawnCli;
+    const spawnSpy = vi.spyOn(procs, "spawnCli").mockImplementation((...args: Parameters<typeof procs.spawnCli>) => {
+      const child = realSpawnCli(...args);
+      child.stderr.on("data", (c: Buffer) => {
+        if (c.toString().includes("426")) writeFileSync(stderrGate, "");
+      });
+      return child;
+    });
+    try {
+      await create();
+      await instance.adapter.sendTurn({ threadId: "t-codex-exit-mid-turn", text: "hi" });
+      await recorder.until((e) => e.type === "content.delta" && e.streamKind === "reasoning_text");
+      writeFileSync(killGate, "");
+      const done = await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
+      expect(done).toMatchObject({ stopReason: "exit_before_result" });
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+      const error = recorder.events.find((e) => e.type === "runtime.error");
+      // Windows has no signals: the kill lands as TerminateProcess, so the
+      // close event carries exit code 1 and signal null. The invariants —
+      // settled exit, no retry, no stale-426 blame — hold everywhere; only
+      // the exit wording is platform-shaped.
+      const exitWording = process.platform === "win32" ? "codex exited 1 before turn/completed" : "signal SIGKILL";
+      expect(error?.message).toContain(exitWording);
+      expect(error?.message).toContain("no stderr after the last app-server output");
+      expect(error?.message).not.toContain("426");
+    } finally {
+      spawnSpy.mockRestore();
+      delete process.env.FAKE_CODEX_EXIT_MID_TURN;
+      delete process.env.FAKE_CODEX_EXIT_MID_TURN_KILL;
+    }
+  }, 20_000);
+  // POSIX-only: win32 turns process.kill into TerminateProcess (exit code
+  // 1, signal null), so a signal close event cannot be produced there at
+  // all. The silent-exit test below covers the classification path win32
+  // can reach, and the mid-turn test splits its wording by platform.
+  (process.platform === "win32" ? it.skip : it)("treats a signal-killed app-server as terminal even with transient stderr", async () => {
+    process.env.FAKE_CODEX_LAUNCH_KILLS = "1";
+    const stateFile = join(scratch, "launch-kills.json");
+    process.env.FAKE_CODEX_STATE = stateFile;
+    try {
+      await create();
+      await instance.adapter.sendTurn({ threadId: "t-codex-launch-kill", text: "hi" });
+      const done = await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
+      expect(done).toMatchObject({ stopReason: "exit_before_result" });
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+      const error = recorder.events.find((e) => e.type === "runtime.error");
+      expect(error?.message).toContain("signal SIGKILL");
+      expect(readFileSync(stateFile, "utf8")).toBe("1");
+    } finally {
+      delete process.env.FAKE_CODEX_LAUNCH_KILLS;
+      delete process.env.FAKE_CODEX_STATE;
+    }
+  }, 20_000);
+  it("treats a silent pre-ack exit as terminal instead of retrying off lifetime stderr", async () => {
+    process.env.FAKE_CODEX_LAUNCH_SILENT = "1";
+    const stateFile = join(scratch, "launch-silent.json");
+    process.env.FAKE_CODEX_STATE = stateFile;
+    try {
+      await create();
+      await instance.adapter.sendTurn({ threadId: "t-codex-launch-silent", text: "hi" });
+      const done = await recorder.until((e) => e.type === "turn.completed" && e.ok === false);
+      expect(done).toMatchObject({ stopReason: "exit_before_result" });
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+      const error = recorder.events.find((e) => e.type === "runtime.error");
+      expect(error?.message).toContain("codex exited 1 before turn/completed");
+      expect(readFileSync(stateFile, "utf8")).toBe("1");
+    } finally {
+      delete process.env.FAKE_CODEX_LAUNCH_SILENT;
+      delete process.env.FAKE_CODEX_STATE;
+    }
+  }, 20_000);
+  it("does not announce a retry when Stop races a transient handshake failure", async () => {
+    process.env.FAKE_CODEX_TRANSIENTS = "1";
+    const stateFile = join(scratch, "stop-race.json");
+    process.env.FAKE_CODEX_STATE = stateFile;
+    process.env.FAKE_CODEX_RETRY_SCALE = "0.01";
+    try {
+      await create();
+      await instance.adapter.sendTurn({ threadId: "t-codex-stop-race", text: "hi" });
+      await recorder.until((e) => e.type === "session.started");
+      await instance.adapter.interruptTurn("t-codex-stop-race");
+      await recorder.until((e) => e.type === "turn.completed");
+      expect(recorder.events.some((e) => e.type === "turn.retrying")).toBe(false);
+    } finally {
+      delete process.env.FAKE_CODEX_TRANSIENTS;
+      delete process.env.FAKE_CODEX_STATE;
+      delete process.env.FAKE_CODEX_RETRY_SCALE;
+    }
+  }, 20_000);
+  it.each(["start", "resume"] as const)(
+    "banks this turn's usage after a coalesced thread/%s response and restored usage notification",
+    async (mode) => {
+      process.env.FAKE_CODEX_RESTORED_USAGE = "1";
+      try {
+        await create({ mode: mode === "resume" ? "resume" : undefined });
+        await instance.adapter.sendTurn({
+          threadId: `t-codex-restored-usage-${mode}`, text: "hi",
+          ...(mode === "resume" ? { resumeCursor: "codex-thread-1" } : {}),
+        });
+        await recorder.until((e) => e.type === "turn.completed");
+        // the running indicator still shows the process total …
+        expect(recorder.events.find((e) => e.type === "thread.token-usage.updated")).toMatchObject({ input: 107, output: 13, cachedInput: 54 });
+        // … but the banked figure is this turn alone, not the whole thread again
+        expect(recorder.events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 7, output: 3, cachedInput: 4 } });
+        // the restored total that arrived before turn/start is a baseline, not an indicator reading
+        expect(recorder.events.filter((e) => e.type === "thread.token-usage.updated")).toHaveLength(1);
+      } finally {
+        delete process.env.FAKE_CODEX_RESTORED_USAGE;
+      }
+    },
+  );
   it("uses the explicit login command from the official Codex flow", () => {
     expect(CodexDriver.install?.signInCommand).toBe("codex login");
   });
