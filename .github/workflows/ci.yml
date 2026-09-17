@@ -57,18 +57,20 @@ jobs:
     # vitest splits the file list deterministically across shards, so a
     # failure names the same shard on every run and one shard is reproducible
     # locally with the same --shard flag.
-    name: vitest (${{ matrix.os }}, shard ${{ matrix.shard }}/3)
+    name: vitest (${{ matrix.os }}, shard ${{ matrix.shard }}/4)
     strategy:
       fail-fast: false
       matrix:
         # The harness and pure desktop capabilities stay portable across all
         # supported host platforms. POSIX-only process tests self-skip.
         os: [macos-latest, ubuntu-latest, windows-latest]
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4]
     runs-on: ${{ matrix.os }}
-    # A shard is a third of a ~19-minute suite plus setup. The cap catches a
-    # hang, not normal growth; raise it with the suite, or add a shard.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 15 }}
+    # vitest splits by file count, not by duration, so the shard holding the
+    # heavy e2e files ran 13 minutes on macOS/Ubuntu and 19 on Windows with
+    # three shards; four keeps the heaviest near 10 and 15. The cap catches a
+    # hang, not normal growth: raise it with the suite, or add a shard.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 25 || 20 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
@@ -86,7 +88,7 @@ jobs:
         # The github-actions reporter turns each failure into an annotation
         # on the PR, so the failing test and its assertion are readable
         # without opening the job log.
-        run: pnpm exec vitest run --shard=${{ matrix.shard }}/3 --reporter=default --reporter=github-actions
+        run: pnpm exec vitest run --shard=${{ matrix.shard }}/4 --reporter=default --reporter=github-actions
       - name: Broker and Electron unit tests
         if: matrix.shard == 1
         run: pnpm broker:test && pnpm test:electron

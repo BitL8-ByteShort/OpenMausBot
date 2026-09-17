@@ -33,7 +33,7 @@ pnpm dev:desktop   # Electron shell (macOS/Ubuntu; keep server + Vite running)
 pnpm typecheck     # app + server
 pnpm test          # vitest suite (server unit + driver contract + API smoke)
 pnpm test:watch    # same, in watch mode
-pnpm exec vitest run --shard=1/3   # one CI shard, exactly the files CI ran in it
+pnpm exec vitest run --shard=1/4   # one CI shard, exactly the files CI ran in it
 pnpm check:electron # syntax-check the plain JS Electron entrypoints
 
 pnpm package:mac   # DMG + ZIP; requires Swift/Xcode tools
@@ -257,7 +257,7 @@ out of its commits and screenshots.
 Every PR runs the same checks, each as its own job so a failure names itself:
 
 - **typecheck + lint** — typecheck, lint, locale catalogs (`pnpm i18n:check`), Electron syntax check, production UI build. Once, on Ubuntu; none of it is platform-specific.
-- **vitest (os, shard n/3)** — the suite on macOS, Ubuntu and Windows, split into three shards each. The suite runs its files serially on purpose (fake CLIs and a real harness server), so one runner takes ~19 minutes; a shard takes ~7. To reproduce a shard's failure locally, run the same `pnpm exec vitest run --shard=n/3`. Failures also appear as annotations on the PR.
+- **vitest (os, shard n/4)** — the suite on macOS, Ubuntu and Windows, split into four shards each. The suite runs its files serially on purpose (fake CLIs and a real harness server), so one runner takes ~19 minutes; a shard takes 4–10. To reproduce a shard's failure locally, run the same `pnpm exec vitest run --shard=n/4`. Failures also appear as annotations on the PR.
 - **packaged server smoke (os)** — the server bundle copied out of the repo and started with no `node_modules` in reach.
 - **Windows CUA host smoke**, **Electron smokes (macOS)** — real Electron utility processes against disposable homes; never the live app.
 - **typecheck + test (os)** — the three checks the branch rules require. They only aggregate the jobs above; if one is red, the failing job is named in its log.
