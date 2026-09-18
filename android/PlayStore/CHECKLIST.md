@@ -11,16 +11,40 @@ Est. 25–40 minutes, plus the review wait.
 
 ## 0. Before the console — build the signed bundle (≈5 min)
 
-The password is in `~/openmausbot-release-keystore-PASSWORD.txt`.
+**Paste the lines between the fences, never the ``` fences themselves.** Three
+backticks open a command substitution in zsh, which swallows every line after
+them and drops you in a bare `sh-3.2$` prompt with nothing built.
+
+The password is typed at a prompt, not written into a command. That keeps it out
+of this file, out of your shell history, and off the screen:
 
 ```sh
 cd ~/Desktop/openmaus/OpenGrokBot-android-v1.4.0/android
+read -s "OPENMAUSBOT_KEYSTORE_PASSWORD?Keystore password: "
+```
+
+Paste the password from `~/openmausbot-release-keystore-PASSWORD.txt` when it
+asks — nothing will appear as you type, which is the point — and press Return.
+Then, in the same terminal window:
+
+```sh
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
 OPENMAUSBOT_KEYSTORE_FILE="$HOME/openmausbot-release.jks" \
-OPENMAUSBOT_KEYSTORE_PASSWORD='<paste it here>' \
+OPENMAUSBOT_KEYSTORE_PASSWORD="$OPENMAUSBOT_KEYSTORE_PASSWORD" \
 OPENMAUSBOT_KEY_ALIAS=openmausbot \
 ./gradlew clean :app:bundleRelease
 ```
+
+When the build finishes, clear the variable so it does not sit in the shell for
+the rest of the day:
+
+```sh
+unset OPENMAUSBOT_KEYSTORE_PASSWORD
+```
+
+> `read -s` is zsh syntax, and zsh is the default shell on this Mac. If your
+> prompt ends in `$` rather than `%` you are in a different shell — type `exit`
+> to get back to zsh first.
 
 Then confirm it is actually signed — this is the one check worth doing, because
 an unsigned bundle fails at upload with a message that never says "unsigned":
