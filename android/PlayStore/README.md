@@ -147,7 +147,7 @@ any AI provider.
 | --- | --- | --- |
 | App icon | 512×512 PNG, opaque | `assets/play-icon-512.png` ✓ |
 | Feature graphic | 1024×500 PNG, no transparency | `assets/feature-graphic-1024x500.png` ✓ |
-| Phone screenshots | 2–8, ≥ 1080 px on the short side, 9:16 | **still to capture** |
+| Phone screenshots | 2–8, ≥ 1080 px on the short side, 9:16 | `assets/screenshots/` (5, 1080×2400) ✓ |
 | 7" / 10" tablet shots | optional; only if the listing claims tablets | skip |
 
 Both graphics are rendered from the HTML beside them — open
@@ -165,9 +165,21 @@ converted from `res/drawable/ic_launcher_foreground.xml` — deliberately not th
 black desktop icon in `build/icon-1024.png`, so the Play listing matches what
 lands on the home screen.
 
-Screenshots must show the Android app, not the iOS one. Capture on the `openmaus`
-AVD or a real phone paired with a desktop install: bot list, a conversation, an
-approval card, voice or call mode, and the pairing screen.
+The five screenshots were captured on the `openmaus` AVD (Pixel 7, 1080×2400)
+against the repository's own isolated fixture — `scripts/control-omb.ts launch`
+with `FAKE_CLAUDE_REPLIES` scripted and `FAKE_CLAUDE_TOOL_CALLS='[]'` — so no
+real conversation, computer name, or account appears in them. The status bar is
+SystemUI demo mode (9:41, full battery, no notification clutter).
+
+Order them in the listing as they are numbered: the thread list, a conversation,
+call mode, pairing, and the updates sheet.
+
+To re-shoot: boot the AVD, install the preview APK, pair it by deep link
+(`openmausbot://pair?address=…&token=…` from `POST /api/auth/pairing`), and note
+that the preview variant strips that deep link on purpose — re-enable
+`PairingLinkActivity` in `app/src/preview/AndroidManifest.xml` for the capture
+and revert it afterwards. Quote the URL for the device shell, or `&` truncates
+it and the invite arrives without its token.
 
 ## 4. Content rating questionnaire
 
