@@ -98,6 +98,7 @@ export function voiceConfigDenial(body: unknown): string | null {
   if (fields.length === 0 || fields.some((field) => field !== "key" && field !== "provider")) return refusal;
   const { key, provider } = tts as { key?: unknown; provider?: unknown };
   if (key !== undefined) {
+    // eslint-disable-next-line no-control-regex -- Matching control characters is the point: an API key carrying one is a paste accident or an injection attempt.
     if (typeof key !== "string" || Buffer.byteLength(key) > 512 || /[\u0000-\u001f\u007f]/.test(key)) {
       return "that doesn't look like an API key";
     }
