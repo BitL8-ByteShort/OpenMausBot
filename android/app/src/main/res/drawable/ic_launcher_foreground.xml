@@ -20,10 +20,10 @@
     android:viewportWidth="1024"
     android:viewportHeight="1024">
     <group
-        android:translateX="271.2"
-        android:translateY="138.1"
-        android:scaleX="0.6"
-        android:scaleY="0.6">
+        android:translateX="311.4"
+        android:translateY="200.4"
+        android:scaleX="0.5"
+        android:scaleY="0.5">
         <group
             android:translateX="30.94"
             android:translateY="-15.92"
