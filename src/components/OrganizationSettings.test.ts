@@ -4,12 +4,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ManagedDesktopBridge, ManagedDesktopState } from "../../electron/managed-desktop.mjs";
 import { setLocale } from "@/lib/i18n";
 
-const fixture = vi.hoisted(() => ({ values: [] as unknown[], index: 0, effects: [] as EffectCallback[] }));
+const fixture = vi.hoisted(() => ({ values: [] as unknown[], index: 0, effects: [] as EffectCallback[], updating: false }));
 vi.mock("react", async (original) => ({ ...await original<typeof import("react")>(),
   useState: (initial: unknown) => {
     const index = fixture.index++;
     if (!(index in fixture.values)) fixture.values[index] = typeof initial === "function" ? initial() : initial;
-    return [fixture.values[index], (next: unknown) => { fixture.values[index] = typeof next === "function" ? next(fixture.values[index]) : next; }];
+    return [fixture.values[index], (next: unknown) => {
+      if (fixture.updating) throw new Error("A state updater called another state setter");
+      fixture.updating = true;
+      try { fixture.values[index] = typeof next === "function" ? next(fixture.values[index]) : next; }
+      finally { fixture.updating = false; }
+    }];
   },
   useRef: (initial: unknown) => {
     const index = fixture.index++;
@@ -44,7 +49,7 @@ let bridge: ManagedDesktopBridge;
 let push: (state: ManagedDesktopState) => void;
 let unsubscribe = vi.fn<() => void>();
 beforeEach(() => {
-  fixture.values = []; fixture.index = 0; fixture.effects = [];
+  fixture.values = []; fixture.index = 0; fixture.effects = []; fixture.updating = false;
   unsubscribe = vi.fn(); push = () => {};
   bridge = {
     state: vi.fn().mockResolvedValue({ status: "signed-out" }), begin: vi.fn().mockResolvedValue(connecting),
@@ -63,24 +68,33 @@ async function ready(state: ManagedDesktopState = { status: "signed-out" }) {
 }
 
 describe("optional desktop Organisation settings", () => {
-  it("loads state without enrolling, then begins only on explicit submit using the private bridge", async () => {
+  it("uses the default portal from one sign-in action and keeps custom setup advanced", async () => {
     await ready();
     let view = render();
     expect(view.html).toContain("https://admin.openmausbot.com");
     expect(view.html).toContain("Sign in with your organisation");
+    expect(view.html).toContain("<summary");
+    expect(view.html).toContain("Advanced");
+    expect(view.html).not.toMatch(/<details[^>]*\bopen/);
     expect(view.html).toContain("personal and local models");
     expect(view.html).toContain("does not upload your chat history");
     expect(bridge.begin).not.toHaveBeenCalled();
+    const signIn = () => view.nodes.find(node => node.type === "button" && node.props.children === "Sign in with your organisation")!.props.onClick!();
+    signIn(); signIn(); await flush();
+    expect(bridge.begin).toHaveBeenCalledExactlyOnceWith({ portalOrigin: "https://admin.openmausbot.com" });
+    expect(fetch).not.toHaveBeenCalled();
+    const progress = render().html;
+    expect(progress).toContain("Finish signing in through your browser");
+    expect(progress).toContain("connect automatically");
+    expect(progress).toMatch(/<details[^>]*><summary[^>]*>Security details<\/summary>[\s\S]*ABCDE-FGHIJ[\s\S]*<\/details>/);
+    expect(progress).not.toContain("admin.example.test/enroll");
+    expect(progress).not.toMatch(/<details[^>]*\bopen/);
+    button("Cancel sign-in").props.onClick!(); await flush();
+    expect(bridge.cancelEnrollment).toHaveBeenCalledOnce(); view = render();
     view.nodes.find(node => node.type === "input")!.props.onChange!({ target: { value: " https://admin.example.test " } });
     view = render();
-    const submit = () => view.nodes.find(node => node.type === "form")!.props.onSubmit!({ preventDefault: vi.fn() });
-    submit(); submit(); await flush();
-    expect(bridge.begin).toHaveBeenCalledExactlyOnceWith({ portalOrigin: "https://admin.example.test" });
-    expect(fetch).not.toHaveBeenCalled();
-    expect(render().html).toContain("ABCDE-FGHIJ");
-    button("Cancel sign-in").props.onClick!(); await flush();
-    expect(bridge.cancelEnrollment).toHaveBeenCalledOnce();
-    expect(render().html).toContain("Sign in with your organisation");
+    view.nodes.find(node => node.type === "form")!.props.onSubmit!({ preventDefault: vi.fn() }); await flush();
+    expect(bridge.begin).toHaveBeenNthCalledWith(2, { portalOrigin: "https://admin.example.test" });
   });
 
   it("shows company model counts, refreshes, and requires a separate disconnect confirmation", async () => {
@@ -129,7 +143,7 @@ describe("optional desktop Organisation settings", () => {
     const cleanup = await ready();
     let resolveBegin!: (state: ManagedDesktopState) => void;
     vi.mocked(bridge.begin).mockImplementation(() => new Promise(resolve => { resolveBegin = resolve; }));
-    render().nodes.find(node => node.type === "form")!.props.onSubmit!({ preventDefault: vi.fn() });
+    button("Sign in with your organisation").props.onClick!();
     if (typeof cleanup === "function") cleanup();
     push(connected); resolveBegin(connecting); await flush();
     expect(unsubscribe).toHaveBeenCalledOnce();
@@ -146,6 +160,20 @@ describe("optional desktop Organisation settings", () => {
     expect(render().html).toContain("Could not complete this action");
     expect(render().html).not.toContain("token-secret");
     expect(render().html).not.toContain("organization.noModels");
+  });
+
+  it("keeps an action error across same-status heartbeats and clears it after a real status change", async () => {
+    await ready(connected);
+    vi.mocked(bridge.refresh).mockRejectedValueOnce(new Error("Fixture refresh failure"));
+    button("Refresh").props.onClick!(); await flush();
+    expect(render().html).toContain("Could not complete this action");
+
+    expect(() => push({ ...connected, providers: [] })).not.toThrow();
+    expect(render().html).toContain("Could not complete this action");
+
+    expect(() => push({ ...connected, status: "reauth-required" })).not.toThrow();
+    expect(render().html).not.toContain("Could not complete this action");
+    expect(render().html).toContain("Disconnect below, then sign in again");
   });
 
   it("can clear an unavailable saved connection instead of trapping the user behind retry", async () => {

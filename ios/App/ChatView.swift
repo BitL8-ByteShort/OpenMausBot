@@ -52,7 +52,6 @@ struct ChatView: View {
     @State private var fileDownloadTask: Task<Void, Never>?
     @State private var fileDownloadRequestID: UUID?
     @State private var threadOpenTask: Task<Void, Never>?
-    @State private var acceptsNextHardwareLineBreak = false
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = SpeechDictation()
     /// The opening beat: the island grows with the bot's face in it, then
@@ -263,6 +262,7 @@ struct ChatView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .top)
                     .ignoresSafeArea(edges: .top)
+                    .allowsHitTesting(false)
                 }
                 .task {
                     // grow, hold a beat, shrink — the face rides along
@@ -379,7 +379,6 @@ struct ChatView: View {
             attachments = restored.attachments
             attachmentError = restored.error
             selectedPhotos = []
-            acceptsNextHardwareLineBreak = false
             showCommandHUD = false
             showingPlus = false
             // The local task picker changed threads. A download
@@ -463,8 +462,8 @@ struct ChatView: View {
 
     // MARK: - Header
 
-    /// Back on the left with the rest-of-app unread count, the bot's
-    /// computer on the right — a blurred strip to the top edge.
+    /// Back on the left with the rest-of-app unread count, threads and the
+    /// bot's computer on the right — a blurred strip to the top edge.
     private var headerBar: some View {
         HStack(alignment: .top) {
             Button { dismiss() } label: {
@@ -491,13 +490,30 @@ struct ChatView: View {
 
             Spacer(minLength: 4)
 
-            if case .bot = current {
-                GlassButton(systemImage: "display", size: 44, weight: .medium) {
-                    showingComputer = true
+            HStack(spacing: 8) {
+                if current.supportsTasks {
+                    Button {
+                        showingTasks = true
+                    } label: {
+                        Label("Threads", systemImage: "square.stack")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.primary)
+                            .padding(.horizontal, 12)
+                            .frame(height: 44)
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .glassCapsule()
+                    .accessibilityIdentifier("header-threads")
                 }
-                .accessibilityLabel("Watch \(current.name)'s computer")
-            } else {
-                Color.clear.frame(width: 44, height: 44)
+                if case .bot = current {
+                    GlassButton(systemImage: "display", size: 44, weight: .medium) {
+                        showingComputer = true
+                    }
+                    .accessibilityLabel("Watch \(current.name)'s computer")
+                } else {
+                    Color.clear.frame(width: 44, height: 44)
+                }
             }
         }
         .padding(.horizontal, 16)
@@ -571,7 +587,6 @@ struct ChatView: View {
             }
             .buttonStyle(.plain)
             .glassCapsule()
-            .disabled(preparingAttachments || sendingMessage)
             .accessibilityLabel(current.supportsTasks ? "Switch thread: \(current.threadTitle)" : "Open \(current.name) thread options")
             .accessibilityHint("Choose a conversation or start a new thread")
             .accessibilityIdentifier("thread-switcher")
@@ -744,27 +759,12 @@ struct ChatView: View {
             && !preparingAttachments && !sendingMessage
     }
 
-    /// A vertically growing SwiftUI TextField treats the software keyboard's
-    /// Return key as a newline even when the key is labelled “Send”. Intercept
-    /// that proposed edit before it reaches the draft. Hardware Shift-Return
-    /// opts into one real line break through `acceptsNextHardwareLineBreak`.
-    private var composerDraft: Binding<String> {
-        Binding(
-            get: { draft },
-            set: { proposed in
-                if acceptsNextHardwareLineBreak {
-                    acceptsNextHardwareLineBreak = false
-                    draft = proposed
-                } else if ComposerKeyboard.shouldSubmit(
-                    previousText: draft,
-                    proposedText: proposed
-                ) {
-                    submit()
-                } else {
-                    draft = proposed
-                }
-            }
-        )
+    /// Messages the harness is holding for this thread. They sit above the
+    /// composer rather than pretending to be part of the transcript: the
+    /// turn that is still running owns the transcript's tail, and these
+    /// words have not been said yet.
+    private var heldSends: [QueuedSend] {
+        session.state.pendingQueued[threadId] ?? []
     }
 
     private var hasPendingApproval: Bool {
@@ -1064,6 +1064,13 @@ struct ChatView: View {
     /// A round + and a glass pill with dictation and send inside it.
     private var composer: some View {
         VStack(spacing: 6) {
+            if !heldSends.isEmpty {
+                QueuedSendList(sends: heldSends) { send in
+                    Task { await session.cancelQueued(send, threadId: threadId, in: current) }
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             if preparingAttachments || sendingMessage {
                 HStack(spacing: 8) {
                     ProgressView()
@@ -1208,7 +1215,7 @@ struct ChatView: View {
 
                         TextField(
                             sendingMessage ? "Sending…" : dictation.isListening ? "Listening…" : "Ask \(current.name)",
-                            text: composerDraft,
+                            text: $draft,
                             axis: .vertical
                         )
                             .lineLimit(1...5)
@@ -1216,7 +1223,6 @@ struct ChatView: View {
                             .padding(.vertical, 11)
                             .focused($composerFocused)
                             .accessibilityIdentifier("message-input")
-                            .submitLabel(.send)
                             // Partial transcripts rebuild from a frozen base;
                             // prevent competing edits without dimming the text.
                             .allowsHitTesting(
@@ -1228,16 +1234,16 @@ struct ChatView: View {
                                     showCommandHUD = value.hasPrefix("/")
                                 }
                             }
+                            // The software keyboard's Return inserts a newline,
+                            // like Messages; only the arrow button sends. A
+                            // hardware Return still sends, Shift-Return breaks
+                            // the line. onKeyPress never sees the software
+                            // keyboard, so this cannot turn its Return into a send.
                             .onKeyPress(.return, phases: .down) { press in
-                                if press.modifiers.contains(.shift) {
-                                    acceptsNextHardwareLineBreak = true
-                                    return .ignored
-                                }
-                                acceptsNextHardwareLineBreak = false
+                                if press.modifiers.contains(.shift) { return .ignored }
                                 submit()
                                 return .handled
                             }
-                            .onSubmit { submit() }
 
                         Button {
                             composerFocused = false
@@ -1277,7 +1283,11 @@ struct ChatView: View {
                         .animation(.easeOut(duration: 0.15), value: canSend)
                     }
                     .frame(minHeight: 44)
-                    .glassCapsule(interactive: false)
+                    // A capsule at one line (44pt tall, 22pt corners) that
+                    // keeps those 22pt corners as the draft grows, the way
+                    // Messages does. A true Capsule would round to half the
+                    // height, and a five-line draft became a giant pill.
+                    .glassSheet(cornerRadius: 22)
                 }
             }
         }
@@ -2322,5 +2332,57 @@ struct StreamingBubble: View {
         // No `.textSelection` on purpose: selecting text that is still growing
         // fights the reader, and the settled bubble a frame later is
         // selectable anyway.
+    }
+}
+
+/// The held sends for one thread, as the desktop's composer shows them: one
+/// line each, deletable, with a note when the harness held them for thread
+/// capacity rather than because a turn is running.
+private struct QueuedSendList: View {
+    let sends: [QueuedSend]
+    let cancel: (QueuedSend) -> Void
+
+    private var showsCapacityNote: Bool {
+        sends.contains { $0.reason == "capacity" }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if showsCapacityNote {
+                Text("Queued — starts when this bot has a free thread slot.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.secondary)
+            }
+            ForEach(Array(sends.enumerated()), id: \.element.queueId) { index, send in
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.turn.down.right")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color.secondary)
+                    Text(send.text)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Color.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        cancel(send)
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(Color.secondary)
+                            .frame(width: 30, height: 30)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Delete queued message \(index + 1) of \(sends.count)")
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .padding(.horizontal, 4)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(sends.count == 1 ? "1 queued message" : "\(sends.count) queued messages")
     }
 }

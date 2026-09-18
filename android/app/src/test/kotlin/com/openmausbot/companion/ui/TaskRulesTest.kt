@@ -48,8 +48,19 @@ class TaskRulesTest {
             listOf("helper-0", "t1", "t2", "helper-1", "helper-2"),
             TaskRules.tasks(bot(helpers + own, current = "helper-0")).map { it.threadId },
         )
+        // a held send keeps a closed thread in the open pile — ordering, never filtering
+        assertEquals(
+            listOf("helper-0", "t1", "t2", "helper-1", "helper-2"),
+            TaskRules.tasks(bot(helpers + own), queuedThreadIds = setOf("helper-0")).map { it.threadId },
+        )
         assertTrue(TaskRules.demandsAttention(task("t1").copy(activity = "waiting-on-you")))
         assertFalse(TaskRules.demandsAttention(task("t1").copy(activity = "idle")))
+        // the wire value still counts, as on main; the client flag covers the
+        // queues the harness reports out-of-band
+        assertTrue(TaskRules.demandsAttention(task("t1").copy(activity = "queued")))
+        assertTrue(TaskRules.demandsAttention(task("t1"), queued = true))
+        // main's teammate wait rides along through the shared core rule
+        assertTrue(TaskRules.demandsAttention(task("t1").copy(waitingOnTeammate = true)))
     }
 
     @Test
@@ -67,6 +78,33 @@ class TaskRulesTest {
             listOf("waiting", "busy", "queued", "unread", "t1", "idle", "helper"),
             TaskRules.tasks(subject).map { it.threadId },
         )
+    }
+
+    @Test
+    fun `archived threads fold to the tail unless they demand attention`() {
+        val tasks = listOf(
+            task("live", "Live"),
+            task("later", "Later").copy(archivedAt = 0.0),
+            task("held", "Held").copy(archivedAt = 5.0, unread = true),
+        )
+        // "held" is archived but unread, so it is surfaced AND floated: attention
+        // ordering (rank 3) puts it above the idle "live" thread, and only the
+        // quiet "later" folds to the tail.
+        assertEquals(
+            listOf("held", "live", "later"),
+            TaskRules.tasks(bot(tasks)).map { it.threadId },
+        )
+    }
+
+    @Test
+    fun `archiving waits for work to settle`() {
+        // A modern bot paints per-task busy, so the task alone decides.
+        val modern = bot(listOf(task("run").copy(busy = false)))
+        assertFalse(TaskRules.canArchive(task("run").copy(activity = "working"), modern))
+        assertFalse(TaskRules.canArchive(task("run").copy(activity = "running"), modern))
+        assertFalse(TaskRules.canArchive(task("run").copy(busy = true), modern))
+        assertTrue(TaskRules.canArchive(task("run").copy(activity = "waiting-on-you"), modern))
+        assertTrue(TaskRules.canArchive(task("run"), modern))
     }
 
     @Test
@@ -89,6 +127,7 @@ class TaskRulesTest {
         val busy = bot(tasks, current = "t1", busy = true)
         assertFalse(TaskRules.canCreate(busy))
         assertFalse(TaskRules.canDelete(task("t2"), busy))
+        assertFalse(TaskRules.canArchive(task("t2"), busy))
         assertTrue(TaskRules.canSwitch(task("t2"), busy))
     }
 
@@ -104,6 +143,8 @@ class TaskRulesTest {
         assertTrue(TaskRules.canSwitch(idle, subject))
         assertTrue(TaskRules.canDelete(idle, subject))
         assertFalse(TaskRules.canDelete(running, subject))
+        assertTrue(TaskRules.canArchive(idle, subject))
+        assertFalse(TaskRules.canArchive(running, subject))
     }
 
     @Test
@@ -112,6 +153,7 @@ class TaskRulesTest {
         val idle = bot(tasks, current = "t1", busy = false)
         assertTrue(TaskRules.canCreate(idle))
         assertTrue(TaskRules.canDelete(task("t2"), idle))
+        assertTrue(TaskRules.canArchive(task("t2"), idle))
         assertTrue(TaskRules.canSwitch(task("t2"), idle))
     }
 

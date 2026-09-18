@@ -194,6 +194,12 @@ final class Session: ObservableObject {
                 connections = [preview]
             }
             state.hydrate(fleet)
+            if arguments.contains("-threads-preview"),
+               let pagesURL = Bundle.main.url(forResource: "ThreadPreviewPages", withExtension: "json"),
+               let pagesData = try? Data(contentsOf: pagesURL),
+               let pages = try? JSONDecoder().decode([String: ThreadPage].self, from: pagesData) {
+                for (threadID, page) in pages { state.merge(page, intoThread: threadID) }
+            }
             status = .live
             return
         }
@@ -915,12 +921,19 @@ final class Session: ObservableObject {
     // is a phone that disagrees with the laptop.
 
     func send(_ text: String, to chat: Chat) async {
+        let connectionID = client?.connection.id
+        var receipt: SendReceipt?
         await perform {
             switch chat {
-            case let .bot(bot): try await $0.send(text: text, toBot: bot.id, threadId: bot.threadId)
-            case let .room(room): try await $0.send(text: text, toRoom: room.id)
+            case let .bot(bot): receipt = try await $0.send(text: text, toBot: bot.id, threadId: bot.threadId)
+            case let .room(room): receipt = try await $0.send(text: text, toRoom: room.id)
             }
         }
+        // The receipt describes a queue on the computer this request went
+        // to. A machine switched mid-flight has already reset state for the
+        // computer now on screen, and that row must not land in it.
+        guard client?.connection.id == connectionID else { return }
+        rememberQueuedSend(from: receipt, text: text)
     }
 
     /// Send a composer draft with app-owned attachments. The destination
@@ -936,6 +949,7 @@ final class Session: ObservableObject {
             actionError = "This computer is offline."
             return false
         }
+        let connectionID = client.connection.id
         actionError = nil
         do {
             try AttachmentPolicy.validate(attachments)
@@ -959,13 +973,7 @@ final class Session: ObservableObject {
                 }
             }
 
-            let destination: MessageDestination
-            switch chat {
-            case let .bot(bot):
-                destination = .bot(id: bot.id, threadId: bot.threadId)
-            case let .room(room):
-                destination = .room(id: room.id, threadId: room.threadId)
-            }
+            let destination = chat.destination
             let draftKey = AttachmentDraftKey(
                 destination: destination,
                 text: text,
@@ -1015,7 +1023,13 @@ final class Session: ObservableObject {
                 urls: [],
                 attachments: uploaded
             )
-            try await client.send(text: message, to: destination, sendId: sendID)
+            let receipt = try await client.send(text: message, to: destination, sendId: sendID)
+            // The send succeeded on the computer it was addressed to, so the
+            // draft clears either way. Its queue row belongs to that computer,
+            // and must not be drawn on one selected mid-upload.
+            if self.client?.connection.id == connectionID {
+                rememberQueuedSend(from: receipt, text: text)
+            }
             attachmentSendIDs.removeValue(forKey: draftKey)
             actionError = nil
             return true
@@ -1028,6 +1042,45 @@ final class Session: ObservableObject {
         } catch {
             actionError = error.localizedDescription
             return false
+        }
+    }
+
+    /// The harness's answer to a send, when it held the message instead of
+    /// delivering it. This is wire state, not optimism: the row exists
+    /// because the computer said it does, identified by its queueId.
+    private func rememberQueuedSend(from receipt: SendReceipt?, text: String) {
+        guard let receipt, receipt.queued == true,
+              let queueId = receipt.queueId, let threadId = receipt.threadId
+        else { return }
+        state.rememberQueued(
+            QueuedSend(
+                queueId: queueId,
+                text: text,
+                reason: receipt.reason == "capacity" ? "capacity" : nil
+            ),
+            threadId: threadId
+        )
+    }
+
+    /// Take back a held message. The row only goes when the computer agrees;
+    /// an entry that already drained counts as agreement.
+    func cancelQueued(_ send: QueuedSend, threadId: String, in chat: Chat) async {
+        let connectionID = client?.connection.id
+        let destination: MessageDestination
+        switch chat {
+        case let .bot(bot): destination = .bot(id: bot.id, threadId: threadId)
+        case let .room(room): destination = .room(id: room.id, threadId: threadId)
+        }
+        var agreed = false
+        await perform {
+            try await $0.cancelQueued(queueId: send.queueId, to: destination)
+            agreed = true
+        }
+        // The cancel landed on the computer that owned the row. One selected
+        // mid-request has already reset state; its rows are not this cancel's
+        // to retire.
+        if agreed, client?.connection.id == connectionID {
+            state.cancelQueued(queueId: send.queueId, threadId: threadId)
         }
     }
 
@@ -1591,7 +1644,36 @@ final class Session: ObservableObject {
     }
 
     @discardableResult
+    func setTaskArchived(_ task: BotTask, for bot: Bot, archivedAt: Double?) async -> Bool {
+        guard let client else { return false }
+        do {
+            try await client.archiveTask(botId: bot.id, threadId: task.threadId, archivedAt: archivedAt)
+            await refresh()
+            return true
+        } catch { actionError = error.localizedDescription; return false }
+    }
+
+    @discardableResult
     func deleteTask(_ task: BotTask, for bot: Bot) async -> Bot? {
+#if DEBUG
+        // The native UI fixture has no paired client. This explicit launch
+        // mode exercises list updates and a partial batch failure entirely
+        // offline, without touching a person's conversations.
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("-threads-preview-deletion"),
+           var updated = state.bot(bot.id),
+           task.threadId != bot.threadId,
+           updated.visibleTasks.contains(where: { $0.threadId == task.threadId && !$0.isWorking }) {
+            if arguments.contains("-threads-preview-deletion-fails-weekend")
+                && task.threadId == "preview-weekend" {
+                actionError = "Synthetic deletion failure"
+                return nil
+            }
+            updated.tasks?.removeAll { $0.threadId == task.threadId }
+            state.apply(.bot(updated))
+            return updated
+        }
+#endif
         guard let client else { return nil }
         do {
             let updated = try await client.deleteTask(botId: bot.id, threadId: task.threadId)
@@ -2035,112 +2117,6 @@ final class Session: ObservableObject {
             status = .unauthorized
         } catch {
             if !quietly { actionError = error.localizedDescription }
-        }
-    }
-}
-
-/// A chat is a bot or a room. They share a thread, which is what every
-/// message, approval and page is keyed by.
-enum Chat: Identifiable, Hashable {
-    case bot(Bot)
-    case room(Room)
-
-    var id: String {
-        switch self {
-        case let .bot(bot): return bot.id
-        case let .room(room): return room.id
-        }
-    }
-
-    /// Owner identity remains available for bot APIs. Navigation and activity
-    /// lists must distinguish two conversations belonging to the same bot.
-    var conversationID: String {
-        switch self {
-        case let .bot(bot): return "bot:\(bot.id):\(bot.threadId)"
-        case let .room(room): return "room:\(room.id):\(room.threadId)"
-        }
-    }
-
-    static func == (left: Chat, right: Chat) -> Bool {
-        switch (left, right) {
-        case let (.bot(a), .bot(b)): return a.id == b.id && a.threadId == b.threadId
-        case let (.room(a), .room(b)): return a.id == b.id
-        default: return false
-        }
-    }
-
-    func hash(into hasher: inout Hasher) {
-        switch self {
-        case let .bot(bot):
-            hasher.combine(0)
-            hasher.combine(bot.id)
-            hasher.combine(bot.threadId)
-        case let .room(room):
-            hasher.combine(1)
-            hasher.combine(room.id)
-        }
-    }
-
-    var threadId: String {
-        switch self {
-        case let .bot(bot): return bot.threadId
-        case let .room(room): return room.threadId
-        }
-    }
-
-    var name: String {
-        switch self {
-        case let .bot(bot): return bot.name
-        case let .room(room): return room.name
-        }
-    }
-
-    var threadTitle: String {
-        switch self {
-        case let .bot(bot): return bot.tasks?.first { $0.threadId == bot.threadId }?.displayTitle ?? "Untitled thread"
-        case let .room(room): return room.tasks?.first { $0.threadId == room.threadId }?.displayTitle ?? "Conversation"
-        }
-    }
-
-    var isBot: Bool {
-        if case .bot = self { return true }
-        return false
-    }
-
-    var supportsTasks: Bool {
-        switch self {
-        case .bot: return true
-        // `tasks == nil` means an older paired desktop. Hide the affordance
-        // instead of sending it a route it does not know yet.
-        case let .room(room): return room.dm != true && room.tasks != nil
-        }
-    }
-
-    var subtitle: String {
-        switch self {
-        case let .bot(bot): return bot.title
-        case let .room(room): return "\(room.memberIds.count) bots"
-        }
-    }
-
-    var unread: Bool {
-        switch self {
-        case let .bot(bot): return bot.unread
-        case let .room(room): return room.unread
-        }
-    }
-
-    var busy: Bool {
-        switch self {
-        case let .bot(bot): return bot.busy ?? false
-        case let .room(room): return room.busyBotId != nil
-        }
-    }
-
-    var color: String {
-        switch self {
-        case let .bot(bot): return bot.color
-        case .room: return "blue"
         }
     }
 }

@@ -33,6 +33,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -46,6 +48,7 @@ import com.openmausbot.companion.core.target
 import com.openmausbot.companion.core.forTask
 import com.openmausbot.companion.core.BotThreadGroup
 import com.openmausbot.companion.core.threadGroups
+import com.openmausbot.companion.core.isArchived
 
 /**
  * Separate contexts for an agent or channel — the port of
@@ -87,9 +90,38 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
         session.actionError = null
     }
 
-    val groups = when (current) {
-        is Chat.BotChat -> current.bot.threadGroups(includingClosed = true)
-        is Chat.RoomChat -> listOf(BotThreadGroup(null, TaskRules.tasks(current)))
+    // The person's own filing folds to the sheet's tail, out of the folders:
+    // an archived thread that starts demanding attention is back above.
+    val (groups, archived) = when (current) {
+        is Chat.BotChat -> {
+            val all = current.bot.threadGroups(
+                includingClosed = true,
+                queuedThreadIds = state.queuedThreadIds,
+            )
+            val folded = all.flatMap { it.tasks }.filter {
+                it.isArchived &&
+                    !TaskRules.demandsAttention(it, queued = it.threadId in state.queuedThreadIds) &&
+                    !TaskRules.isCurrent(it, current)
+            }
+            val foldedIds = folded.map { it.threadId }.toSet()
+            all.mapNotNull { group ->
+                group.copy(tasks = group.tasks.filter { it.threadId !in foldedIds })
+                    .takeIf { it.tasks.isNotEmpty() }
+            } to folded
+        }
+        is Chat.RoomChat -> listOf(BotThreadGroup(null, TaskRules.tasks(current))) to emptyList()
+    }
+
+    val archiveHandler: (BotTask) -> Unit = { task ->
+        saving = true
+        error = null
+        scope.launch {
+            // A null clears the stamp — the server treats it as unarchive.
+            val stamped = if (task.isArchived) null else System.currentTimeMillis().toDouble()
+            val ok = archiveTask(session, task, current, stamped)
+            saving = false
+            if (!ok) failed()
+        }
     }
 
     BasicAlertDialog(
@@ -178,6 +210,7 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
                                 task = task,
                                 chat = current,
                                 enabled = !saving,
+                                queued = task.threadId in state.queuedThreadIds,
                                 onSwitch = {
                                     saving = true
                                     error = null
@@ -196,6 +229,45 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
                                     renaming = task
                                 },
                                 onDelete = { error = null; pendingDelete = task },
+                                onArchive = (current as? Chat.BotChat)?.let { archiveHandler },
+                            )
+                        }
+                    }
+                    if (archived.isNotEmpty()) {
+                        item(key = "archived") {
+                            Text(
+                                "Archived",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = secondaryTint,
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+                            )
+                        }
+                        items(archived, key = { it.threadId }) { task ->
+                            TaskRow(
+                                task = task,
+                                chat = current,
+                                enabled = !saving,
+                                queued = task.threadId in state.queuedThreadIds,
+                                onSwitch = {
+                                    saving = true
+                                    error = null
+                                    scope.launch {
+                                        val selected = switchTask(session, task, current)
+                                        saving = false
+                                        if (selected == null) failed() else {
+                                            onSelectTask(selected.target)
+                                            onDismiss()
+                                        }
+                                    }
+                                },
+                                onRename = {
+                                    title = task.title
+                                    error = null
+                                    renaming = task
+                                },
+                                onDelete = { error = null; pendingDelete = task },
+                                onArchive = (current as? Chat.BotChat)?.let { archiveHandler },
                             )
                         }
                     }
@@ -270,13 +342,16 @@ private fun TaskRow(
     task: BotTask,
     chat: Chat,
     enabled: Boolean,
+    queued: Boolean,
     onSwitch: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
+    onArchive: ((BotTask) -> Unit)? = null,
 ) {
     val current = TaskRules.isCurrent(task, chat)
     val canSwitch = enabled && TaskRules.canSwitch(task, chat)
     val canDelete = enabled && TaskRules.canDelete(task, chat)
+    val canArchive = enabled && TaskRules.canArchive(task, chat)
 
     Row(
         modifier = Modifier
@@ -286,7 +361,21 @@ private fun TaskRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        BotThreadRow(task, selected = current, modifier = Modifier.weight(1f))
+        BotThreadRow(task, selected = current, modifier = Modifier.weight(1f), queued = queued)
+
+        if (onArchive != null) {
+            val label = if (task.isArchived) "Unarchive" else "Archive"
+            Text(
+                text = label,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (canArchive) secondaryTint else secondaryTint.copy(alpha = 0.4f),
+                modifier = Modifier
+                    .clickable(enabled = canArchive) { onArchive(task) }
+                    .semantics { contentDescription = "$label ${TaskRules.title(task)}" }
+                    .padding(horizontal = 8.dp),
+            )
+        }
 
         Icon(
             imageVector = Icons.Filled.Edit,
@@ -338,6 +427,12 @@ private suspend fun deleteTask(session: Session, task: BotTask, chat: Chat): Cha
     when (chat) {
         is Chat.BotChat -> session.deleteTask(task, chat.bot)?.let(Chat::BotChat)
         is Chat.RoomChat -> session.deleteTask(task, chat.room)?.let(Chat::RoomChat)
+    }
+
+private suspend fun archiveTask(session: Session, task: BotTask, chat: Chat, archivedAt: Double?): Boolean =
+    when (chat) {
+        is Chat.BotChat -> session.archiveTask(task, chat.bot, archivedAt)
+        is Chat.RoomChat -> false
     }
 
 @Composable

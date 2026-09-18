@@ -476,3 +476,57 @@ it("retains returned direct reports for follow-up turns but rechecks access befo
   expect(final.prompt.message.content).toContain("Teammate result withheld");
   expect(JSON.stringify({ system: final.system, prompt: final.prompt })).not.toContain("PRIVATE_ENGINEERING_FACT_8347");
 }), 45_000);
+
+it("runs the owed direct follow-up while the same bot works in another thread", () => fixture(async f => {
+  const gate = join(f.session.info.dataDir, "hold-gate");
+  f.plan[f.chief.id] = { turns: [
+    { steps: [
+      { tool: "coordinate_bots", arguments: { bot_ids: [f.specialist.id], request_key: "check", message: "Independently verify the CSV export" } },
+      { tool: "start_thread", arguments: { title: "Independent hold", message: "Run the long independent check." } },
+    ], reply: "Assigned the check and opened the hold" },
+    { gateFile: gate, reply: "The follow-up ran while the hold worked" },
+    // The hold's completion and the resume's plan read race: the resume
+    // lands on slot 1 while the hold still waits, or slot 2 once the hold
+    // has finished. Both must settle the same reply in this conversation.
+    { reply: "The follow-up ran while the hold worked" },
+  ] };
+  f.save();
+  await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", "Assign the check, then open an independent job that runs long.");
+  const chiefTasks = async () => (await f.api("/api/bots")).bots.find((bot: any) => bot.id === f.chief.id).tasks;
+  // The self-opened job stays mid-turn at its gate: the whole-bot busy flag
+  // is held up by a thread that has nothing to do with this coordination.
+  await expect.poll(async () => (await chiefTasks()).find((task: any) => task.title === "Independent hold")?.busy, { timeout: 20_000 }).toBe(true);
+  // The owed follow-up belongs to this conversation alone: it must dispatch
+  // even while the bot stays busy in its sibling thread.
+  const root = () => f.nodes().find((node: any) => node.key === "root");
+  await expect.poll(() => root()?.status, { timeout: 10_000 }).toBe("running");
+  writeFileSync(gate, "");
+  await expect.poll(() => root()?.status, { timeout: 10_000 }).toBe("completed");
+  const tasks = await chiefTasks();
+  expect(tasks.find((task: any) => task.threadId === f.chief.activeTaskId).busy).toBe(false);
+  await expect.poll(async () => (await chiefTasks()).find((task: any) => task.title === "Independent hold")?.busy, { timeout: 10_000 }).toBe(false);
+  expect((await f.messages(f.chief.activeTaskId)).some((message: any) => message.text === "The follow-up ran while the hold worked")).toBe(true);
+}), 45_000);
+
+it("sends each teammate result once in the turn that reviews it", () => fixture(async f => {
+  f.plan[f.lead.id].resumeReply = "LEAD_RESULT_ONCE implemented and verified";
+  await f.start();
+  expect((await f.wait()).status).toBe("settled");
+  const text = String(f.evidence().filter((turn: any) => turn.botId === f.chief.id).at(-1).prompt.message.content);
+  expect(text).toContain("Your downstream room requests have settled.");
+  expect(text.split("LEAD_RESULT_ONCE").length - 1).toBe(1);
+}), 45_000);
+
+it("gives a teammate whose session is rebuilt its second request once, never also as a bare assistant line", () => fixture(async f => {
+  f.plan[f.lead.id] = { reply: "round result" };
+  for (const key of ["first", "second"]) {
+    f.plan[f.chief.id] = { steps: [{ arguments: { bot_ids: [f.lead.id], request_key: key, message: `REQUEST_${key.toUpperCase()} please do it` } }], reply: "Assigned", resumeReply: "Done" };
+    f.save();
+    await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", `Delegate the ${key} request.`);
+    expect((await f.wait()).status).toBe("settled");
+  }
+  const second = String(f.evidence().filter((turn: any) => turn.botId === f.lead.id).at(-1).prompt.message.content);
+  expect(second.split("REQUEST_SECOND").length - 1).toBe(1);
+  expect(second).toContain("could not be resumed");
+  expect(second).not.toMatch(/^Assistant: @/m);
+}, { FAKE_CLAUDE_MODE: "dead-session" }), 60_000);

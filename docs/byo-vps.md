@@ -12,7 +12,8 @@ passphrase, and never runs an agent remotely.
 - Live screen preview in the Computer panel and in transcripts, same as a Box.
 - Explicit **Cloud** with the **Self-hosted VPS** backend provisions or starts the container. **Auto** reuses
   a ready container by default; an off-by-default **Start VPS automatically** switch lets that bot prepare
-  or wake its managed container when needed.
+  or wake its managed container when needed. Scheduled and manually triggered routine runs always start it,
+  and never fall back to this computer's own desktop when the VPS cannot be reached.
 - Interactive **Take control** locally or from a paired desktop client. The host binds noVNC only to a random
   `127.0.0.1` port, closes the tunnel with the viewer, and never publishes VNC on the VPS. A paired client
   receives a short-lived, device-scoped relay through managed HTTPS or Tailscale only after **Cloud desktop
@@ -33,10 +34,12 @@ not one that also holds things you would not hand to the agent.
 ## The required SSH config alias
 
 OpenMausBot connects only through a named alias in your `~/.ssh/config` — you type the alias into
-App Settings → Connections, nothing else. The alias block is load-bearing, not a convenience: every bot
-action becomes a `docker exec` over SSH, and without multiplexing each one pays a full SSH handshake; without
-keepalives and a connect timeout, a VPS that drops off the network hangs the bot's turn instead of failing it.
-Set the block up like this:
+App Settings → Connections, nothing else. Every bot action becomes a `docker exec` over SSH, so the app
+supplies connection sharing and fail-fast timeouts itself: it runs each VPS command through its own
+`ssh_config` (under `~/.openmausbot/ssh/`) that includes your file first and fills in `ControlMaster`,
+`ControlPersist`, keepalives and a connect timeout wherever your alias leaves them unset. Anything your
+alias sets wins. The block below is still the recommended shape, and it is what your own `ssh` uses outside
+the app:
 
 ```
 Host my-vps
@@ -100,6 +103,21 @@ A bot set to **Auto** is lifecycle-read-only by default. It attaches only when t
 running and verified. If no local fallback exists, the turn now explains why the VPS was unavailable instead
 of silently running without a computer. Enable **Start VPS automatically** per bot to let Auto prepare or wake
 that bot's managed container; the switch is deliberately off by default.
+
+## Several turns at once
+
+Each bot has one container, but the container is not the bottleneck — the desktop inside it is. Any number of
+the bot's threads (chats, tasks, routines) can run with the VPS mounted at the same time. The desktop goes to
+the first thread that calls a computer tool (a screenshot, a click, a command through the Cua driver) and stays
+with that turn until it ends; threads that never touch the computer tools are never held up. A thread that
+reaches for the screen while another holds it shows
+
+> Waiting for its turn on this computer — *bot* is running *thread*. Starts automatically when that finishes.
+
+and its computer calls are refused with a note telling the model to pause screen work; the chip settles as
+"Computer free — continuing" when the desktop lands, or "Stopped waiting for the computer" if the turn ends
+first. A wait gives up after 30 minutes and names the holder. Container lifecycle actions (create, start,
+stop) are still one at a time per container.
 
 ## Troubleshooting
 

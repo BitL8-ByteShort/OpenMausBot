@@ -212,6 +212,10 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// The message this one follows; nil at the thread root. Two messages
     /// sharing a parent are a fork.
     public var parentId: String?
+    /// Set when this line began as a queued send: the id the harness quoted
+    /// when it held the message, echoed back on the line that finally landed.
+    /// Clients match it against their held-send rows to retire them.
+    public var queueId: String?
     /// Rooms: which member said this.
     public var from: Sender?
     public var reactions: [Reaction]?
@@ -276,6 +280,11 @@ public struct BotTask: Codable, Hashable, Sendable {
     /// Runtime state from newer computers; used to recover approvals in
     /// background threads without downloading every conversation.
     public var activity: String?
+    /// This thread's own turn is done and a dispatched teammate has not
+    /// settled yet (#1223): a wait, not work. Newer computers send it while
+    /// leaving busy/activity idle, so older builds simply see the thread
+    /// idle instead of spinning a work glyph for the whole teammate run.
+    public var waitingOnTeammate: Bool?
     public var unread: Bool?
     public var approvalMode: String?
     public var autoApprove: Bool?
@@ -283,6 +292,11 @@ public struct BotTask: Codable, Hashable, Sendable {
     public var projectId: String?
     public var openedBy: ThreadOpener?
     public var closedBy: ThreadCloser?
+    /// When the person put this thread away, in epoch milliseconds. The
+    /// field's presence — not its value — marks the thread archived: the
+    /// task API accepts any epoch number, so a thread persisted with
+    /// archivedAt: 0 is archived. Absent means it was never put away.
+    public var archivedAt: Double?
     /// Bot-only internal execution. Keep it addressable, but out of thread pickers.
     public var routineRunId: String?
 
@@ -294,21 +308,64 @@ public struct BotTask: Codable, Hashable, Sendable {
     /// A bot closed this thread and nothing has happened there since.
     public var isClosed: Bool { closedBy != nil }
 
-    /// The one line under a title: who closed it once a bot has, otherwise
-    /// who opened it, otherwise nothing. Closed wins because it is the newer
-    /// fact and the reason the row is dimmed.
+    /// Archived means the field is present, not nonzero: the task API
+    /// accepts any epoch number, so a thread persisted with
+    /// archivedAt: 0 is archived.
+    public var isArchived: Bool { archivedAt != nil }
+
+    /// Working is activity or flag: the wire can carry either alone, so the
+    /// archive action's busy gate and the working status ask the same
+    /// question. A run counts as work here exactly as its row already
+    /// labels it Working.
+    public var isWorking: Bool { activity == "working" || activity == "running" || busy == true }
+
+    /// The one line under a title: who closed it once a bot has, "Archived"
+    /// once the person put it away, otherwise who opened it, otherwise
+    /// nothing. Closed wins because it is the newer fact; archived wins over
+    /// the opener because it explains why the row sits where it does.
     public var bylineLabel: String? {
-        closedBy.map { "closed by \($0.name)" } ?? openedByLabel
+        if let closedBy { return "closed by \(closedBy.name)" }
+        return isArchived ? "Archived" : openedByLabel
     }
 
+    /// Waiting on a dispatched teammate: the thread's own turn is done and
+    /// a teammate has not settled. Flag-only, matching Android: the live
+    /// #1228 wire paints busy, working, and this flag together during a
+    /// coordination wait, so the flag alone decides — a quiet wait, never
+    /// the work spinner.
+    public var isWaitingOnTeammate: Bool { waitingOnTeammate == true }
+
     /// Whether the row must stay in the list regardless of closed state:
-    /// it is running, needs the person, or has something they have not read.
-    public var demandsAttention: Bool {
-        if busy == true || unread == true { return true }
+    /// it is working, waiting on someone, has something they have not read,
+    /// or is holding a queued send. Queued is client state the harness
+    /// reports out-of-band, so it arrives as an input rather than living on
+    /// the wire-decoded task.
+    public func demandsAttention(queued: Bool = false) -> Bool {
+        if isWorking || isWaitingOnTeammate || unread == true { return true }
+        if queued { return true }
         switch activity {
-        case "waiting-on-you", "waiting", "working", "running", "queued": return true
+        case "waiting-on-you", "waiting", "queued": return true
         default: return false
         }
+    }
+}
+
+/// A message the harness is holding until the running turn settles. The
+/// phone's copy of a server-owned queue entry, identified by the harness's
+/// queueId and never by its text.
+public struct QueuedSend: Codable, Hashable, Identifiable, Sendable {
+    public var queueId: String
+    public var text: String
+    /// Why the harness held it. "capacity" is the known value; anything else
+    /// parses and is shown as a plain queued line.
+    public var reason: String?
+
+    public var id: String { queueId }
+
+    public init(queueId: String, text: String, reason: String? = nil) {
+        self.queueId = queueId
+        self.text = text
+        self.reason = reason
     }
 }
 
@@ -331,6 +388,10 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
     public var modelSelection: ModelSelection
     public var createdAt: Double
     public var busy: Bool?
+    /// A dispatched teammate has not settled yet; the bot itself is waiting
+    /// on it rather than working (#1223). Carries the active thread's wait;
+    /// per-thread waits live on the task.
+    public var waitingOnTeammate: Bool?
     public var pinned: Bool?
     public var hidden: Bool?
     /// Desktop sidebar section. Missing or blank means the built-in Bots area.
@@ -383,6 +444,7 @@ public struct Bot: Codable, Hashable, Identifiable, Sendable {
         view.threadId = selectedThreadId
         view.modelSelection = task?.modelSelection ?? modelSelection
         view.busy = task?.busy ?? (selectedThreadId == threadId ? busy : false)
+        view.waitingOnTeammate = task?.waitingOnTeammate ?? (selectedThreadId == threadId ? waitingOnTeammate : false)
         view.unread = task?.unread ?? (selectedThreadId == threadId ? unread : false)
         view.approvalMode = task?.approvalMode ?? task?.autoApprove.map { $0 ? "auto" : "ask" } ?? approvalMode
         view.autoApprove = task?.autoApprove ?? autoApprove
@@ -465,7 +527,7 @@ public struct Room: Codable, Hashable, Identifiable, Sendable {
 
 // MARK: - Responses
 
-private struct Lossy<Element: Decodable>: Decodable {
+struct Lossy<Element: Decodable>: Decodable {
     let value: Element?
 
     init(from decoder: Decoder) throws {
@@ -476,18 +538,28 @@ private struct Lossy<Element: Decodable>: Decodable {
 public struct Fleet: Decodable, Sendable {
     public var bots: [Bot]
     public var groups: [Room]
+    /// Held sends for every bot thread, the same snapshot the
+    /// bot.queued frames carry. Older computers omit it.
+    public var botQueuedMessages: [String: [QueuedSend]]?
 
-    private enum CodingKeys: String, CodingKey { case bots, groups }
+    private enum CodingKeys: String, CodingKey { case bots, groups, botQueuedMessages }
 
-    public init(bots: [Bot], groups: [Room]) {
+    public init(bots: [Bot], groups: [Room], botQueuedMessages: [String: [QueuedSend]]? = nil) {
         self.bots = bots
         self.groups = groups
+        self.botQueuedMessages = botQueuedMessages
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         bots = try container.decodeIfPresent([Lossy<Bot>].self, forKey: .bots)?.compactMap(\.value) ?? []
         groups = try container.decodeIfPresent([Lossy<Room>].self, forKey: .groups)?.compactMap(\.value) ?? []
+        // One malformed entry must not cost the whole fleet: the roster is
+        // worth more than the queue note beside it.
+        botQueuedMessages = (try? container.decodeIfPresent(
+            [String: [Lossy<QueuedSend>]].self,
+            forKey: .botQueuedMessages
+        ))??.mapValues { list in list.compactMap(\.value) }
     }
 }
 
@@ -694,6 +766,7 @@ public struct InstanceList: Codable, Sendable {
 /// Derived from `ConfigFlag.provider`, never decoded straight off the wire.
 public enum VoiceProvider: Hashable, Sendable {
     case elevenlabs
+    case fish
     case system
     case chatterbox
 
@@ -702,6 +775,7 @@ public enum VoiceProvider: Hashable, Sendable {
     public var wireValue: String {
         switch self {
         case .elevenlabs: "elevenlabs"
+        case .fish: "fish"
         case .system: "system"
         case .chatterbox: "chatterbox"
         }
@@ -759,17 +833,24 @@ public struct ConfigStatus: Codable, Sendable {
     }
 
     /// `voiceProvider(cfg)` in `server/tts/index.ts`: only the exact
-    /// strings `"system"` and `"chatterbox"` select those engines. A missing
+    /// strings `"fish"`, `"system"`, and `"chatterbox"` select those engines. A missing
     /// field — a computer older than the choice — and an engine this build
     /// has never heard of both fall back to ElevenLabs, which is the
     /// server's own rule and what keeps an unrecognised engine from being
     /// explained to the user with copy written for a different one.
     public var voiceProvider: VoiceProvider {
         switch tts?.provider {
+        case "fish": .fish
         case "system": .system
         case "chatterbox": .chatterbox
         default: .elevenlabs
         }
+    }
+
+    /// Walkie synthesizes directly on the phone through its own ElevenLabs
+    /// key. A voice chosen from another provider's catalog is not compatible.
+    public func walkieAgentVoice(_ voice: String?) -> String? {
+        voiceProvider == .elevenlabs ? voice : nil
     }
 }
 
