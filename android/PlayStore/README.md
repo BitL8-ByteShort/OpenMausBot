@@ -268,8 +268,8 @@ give instructions:
 ```
 This app is a companion for the OpenMausBot desktop app and cannot be used on
 its own. To test it: install the free desktop app from https://openmausbot.com
-(macOS, Windows, or Linux), open it, go to Settings > Companion, and show the
-pairing QR code. Scan that code with this app on a phone on the same Wi-Fi
+(macOS, Windows, or Linux), open it, go to Settings > Phone, and choose "Set up
+a phone" to show the pairing QR code. Scan that code with this app on a phone on the same Wi-Fi
 network. No account or purchase is required. A demo video of the paired flow is
 available on request at omkar@supamaus.com.
 ```
