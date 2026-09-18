@@ -1071,6 +1071,8 @@ describe("harness HTTP API", () => {
     const bot = created.body.bot;
     const person = await asPairedPerson("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) Safari/605.1");
     expect(person.label).toBe("Safari on Mac");
+    const cleanup: string[] = [bot.id];
+    try {
 
     const theirs = await person.call("POST", `/api/bots/${bot.id}/messages`, { text: "from the paired person" });
     expect(theirs.status).toBe(202);
@@ -1091,6 +1093,7 @@ describe("harness HTTP API", () => {
       requireAvailableModel: true,
     });
     expect(second.status).toBe(201);
+    cleanup.push(second.body.bot.id);
     const mine = await api("POST", `/api/bots/${second.body.bot.id}/messages`, { text: "from the owner" });
     expect(mine.status).toBe(202);
     expect(mine.body.message.role).toBe("user");
@@ -1103,6 +1106,16 @@ describe("harness HTTP API", () => {
     expect(theirMessages.find((m: any) => m.text === "from the paired person")?.sender).toEqual({ name: "Safari on Mac" });
     expect(theirMessages.find((m: any) => m.text === "and one more")?.sender).toEqual({ name: "Safari on Mac" });
     expect(myMessages.find((m: any) => m.text === "from the owner")?.sender).toBeUndefined();
+    } finally {
+      // Stop the fixture turns and take the bots and the paired session back
+      // out: this suite shares one isolated server, so anything left running
+      // here shows up as somebody else's failure much later.
+      for (const id of cleanup) {
+        await api("POST", `/api/bots/${id}/interrupt`).catch(() => undefined);
+        await api("DELETE", `/api/bots/${id}`).catch(() => undefined);
+      }
+      await person.call("DELETE", "/api/auth/session").catch(() => undefined);
+    }
   });
 
   it("rejects non-loopback authorities while accepting IPv4 and IPv6 loopback forms", async () => {
