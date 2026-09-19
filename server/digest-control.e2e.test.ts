@@ -63,7 +63,7 @@ it("records independent turns and room speakers through the shared control fixtu
     try {
       const path = `${fixture.info.logPath}.digests.json`;
       writeFileSync(path, JSON.stringify(evidence, null, 2));
-      console.log(`Digest control evidence: ${path}`);
+      console.log("Digest control evidence saved.");
     } finally { await fixture.close(); }
     expect(existsSync(fixture.info.dataDir)).toBe(false);
   }
