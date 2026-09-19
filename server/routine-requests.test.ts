@@ -141,7 +141,7 @@ describe("RoutineRequestService", () => {
 
     it.each<Partial<RoutineInput>>([
       { enabled: false }, { botId: "bot-b" }, { target: "room-goal", groupId: "room-a" },
-      { runOn: "cloud" }, { continuity: true }, { timeoutMinutes: 10 }, { durationMinutes: 60 },
+      { runOn: "cloud" }, { continuity: true }, { timeoutMinutes: 10 }, { durationMinutes: 60 }, { overlap: "queue" },
       { schedule: { type: "daily", time: "10:00", weekdays: [1, 3] } },
       { attachments: [{ id: "context", name: "Context", path: "/fixture/context.txt", kind: "file", size: 20 }] },
     ])("does not confuse different execution settings with a duplicate: %j", async (patch) => {
@@ -409,6 +409,19 @@ describe("RoutineRequestService", () => {
     });
     expect(result.state).toBe("applied");
     expect(routines.listRoutines().find((routine) => routine.name === "Morning brief")?.continuity).toBe(true);
+  });
+
+  it("reviews and persists queue policy changes without losing them in tool normalization", async () => {
+    const { service, routines } = harness();
+    const created = await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: createProposal({ overlap: "queue" }) });
+    expect(created.detail).toContain("Queue one scheduled run; skip further occurrences");
+    service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: created.requestId, behavior: "allow" });
+    const routine = routines.listRoutines()[0];
+    expect(routine.overlap).toBe("queue");
+    const update = await service.propose({ botId: "bot-a", threadId: "thread-a", proposal: { action: "update", routineId: routine.id, changes: { overlap: "skip" } } });
+    expect(update.detail).toContain("Skip overlapping scheduled occurrences");
+    service.resolve({ botId: "bot-a", threadId: "thread-a", requestId: update.requestId, behavior: "allow" });
+    expect(routines.listRoutines()[0].overlap).toBeUndefined();
   });
 
   it("canonicalizes receipt fingerprints and binds them to the card's conversation", async () => {
