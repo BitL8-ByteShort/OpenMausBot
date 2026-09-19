@@ -66,6 +66,16 @@ it("takes cron through the real routine tools and confirmation, preserving its z
     expect(await current()).toMatchObject({ schedule, enabled: true, runOn: "maus" });
     expect((await current()).nextRunAt).toBe(nextCronRuns(schedule, create.routineRequest.createdAt, 1)[0]);
 
+    const cardCount = (await messages()).filter(message => message.card?.routineRequest).length;
+    await proposal("propose_routine", {
+      name: "Renamed monthly report", instructions: "Summarize last month's fixture activity; no external services.", schedule,
+    }, "Try scheduling the same work again under a different name.", true);
+    const duplicateResponse = providerEvidence().at(-1).evidence.find((entry: any) => entry.step?.tool === "propose_routine").response;
+    expect(duplicateResponse.result.content[0].text).toContain(routineId);
+    expect(duplicateResponse.result.content[0].text).toContain("already exists");
+    expect((await messages()).filter(message => message.card?.routineRequest)).toHaveLength(cardCount);
+    expect((await api("GET", "/api/routines")).routines).toHaveLength(1);
+
     const lastDay = { ...schedule, expression: "0 9 L * *" };
     const update = await proposal("propose_routine_action", {
       action: "update", routine_id: routineId, changes: { schedule: lastDay },

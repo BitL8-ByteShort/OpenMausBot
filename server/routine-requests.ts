@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
 
@@ -969,6 +970,34 @@ function requestCommit(payload: RoutineRequestCardData, messageId: string): Rout
 }
 
 function revalidateOperation(operation: RoutineRequestOperation, manager: RoutineManager, botId: string, now: number): void {
+  if (operation.action === "create") {
+    const definition = operation.routine;
+    const owner = operation.forBot?.botId ?? botId;
+    const schedule = asSchedule(definition.schedule, now);
+    const duplicate = manager.listRoutines().find((routine) => {
+      if (!routine.enabled || routine.target !== "bot" || routine.botId !== owner
+        || routine.runOn !== definition.runOn || routine.prompt !== definition.instructions
+        || routine.durationMinutes !== definition.durationMinutes
+        || routine.timeoutMinutes !== definition.timeoutMinutes
+        || Boolean(routine.continuity) !== Boolean(definition.continuity)
+        || (routine.attachments?.length ?? 0) > 0) return false;
+      // An omitted start means "every N minutes", not a new phase each time
+      // the model retries. Explicit starts and all other constraints stay exact.
+      const candidate = schedule.type === "interval" && routine.schedule.type === "interval"
+        && definition.schedule.type === "interval" && definition.schedule.anchorAt === undefined
+        ? { ...schedule, anchorAt: routine.schedule.anchorAt }
+        : schedule;
+      return isDeepStrictEqual(candidate, routine.schedule);
+    });
+    if (duplicate) {
+      // The tool cannot choose a result destination. Return the existing ID,
+      // without moving its reports or treating a renamed request as new work.
+      throw new RoutineRequestError(
+        `An enabled routine with the same instructions and execution settings already exists (${duplicate.id}). Use list_routines to review it, then update or run that routine instead.`,
+        409,
+      );
+    }
+  }
   const current = operation.action === "create"
     ? null
     : verifyManageSnapshot(operation, manager, botId);
