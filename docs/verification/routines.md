@@ -146,6 +146,24 @@ never kill processes by name or delete a broad temporary root.
 
 ## Automated regressions
 
+In the editor's Advanced section, recurring routines offer **Skip this
+occurrence** (the default) or **Queue one run**. The queued scheduled run waits
+for the same routine to finish, including delegated work; extra occurrences
+are skipped, not accumulated. Manual runs and webhook deliveries remain
+independent. Pausing still cancels queued work. The cron renderer test changes
+this option, saves it, opens the editor again and switches it back.
+
+The List view and `list_routines` expose saved skipped-occurrence counts and
+recent consecutive failures. Skips count occurrences observed by the scheduler
+while busy, not every interval elapsed while offline. Failure streaks are
+derived from retained terminal receipts (up to the existing history limit),
+ignore cancelled/missed runs, and reset only after the whole run succeeds—not
+an intermediate turn waiting for a teammate. Neither indicator pauses work
+automatically. The scheduler tests cover bounded queues, daily/cron/interval
+parity, restart recovery, duplicate completion events and atomic cursor/counter
+rollback on a failed save. The MCP fixture verifies reviewed policy changes
+and the listing through the actual tool and API, using no live accounts.
+
 The routine tool defaults to `maus` (the bot's configured model and computer,
 including VPS); `box` explicitly selects the separate Box agent. Legacy `cloud`
 values remain accepted without migrating existing routines. The cron tool
