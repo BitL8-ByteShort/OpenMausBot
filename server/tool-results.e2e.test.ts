@@ -107,11 +107,12 @@ it("bounds a real roster, retrieves its tail, isolates owners and expires stoppe
     evidence.push({ checks: ["real roster capped", "tail retrievable", "unauthenticated refused", "sibling thread refused",
       "other bot refused", "spoofed thread refused", "oversize save refused", "stopped capability revoked", "next turn can read own result"] });
   } finally {
-    for (const proxy of proxies) await waitForExit(proxy, { signal: "SIGTERM" });
-    const path = `${fixture.info.logPath}.tool-results.json`;
-    // Never retain the provider launch dump or its short-lived capability.
-    writeFileSync(path, JSON.stringify({ url: fixture.info.url, log: fixture.info.logPath, evidence }, null, 2), { mode: 0o600 });
-    console.info(`Tool-result fixture evidence: ${path}`);
-    await fixture.close();
+    try {
+      await Promise.all(proxies.map((proxy) => waitForExit(proxy, { signal: "SIGTERM" })));
+      const path = `${fixture.info.logPath}.tool-results.json`;
+      // Never retain the provider launch dump or its short-lived capability.
+      writeFileSync(path, JSON.stringify({ url: fixture.info.url, log: fixture.info.logPath, evidence }, null, 2), { mode: 0o600 });
+      console.info(`Tool-result fixture evidence: ${path}`);
+    } finally { await fixture.close(); }
   }
 }, 90_000);
