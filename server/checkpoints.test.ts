@@ -5,7 +5,7 @@
 // user's own git repo in the folder is never touched, and dangerous folders
 // (home) are refused outright.
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -310,7 +310,7 @@ describe("diffStat", () => {
     const before = await snapshot(bot, cwd, "turn aaaaaaaa");
     writeFileSync(join(cwd, "edit.txt"), "after");
     writeFileSync(join(cwd, "new.txt"), "hello");
-    execFileSync("rm", [join(cwd, "gone.txt")]);
+    unlinkSync(join(cwd, "gone.txt"));
     const after = await snapshot(bot, cwd, "settle aaaaaaaa");
     expect(before).not.toBeNull();
     expect(after).not.toBeNull();

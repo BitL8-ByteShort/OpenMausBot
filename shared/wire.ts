@@ -285,8 +285,8 @@ export interface WireMessage {
     name: string; ok?: boolean; spoken?: string; setup?: boolean; terminal?: boolean; summary?: string; input?: string; output?: string;
     /** Provider item identity, scoped to the owning turn. */
     itemId?: string;
-    /** Full redacted result captured by the harness, when available. */
-    outputPath?: string;
+    /** Whether the harness captured the full redacted result. Private
+     * server-local spill paths are not exposed to clients. */
     fullResult?: boolean;
   };
   /** user messages sent INTO a running turn (capabilities.queueing). */

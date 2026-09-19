@@ -1222,6 +1222,7 @@ function cancelDirectTurnDispatch(botId: string, expectedThreadId?: string): Dir
   const claim = directTurnDispatchClaims.get(threadId);
   if (!claim || claim.botId !== botId) return null;
   directTurnDispatchClaims.delete(threadId);
+  if (directTurnGenerationByThread.get(threadId) === claim.id) clearTurnDigestState(threadId);
   // Setup has not called the adapter yet, so there is no provider handshake
   // (and no unknown turn id) to quarantine. Dispatching is the only phase in
   // which a late provider event can exist.
@@ -3599,7 +3600,10 @@ bus.subscribe((event: RuntimeEvent) => {
   if (shouldIgnoreProviderEvent(event)) return;
   if (event.type === "turn.completed" || event.type === "session.exited") {
     runningTurnEngines.delete(event.threadId);
-    memoryRowsByThread.set(event.threadId, endMemoryTurn(event.threadId));
+    const rows = endMemoryTurn(event.threadId);
+    if (rows.length && (store.botByThread(event.threadId) || store.groupByThread(event.threadId))) {
+      memoryRowsByThread.set(event.threadId, rows);
+    } else memoryRowsByThread.delete(event.threadId);
   }
 });
 
@@ -3642,6 +3646,13 @@ const turnCheckpoints = new Map<string, { cwd: string; hash: string }>();
 // a digest can only count activity it can attribute — so an unstamped tool
 // row is attributed to the thread's live turn instead of to nothing.
 const liveTurnByThread = new Map<string, string>();
+
+function clearTurnDigestState(threadId: string): void {
+  turnStartedAt.delete(threadId);
+  turnCheckpoints.delete(threadId);
+  liveTurnByThread.delete(threadId);
+  memoryRowsByThread.delete(threadId);
+}
 
 const TOOL_RESULTS_DIR = join(DATA_DIR, "tool-results");
 const TOOL_RESULT_SPILL_MAX = 512 * 1024;
@@ -3698,7 +3709,7 @@ function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: 
       ? `${redacted.slice(0, TOOL_RESULT_SPILL_MAX)}\n[… ${redacted.length - TOOL_RESULT_SPILL_MAX} more characters omitted]`
       : redacted;
     writeFileAtomic(file, bounded, { mode: 0o600 });
-    store.patchMessage(threadId, row.id, { tool: { ...row.tool, outputPath: file, fullResult: redacted.length <= TOOL_RESULT_SPILL_MAX } }, { kind: "hook.ingest", key });
+    store.patchMessage(threadId, row.id, { tool: { ...row.tool, fullResult: redacted.length <= TOOL_RESULT_SPILL_MAX } }, { kind: "hook.ingest", key });
   }
   return { ok: true };
 }
@@ -6716,6 +6727,9 @@ async function startTurn(
       // a turn.
       if (checkpointCwd) {
         const before = await checkpoints.snapshot(bot.id, checkpointCwd, `turn ${threadId.slice(0, 8)}`);
+        if (!directTurnClaimIsCurrent(bot.id, dispatchClaimId, threadId)) {
+          throw new DirectTurnSetupCancelled("turn stopped during checkpoint");
+        }
         if (before) turnCheckpoints.set(threadId, { cwd: checkpointCwd, hash: before });
         else turnCheckpoints.delete(threadId);
       }
@@ -6921,6 +6935,7 @@ async function startTurn(
       const ownsLatestGeneration = directTurnGenerationByThread.get(threadId) === dispatchClaimId;
       releaseTurnResources(resourceOwner);
       if (ownsLatestGeneration) {
+        clearTurnDigestState(threadId);
         releaseLocalVmThread(threadId);
         vpsThreadEnded(bot.id, threadId);
         watchdog.settle(threadId);
@@ -7536,6 +7551,7 @@ async function deleteBotWithLifecycle(botId: string, revalidate: () => void = ()
           // staged provider images into a message, so dispose them here.
           for (const task of store.tasks(bot.id)) {
             purgeGeneratedImagesForThread(task.threadId);
+            clearTurnDigestState(task.threadId);
             settleDirectFollowup(directTurnGenerationByThread.get(task.threadId));
             directTurnGenerationByThread.delete(task.threadId);
             directTurnBots.delete(task.threadId);
@@ -14068,6 +14084,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       lastReply.delete(m[2]);
       cancelTeamSetupResumesForThread(m[2]);
       const updated = store.deleteGroupTask(group.id, m[2]);
+      if (updated) clearTurnDigestState(m[2]);
       if (!updated) return json(res, 400, { error: "a channel keeps at least one task" });
       rejectDeletedThreadSkillStages(stagedSkillCleanups);
       const fresh = groupWithThread(updated);
@@ -14107,6 +14124,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       for (const threadId of threadIds) {
         cancelTeamSetupResumesForThread(threadId);
         lastReply.delete(threadId);
+        clearTurnDigestState(threadId);
       }
       routines!.disableForGroup(group.id);
       store.deleteGroup(group.id);
@@ -16206,6 +16224,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       cancelTeamSetupResumesForThread(m[2]);
       const updated = store.deleteTask(m[1], m[2]);
       if (!updated) return json(res, 404, { error: "no such task" });
+      clearTurnDigestState(m[2]);
       handoffs.forget(m[2]);
       settleDirectFollowup(directTurnGenerationByThread.get(m[2]));
       rejectDeletedThreadSkillStages(stagedSkillCleanups);

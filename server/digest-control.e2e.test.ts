@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it } from "vitest";
@@ -41,12 +41,13 @@ it("records independent turns and room speakers through the shared control fixtu
       expect(row.digest?.tools).toMatchObject([{ name: "Bash", count: 1, failed: 0 }]);
       expect(row.digest?.hookCoverage).toBe("full");
       const tool = direct.find(message => message.turnId === row.turnId && message.tool?.itemId);
-      expect(tool?.tool?.outputPath).toBeTruthy();
-      expect(existsSync(tool!.tool!.outputPath!)).toBe(true);
+      expect(tool?.tool?.fullResult).toBe(true);
+      expect(tool?.tool).not.toHaveProperty("outputPath");
     }
     // The fake reuses tool ids across turns: each must have its own receipt
     // and spill file rather than inheriting evidence from its predecessor.
-    expect(new Set(direct.filter(row => row.tool?.outputPath).map(row => row.tool!.outputPath)).size).toBe(2);
+    expect(readdirSync(join(fixture.info.dataDir, "tool-results", first.activeTaskId))).toHaveLength(2);
+    expect(JSON.stringify(direct)).not.toContain(fixture.info.dataDir);
     const channel = (await control(["new-channel", "--name", "Receipt room", "--members", `${first.id},${second.id}`])).channel;
     await control(["send-channel", "--channel", channel.id, "--text", "Each reply once"]);
     expect((await control(["wait", "--channel", channel.id, "--timeout", "30"])).status).toBe("settled");
@@ -59,10 +60,11 @@ it("records independent turns and room speakers through the shared control fixtu
       expect(db.prepare("SELECT COUNT(*) AS count FROM command_receipts WHERE kind = 'digest.append' AND key LIKE ?").get(`${first.activeTaskId}:%`)?.count).toBe(2);
     } finally { db.close(); }
   } finally {
-    const path = `${fixture.info.logPath}.digests.json`;
-    writeFileSync(path, JSON.stringify(evidence, null, 2));
-    console.log(`Digest control evidence: ${path}`);
-    await fixture.close();
+    try {
+      const path = `${fixture.info.logPath}.digests.json`;
+      writeFileSync(path, JSON.stringify(evidence, null, 2));
+      console.log(`Digest control evidence: ${path}`);
+    } finally { await fixture.close(); }
     expect(existsSync(fixture.info.dataDir)).toBe(false);
   }
 }, 90_000);

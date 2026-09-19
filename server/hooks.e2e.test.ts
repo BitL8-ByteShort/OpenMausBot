@@ -7,7 +7,7 @@
 //
 // Same POSIX gating as branching.test.ts (the fake CLI is a shebang script).
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +24,7 @@ interface Msg {
   role: string;
   kind: string;
   text?: string;
-  tool?: { name: string; itemId?: string; outputPath?: string; fullResult?: boolean; output?: string };
+  tool?: { name: string; itemId?: string; fullResult?: boolean; output?: string };
   digest?: { hookCoverage: string; tools: Array<{ name: string; count: number }> };
 }
 
@@ -62,6 +62,8 @@ function harness(label: string, serverEnv: Record<string, string>, instanceEnv: 
           driver: "claudeAgent",
           environment: {
             ...instanceEnv,
+            FAKE_CLAUDE_TURN_STATE: join(home, "turns"),
+            FAKE_CLAUDE_PROMPTS: join(home, "prompts.ndjson"),
             FAKE_CLAUDE_HOOKS: "1",
             FAKE_CLAUDE_TOOL_CALLS: JSON.stringify([
               { name: "Bash", input: { command: "cat big.log" }, ok: true, output: BIG },
@@ -118,12 +120,18 @@ posixOnly("engine hooks e2e (fake Claude honouring the settings hooks)", () => {
     for (const row of tools) {
       expect(row.tool!.itemId).toBeTruthy();
       expect(row.tool!.fullResult).toBe(true);
-      expect(row.tool!.outputPath).toContain(join(h.home(), ".openmausbot", "tool-results"));
-      expect(existsSync(row.tool!.outputPath!)).toBe(true);
-      expect(statSync(row.tool!.outputPath!).mode & 0o777).toBe(0o600);
+      expect(row.tool).not.toHaveProperty("outputPath");
     }
+    expect(JSON.stringify(tools)).not.toContain(h.home());
+    const root = join(h.home(), ".openmausbot", "tool-results");
+    const threads = readdirSync(root);
+    expect(threads).toHaveLength(1);
+    const dir = join(root, threads[0]!);
+    const files = readdirSync(dir).map((name) => join(dir, name));
+    expect(files).toHaveLength(2);
+    for (const file of files) expect(statSync(file).mode & 0o777).toBe(0o600);
     const bash = tools[0]!.tool!;
-    const spilled = readFileSync(bash.outputPath!, "utf8");
+    const spilled = files.map((file) => readFileSync(file, "utf8")).find((text) => text.startsWith("line "))!;
     expect(spilled.length).toBeGreaterThan(10_000);
     expect(spilled).toContain(BIG.slice(0, 200));
     // the row's own preview stays bounded; the file has the rest
@@ -140,7 +148,7 @@ posixOnly("engine hooks e2e (fake Claude honouring the settings hooks)", () => {
 });
 
 posixOnly("engine hooks e2e: compaction", () => {
-  const h = harness("compact", {}, { FAKE_CLAUDE_COMPACT: "1", FAKE_CLAUDE_TURN_STATE: join(tmpdir(), `omb-hooks-turns-${process.pid}-${Date.now()}`), FAKE_CLAUDE_PROMPTS: join(tmpdir(), `omb-hooks-prompts-${process.pid}-${Date.now()}.ndjson`) });
+  const h = harness("compact", {}, { FAKE_CLAUDE_COMPACT: "1" });
 
   it("records the compaction in the transcript and hands the latest digests back to the engine as plain-text context", async () => {
     const bot = await h.runTurn();
@@ -175,7 +183,7 @@ posixOnly("engine hooks e2e with OMB_HOOKS=0", () => {
     expect(tools.length).toBe(2);
     for (const row of tools) {
       expect(row.tool!.fullResult).toBeUndefined();
-      expect(row.tool!.outputPath).toBeUndefined();
+      expect(row.tool).not.toHaveProperty("outputPath");
     }
     const digest: Msg = bot.messages.find((m: Msg) => m.kind === "digest");
     expect(digest.digest?.hookCoverage).toBe("preview");

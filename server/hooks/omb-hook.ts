@@ -23,10 +23,11 @@ const MAX_INPUT_BYTES = 1024 * 1024;
 const url = process.env.OMB_HOOK_URL ?? "";
 const tokenFile = process.env.OMB_HOOK_TOKEN_FILE ?? "";
 
-const done = (out?: unknown) => {
-  if (out !== undefined) process.stdout.write(JSON.stringify(out));
-  process.exit(0);
+const done = (out?: string) => {
+  if (out === undefined) process.exit(0);
+  process.stdout.write(out, () => process.exit(0));
 };
+process.stdout.on("error", () => process.exit(0));
 // the outer fuse: whatever is still pending when this fires, we leave
 const fuse = setTimeout(() => done(), budgetMs);
 fuse.unref();
@@ -78,14 +79,13 @@ async function main(): Promise<void> {
     if (!response.ok) return done();
     const body = (await response.json().catch(() => null)) as { hookSpecificOutput?: unknown; context?: unknown } | null;
     if (body && typeof body === "object" && body.hookSpecificOutput && typeof body.hookSpecificOutput === "object") {
-      return done({ hookSpecificOutput: body.hookSpecificOutput });
+      return done(JSON.stringify({ hookSpecificOutput: body.hookSpecificOutput }));
     }
     // On SessionStart (and UserPromptSubmit) Claude Code reads plain-text
     // stdout as context the model sees; on every other event stdout is
     // only a debug line, so a context body is printed nowhere else.
     if (body && typeof body === "object" && typeof body.context === "string" && body.context && CONTEXT_EVENTS.has(event)) {
-      process.stdout.write(body.context);
-      return done();
+      return done(body.context);
     }
     return done();
   } catch {

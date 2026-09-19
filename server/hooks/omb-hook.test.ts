@@ -26,6 +26,8 @@ function run(stdin: string, env: Record<string, string>): Promise<{ code: number
   return new Promise((resolve) => {
     const started = Date.now();
     const child = spawn(process.execPath, [HELPER], { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
@@ -49,6 +51,16 @@ function listen(handler: Parameters<typeof createServer>[1]): Promise<string> {
 }
 
 describe("omb-hook helper", () => {
+  it.each(["context", "hookSpecificOutput"])("flushes large %s replies before exiting", async (field) => {
+    const context = "A long restored note 🐭\n".repeat(20_000);
+    const body = field === "context" ? { context } : { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } };
+    const url = await listen((_req, res) => res.end(JSON.stringify(body)));
+    const result = await run(JSON.stringify({ hook_event_name: "SessionStart" }), { OMB_HOOK_URL: url, OMB_HOOK_TOKEN_FILE: tokenFile });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe(field === "context" ? context : JSON.stringify(body));
+    expect(result.stderr).toBe("");
+  });
+
   it("does not forward oversized hook input", async () => {
     let requests = 0;
     const url = await listen((_req, res) => { requests++; res.end("{}"); });
