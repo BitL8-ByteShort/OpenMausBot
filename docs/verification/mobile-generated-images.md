@@ -63,6 +63,16 @@ Native results: **462 Swift core tests; 544 Android core + 916 Android app tests
 The Android preview APK builds and passes APK v2 signature verification. The
 focused real-server run passes **10 tests** (220 unrelated tests filtered out).
 
+Repository-wide run on 2026-09-19: **7,351 passed, 1 failed, 60 skipped,
+1 todo** across 586 Vitest files (569 passed, 1 failed, 16 skipped). The only
+failure is the existing delegate replay assertion at
+`server/delta-context.e2e.test.ts:963`, previously reproduced against pristine
+main `0c327bca` during the mobile queue investigation. It is unrelated to these
+attachment changes. `pnpm test` therefore exits nonzero before its chained
+checks; running those separately passes **9 broker tests**, **347 Electron tests
+(3 skipped)**, and the packaged-server smoke. Typecheck, lint, and locale
+validation pass. The full suite is not claimed green.
+
 Generate the Xcode project with `xcodegen generate --spec ios/project.yml`.
 Create a fresh simulator, then run:
 
