@@ -86,6 +86,22 @@ describe("runCommand nesting", () => {
     mkdirSync(DATA_DIR, { recursive: true });
   });
 
+  it("rolls back a failed inner command even when the outer caller handles its error", () => {
+    runCommand({ kind: "outer", key: "one" }, () => {
+      try {
+        runCommand({ kind: "inner", key: "one" }, () => {
+          insertMessage("nested", msg("partial", "must roll back"));
+          throw new Error("inner failed");
+        });
+      } catch { /* the outer command can continue without the failed inner effect */ }
+      insertMessage("nested", msg("complete", "kept"));
+      return "outer completed";
+    });
+    expect(readThread("nested", "/nonexistent").messages.map(message => message.id)).toEqual(["complete"]);
+    expect(commandReceipt("inner", "one")).toBeNull();
+    expect(commandReceipt("outer", "one")?.result).toBe("outer completed");
+  });
+
   it("lets apply use the store's own transactional writes and keeps them atomic with the receipt", async () => {
     const { appendMessage } = await import("./message-db.ts");
     // appendMessage opens its own transaction; inside a command it must join

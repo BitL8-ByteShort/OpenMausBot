@@ -14,6 +14,7 @@ import {
   type ReactNode,
 } from "react";
 import type { CloudBackend, EffortLevel, ServerFrame } from "../../shared/wire";
+import type { TurnDigest } from "../../shared/digest";
 import type { ModelVariantOption, RuntimeEvent } from "../../shared/runtime-events";
 import type { MausColor, MausMotion } from "@/lib/mascot";
 import type { BotAvatarCrop } from "../../shared/bot-avatar";
@@ -137,16 +138,7 @@ export interface Message {
   kind: "text" | "options" | "activity" | "screen" | "connector" | "secret" | "routine.run" | "goal.run" | "digest";
   text?: string;
   /** digest messages: what the turn did, rendered in `text` and structured here. */
-  digest?: {
-    turnId: string;
-    durationMs: number;
-    tools: Array<{ name: string; count: number; failed: number; sample?: string }>;
-    toolsDropped?: number;
-    files?: { changed: string[]; added: string[]; deleted: string[]; truncated?: number };
-    memory: Array<{ path: string; kind: "created" | "updated" | "deleted" }>;
-    reply: string;
-    hookCoverage: "full" | "preview" | "none";
-  };
+  digest?: TurnDigest;
   /** Provider-generated files attached to this assistant response. */
   attachments?: Array<{ kind: "image"; path: string; mime: string }>;
   card?: OptionCardData;

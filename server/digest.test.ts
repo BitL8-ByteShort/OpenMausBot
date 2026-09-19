@@ -15,7 +15,7 @@ const activity = (name: string, ok: boolean | undefined, summary?: string, turnI
   kind: "activity",
   at: 1,
   turnId,
-  tool: { name, ok, summary },
+  tool: { name, ok, summary, itemId: `tool-${Math.random()}` },
 });
 
 const journal = (path: string, kind: MemoryJournalEntry["kind"]): MemoryJournalEntry => ({
@@ -55,7 +55,7 @@ describe("buildTurnDigest", () => {
   it("ignores activity rows from other turns and rows that are not tool calls", () => {
     const d = buildTurnDigest({
       ...base,
-      activities: [activity("Bash", true, "ls", "turn-0"), { ...activity("Bash", true, "pwd"), tool: undefined }],
+      activities: [activity("Bash", true, "ls", "turn-0"), { ...activity("Bash", true, "pwd"), tool: undefined }, { ...activity("status", true), tool: { name: "context compacted", ok: true } }],
       memory: [],
     });
     expect(d.tools).toEqual([]);
@@ -69,6 +69,7 @@ describe("buildTurnDigest", () => {
     expect(d.tools).toHaveLength(8);
     expect(d.tools[0]).toMatchObject({ name: "tool9", count: 10 });
     expect(d.toolsDropped).toBe(2);
+    expect(d.toolCalls).toBe(55);
   });
 
   it("maps memory journal rows to path + kind and carries files from the checkpoint diff", () => {
@@ -97,6 +98,19 @@ describe("buildTurnDigest", () => {
     const d = buildTurnDigest({ ...base, activities: [], memory: [], files: { changed, added: [], deleted: [] } });
     expect(d.files?.changed).toHaveLength(20);
     expect(d.files?.truncated).toBe(10);
+  });
+
+  it("bounds stored metadata as well as the rendered paragraph without splitting emoji", () => {
+    const path = "🧵".repeat(1000);
+    const d = buildTurnDigest({ ...base, activities: [activity(path, true, path)], memory: Array.from({ length: 100 }, () => journal(path, "edited")), files: { changed: [path], added: [], deleted: [] } });
+    expect(d.memory).toHaveLength(20);
+    expect(d.memoryDropped).toBe(80);
+    expect(Buffer.byteLength(d.tools[0]!.name)).toBeLessThanOrEqual(160);
+    expect(Buffer.byteLength(d.tools[0]!.sample!)).toBeLessThanOrEqual(300);
+    expect(Buffer.byteLength(d.memory[0]!.path)).toBeLessThanOrEqual(512);
+    for (const text of [d.memory[0]!.path, d.files!.changed[0]!, renderDigest(d)]) {
+      expect(Buffer.from(text, "utf8").toString("utf8")).toBe(text);
+    }
   });
 });
 
@@ -134,7 +148,7 @@ describe("renderDigest", () => {
 
   it("says when the record is from previews or absent, so a reader never over-trusts it", () => {
     expect(renderDigest({ ...digest, hookCoverage: "preview" })).toContain("from tool previews");
-    expect(renderDigest({ ...digest, hookCoverage: "none", tools: [] })).toContain("no tool activity visible");
+    expect(renderDigest({ ...digest, hookCoverage: "none", tools: [] })).toContain("no tool activity observed");
     expect(renderDigest({ ...digest, hookCoverage: "full" })).not.toContain("from tool previews");
   });
 });
@@ -149,25 +163,27 @@ describe("digestPromptLine", () => {
 });
 
 describe("coverageForDriver", () => {
-  it("reports no visibility for chat-only and box engines, previews for CLI engines, full when results were delivered", async () => {
+  it("reports observed evidence regardless of engine family", async () => {
     const { coverageForDriver } = await import("./digest.ts");
-    expect(coverageForDriver("openai-compat")).toBe("none");
-    expect(coverageForDriver("grok")).toBe("none");
-    expect(coverageForDriver("minimax")).toBe("none");
+    expect(coverageForDriver("openai-compat", false, true)).toBe("preview");
+    expect(coverageForDriver("grok", false, true)).toBe("preview");
+    expect(coverageForDriver("minimax", false, true)).toBe("preview");
     expect(coverageForDriver("boxAgent")).toBe("none");
-    expect(coverageForDriver("claudeAgent")).toBe("preview");
-    expect(coverageForDriver("codex")).toBe("preview");
-    expect(coverageForDriver("grokAgent")).toBe("preview");
-    expect(coverageForDriver("piAgent")).toBe("preview");
+    expect(coverageForDriver("claudeAgent", false, true)).toBe("preview");
+    expect(coverageForDriver("codex", false, true)).toBe("preview");
+    expect(coverageForDriver("grokAgent", false, true)).toBe("preview");
+    expect(coverageForDriver("piAgent", false, true)).toBe("preview");
     expect(coverageForDriver("claudeAgent", true)).toBe("full");
-    expect(coverageForDriver(undefined)).toBe("preview");
+    expect(coverageForDriver("grok", true)).toBe("full");
+    expect(coverageForDriver("boxAgent", false, true)).toBe("preview");
+    expect(coverageForDriver(undefined)).toBe("none");
   });
 });
 
 describe("toolEvidence", () => {
   it("is full only when every tool row of the turn carries a delivered result", async () => {
     const { toolEvidence } = await import("./digest.ts");
-    const full = { ...activity("Bash", true, "ls"), tool: { name: "Bash", ok: true, fullResult: true } };
+    const full = { ...activity("Bash", true, "ls"), tool: { name: "Bash", itemId: "bash-1", ok: true, fullResult: true } };
     const preview = activity("Read", true, "a.ts");
     expect(toolEvidence([full, { ...full, id: "b" }], "turn-1")).toBe(true);
     expect(toolEvidence([full, preview], "turn-1")).toBe(false);

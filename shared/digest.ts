@@ -24,10 +24,13 @@ export interface TurnDigest {
   at: number;
   durationMs: number;
   tools: DigestTool[];
+  /** Total observed calls, including tool names omitted from the list. */
+  toolCalls?: number;
   /** Tools beyond the busiest MAX_TOOLS, dropped from `tools`. */
   toolsDropped?: number;
   files?: DigestFiles;
   memory: Array<{ path: string; kind: "created" | "updated" | "deleted" }>;
+  memoryDropped?: number;
   /** First sentence of the terminal assistant text, at most REPLY_CHARS. */
   reply: string;
   usage?: { input: number; output: number; cachedInput?: number; costUsd?: number | null };

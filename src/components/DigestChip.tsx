@@ -10,8 +10,8 @@ import type { Message } from "@/state/store";
 export function DigestChip({ message }: { message: Message }) {
   const digest = message.digest;
   if (!digest) return null;
-  const tools = digest.tools.reduce((n, tool) => n + tool.count, 0);
-  const files = digest.files ? digest.files.changed.length + digest.files.added.length + digest.files.deleted.length : null;
+  const tools = digest.toolCalls ?? `${digest.tools.reduce((n, tool) => n + tool.count, 0)}${digest.toolsDropped ? "+" : ""}`;
+  const files = digest.files ? digest.files.changed.length + digest.files.added.length + digest.files.deleted.length + (digest.files.truncated ?? 0) : null;
   const label = files === null
     ? t("chat.digestChipNoFiles", { tools })
     : t("chat.digestChip", { tools, files });

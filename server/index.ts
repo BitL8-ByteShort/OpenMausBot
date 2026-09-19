@@ -2,7 +2,8 @@
 // (upstream rule): the React app dispatches typed commands over HTTP and
 // folds one SSE event stream; every provider process runs here.
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync, readFileSync, rmSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, mkdirSync } from "node:fs";
+import { writeFileAtomic } from "./atomic.ts";
 import { rm as removeDirectory } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { extname, join } from "node:path";
@@ -45,7 +46,7 @@ import {
   type BrowserCleanupWireRequest,
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
-import { runCommand } from "./commands.ts";
+import { commandReceipt } from "./commands.ts";
 import { buildTurnDigest, coverageForDriver, digestPromptLine, renderDigest, toolEvidence } from "./digest.ts";
 import { appendDecision, readDecisions, flushDecisionLog } from "./decision-log.ts";
 import { validateBotCwd } from "./bot-cwd.ts";
@@ -3670,49 +3671,53 @@ function ingestEngineHook(capability: InternalCapability, body: unknown): { ok: 
   if (name === "SessionStart") {
     if (payload.source !== "compact") return { ok: true, ignored: `SessionStart ${String(payload.source ?? "")}` };
     const bot = store.bot(capability.botId);
-    const digests = store.messagesFor(threadId).filter((m) => m.kind === "digest" && m.digest).slice(-DIGESTS_AFTER_COMPACTION);
+    const digests = store.activePath(threadId).filter((m) => m.kind === "digest" && m.digest).slice(-DIGESTS_AFTER_COMPACTION);
     chip(`context compacted — re-sent the last ${digests.length} digest${digests.length === 1 ? "" : "s"}`);
     if (!digests.length) return { ok: true };
-    const context = digests.map((m) => digestPromptLine(m.digest!, bot?.name ?? "the bot")).join("\n");
+    const context = digests.map((m) => digestPromptLine(m.digest!, m.from?.name ?? store.bot(m.digest!.botId)?.name ?? bot?.name ?? "the bot")).join("\n");
     return { ok: true, context };
   }
   if (name === "Stop") return { ok: true };
   if (name !== "PostToolUse") return { ok: true, ignored: name || "unknown" };
   const toolUseId = typeof payload.tool_use_id === "string" ? payload.tool_use_id : "";
   if (!toolUseId) return { ok: true, ignored: "PostToolUse without tool_use_id" };
+  if (!Object.hasOwn(payload, "tool_response")) return { ok: true, ignored: "hook did not include a tool response" };
   const response = payload.tool_response;
   const text = typeof response === "string" ? response : JSON.stringify(response ?? null, null, 2);
-  runCommand({ kind: "hook.ingest", key: `${threadId}:${toolUseId}` }, () => {
+  const turnId = liveTurnByThread.get(threadId);
+  const row = store.activePath(threadId).findLast((m) => m.kind === "activity" && m.turnId === turnId && m.tool?.itemId === toolUseId);
+  if (!turnId || !row?.tool) return { ok: true, ignored: "tool not observed in this turn" };
+  const key = `${threadId}:${turnId}:${toolUseId}`;
+  if (!commandReceipt("hook.ingest", key)) {
     const dir = join(TOOL_RESULTS_DIR, threadId.replace(/[^\w.-]/g, "_"));
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const safeId = toolUseId.replace(/[^\w.-]/g, "_").slice(0, 120);
+    const safeId = createHash("sha256").update(key).digest("hex");
     const file = join(dir, `${safeId}.txt`);
     const redacted = redactSecretsInText(text);
     const bounded = redacted.length > TOOL_RESULT_SPILL_MAX
       ? `${redacted.slice(0, TOOL_RESULT_SPILL_MAX)}\n[… ${redacted.length - TOOL_RESULT_SPILL_MAX} more characters omitted]`
       : redacted;
-    writeFileSync(file, bounded, { mode: 0o600 });
-    const row = [...store.messagesFor(threadId)].reverse().find((m) => m.kind === "activity" && m.tool?.itemId === toolUseId);
-    if (row?.tool) {
-      store.patchMessage(threadId, row.id, { tool: { ...row.tool, outputPath: file, fullResult: true } });
-    }
-    return row?.id ?? null;
-  });
+    writeFileAtomic(file, bounded, { mode: 0o600 });
+    store.patchMessage(threadId, row.id, { tool: { ...row.tool, outputPath: file, fullResult: redacted.length <= TOOL_RESULT_SPILL_MAX } }, { kind: "hook.ingest", key });
+  }
   return { ok: true };
 }
 
-/** Write the turn's work digest (item 0.1). Runs off the fold's critical
- * path because the file diff shells out to git; the receipt keyed on the
- * turn makes a duplicate settle event harmless. Never throws. */
-function scheduleTurnDigest(input: {
+/** Persist observed tools and memory immediately. Keep a direct turn's
+ * workspace claimed while its bounded file snapshot settles, then enrich
+ * that same row only if its task and active branch still exist. */
+async function scheduleTurnDigest(input: {
   botId: string;
   botName: string;
   threadId: string;
   turnId: string;
   driverKind: string | undefined;
+  instanceId?: string;
   reply: string;
+  from?: Message["from"];
+  isCurrent: () => boolean;
   usage?: { input: number; output: number; cachedInput?: number; costUsd?: number | null };
-}): void {
+}): Promise<void> {
   const at = Date.now();
   const startedAt = turnStartedAt.get(input.threadId);
   turnStartedAt.delete(input.threadId);
@@ -3720,42 +3725,61 @@ function scheduleTurnDigest(input: {
   turnCheckpoints.delete(input.threadId);
   const memory = memoryRowsByThread.get(input.threadId) ?? [];
   memoryRowsByThread.delete(input.threadId);
-  void (async () => {
-    try {
-      let files: Awaited<ReturnType<typeof checkpoints.diffStat>> = null;
-      if (checkpoint) {
-        const after = await checkpoints.snapshot(input.botId, checkpoint.cwd, `settle ${input.threadId.slice(0, 8)}`);
-        if (after) files = await checkpoints.diffStat(input.botId, checkpoint.cwd, checkpoint.hash, after);
-        if (after && !files && checkpoint.hash === after) files = { changed: [], added: [], deleted: [] };
-      }
-      const activities = store.messagesFor(input.threadId);
-      const digest = buildTurnDigest({
+  try {
+    if (!input.isCurrent()) return;
+    const activities = store.activePath(input.threadId);
+    const digest = buildTurnDigest({
+      turnId: input.turnId,
+      botId: input.botId,
+      threadId: input.threadId,
+      at,
+      durationMs: startedAt ? Math.max(0, at - startedAt) : 0,
+      activities,
+      memory,
+      reply: input.reply,
+      ...(input.usage ? { usage: input.usage } : {}),
+      hookCoverage: coverageForDriver(input.driverKind, toolEvidence(activities, input.turnId), activities.some(m => m.kind === "activity" && m.turnId === input.turnId && m.tool?.itemId)),
+    });
+    const message = store.appendMessage(input.threadId, {
+        role: "bot",
+        kind: "digest",
+        text: renderDigest(digest),
+        digest,
         turnId: input.turnId,
-        botId: input.botId,
-        threadId: input.threadId,
-        at,
-        durationMs: startedAt ? Math.max(0, at - startedAt) : 0,
-        activities,
-        memory,
-        ...(files ? { files } : {}),
-        reply: input.reply,
-        ...(input.usage ? { usage: input.usage } : {}),
-        hookCoverage: coverageForDriver(input.driverKind, toolEvidence(activities, input.turnId)),
-      });
-      runCommand({ kind: "digest.append", key: `${input.threadId}:${input.turnId}` }, () => {
-        const message = store.appendMessage(input.threadId, {
-          role: "bot",
-          kind: "digest",
-          text: renderDigest(digest),
-          digest,
-          turnId: input.turnId,
-        });
-        return message.id;
-      });
-    } catch (error) {
-      console.error(`digest: could not record turn ${input.turnId} on ${input.threadId}:`, error instanceof Error ? error.message : error);
+        ...(input.from ? { from: input.from } : {}),
+      }, { kind: "digest.append", key: `${input.threadId}:${input.turnId}` });
+    // This is derived from the native session's own work, not an unseen
+    // teammate message. Record it alongside that turn's replies so normal
+    // resumes stay delta-only. Other engines still receive it on replay.
+    if (input.instanceId && !input.from) {
+      const handed = store.taskByThread(input.botId, input.threadId)?.handedMessages?.[input.instanceId];
+      if (handed) store.setHandedMessages(input.botId, input.threadId, input.instanceId,
+        recordHanded(handed, store.activePath(input.threadId).filter(isContextMessage).map(row => row.id), [message.id]));
     }
-  })();
+    if (!checkpoint) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const capture = async () => {
+      const after = await checkpoints.snapshot(input.botId, checkpoint.cwd, `settle ${input.threadId.slice(0, 8)}`, controller.signal);
+      if (!after || controller.signal.aborted) return null;
+      if (checkpoint.hash === after) return { changed: [], added: [], deleted: [] };
+      return checkpoints.diffStat(input.botId, checkpoint.cwd, checkpoint.hash, after, controller.signal);
+    };
+    let files: Awaited<ReturnType<typeof capture>>;
+    try {
+      files = await Promise.race([
+        capture(),
+        new Promise<null>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(null); }, 3_000); }),
+      ]);
+    } finally {
+      clearTimeout(timer!);
+    }
+    if (!files || !input.isCurrent() || !store.activePath(input.threadId).some(row => row.id === message.id)) return;
+    const withFiles = buildTurnDigest({ ...digest, activities, memory, files });
+    store.patchMessage(input.threadId, message.id, { digest: withFiles, text: renderDigest(withFiles) }, { kind: "digest.files", key: `${input.threadId}:${input.turnId}` });
+  } catch (error) {
+    console.error(`digest: could not record turn ${input.turnId} on ${input.threadId}:`, error instanceof Error ? error.message : error);
+  }
 }
 
 // Bots currently working with nobody at the keyboard — a webhook turn, or a
@@ -4508,7 +4532,7 @@ bus.subscribe((event: RuntimeEvent) => {
         const message = pushMessage({
           role: "bot",
           kind: "activity",
-          tool: { name, spoken: narrateTool(name) ?? undefined, summary: event.summary, input: event.input, ...(event.itemId ? { itemId: event.itemId } : {}) },
+          tool: { name, spoken: narrateTool(name) ?? undefined, summary: event.summary, input: event.input, itemId: event.itemId ?? event.eventId },
           // attributed to its turn so the digest can count it
           turnId: liveTurnId,
         });
@@ -4840,17 +4864,18 @@ bus.subscribe((event: RuntimeEvent) => {
               : turnTriggers.get(event.threadId) ?? { kind: "owner" },
         });
         noteSpend(DATA_DIR, event.cost ?? null);
-        if (completedTurnId) {
-          scheduleTurnDigest({
+        const digestSettled = completedTurnId ? scheduleTurnDigest({
             botId: bot.id,
             botName: bot.name,
             threadId: event.threadId,
             turnId: completedTurnId,
             driverKind: registry.get(selection.instanceId)?.driverKind,
+            instanceId: selection.instanceId,
             reply,
+            isCurrent,
             ...(tokens ? { usage: { input: tokens.input ?? 0, output: tokens.output ?? 0, ...(typeof tokens.cachedInput === "number" ? { cachedInput: tokens.cachedInput } : {}), costUsd: event.cost ?? null } } : {}),
-          });
-        }
+          }) : Promise.resolve();
+        if (resourceOwner) settlingResourceOwners.set(resourceOwner.threadId, resourceOwner.generation);
         liveTurnByThread.delete(event.threadId);
         const routineReportThread = routineRun ? routineSourceThread(routineRun) : null;
         // A routine's result belongs to its reporting thread's unread state.
@@ -4872,7 +4897,6 @@ bus.subscribe((event: RuntimeEvent) => {
           notify(buildNotification("done", notificationBot, routineReportThread ?? event.threadId, completionDetail, { avatarUrl: notificationBot.avatarUrl }));
         }
         if (screenPollers.has(event.threadId)) {
-          if (resourceOwner) settlingResourceOwners.set(resourceOwner.threadId, resourceOwner.generation);
           // the last live frame becomes a settled inline screen message —
           // the screenshot-in-chat moment. One fresh capture first, so the
           // frame shows the turn's END state (the final tool's poke may
@@ -4883,7 +4907,7 @@ bus.subscribe((event: RuntimeEvent) => {
           // these claims and fails as though another thread owned its folder.
           const settleLeafId = store.activePath(event.threadId).at(-1)?.id;
           let timeout: ReturnType<typeof setTimeout>;
-          void Promise.race([
+          const screenSettled = Promise.race([
             finalScreenFrame(bot.id, event.threadId),
             new Promise<null>((resolve) => { timeout = setTimeout(() => resolve(null), SCREEN_SETTLE_TIMEOUT_MS); }),
           ]).then((frame) => {
@@ -4892,10 +4916,10 @@ bus.subscribe((event: RuntimeEvent) => {
             }
           }).catch(() => {}).finally(() => {
             clearTimeout(timeout);
-            settleDirectTurn(true);
           });
+          void Promise.all([screenSettled, digestSettled]).finally(() => settleDirectTurn(true));
         } else {
-          settleDirectTurn();
+          void digestSettled.finally(() => settleDirectTurn(true));
         }
       } else if (group && speaker) {
         // Room/goal turns run on a shared thread, but their spend still counts
@@ -4919,6 +4943,17 @@ bus.subscribe((event: RuntimeEvent) => {
             : turnTriggers.get(event.threadId) ?? { kind: "owner" },
         });
         noteSpend(DATA_DIR, event.cost ?? null);
+        if (completedTurnId) {
+          void scheduleTurnDigest({
+            botId: speaker.botId, botName: speaker.name,
+            threadId: event.threadId, turnId: completedTurnId,
+            driverKind: selection && registry.get(selection.instanceId)?.driverKind,
+            reply, from: speaker,
+            isCurrent: () => store.groupByThread(event.threadId)?.id === group.id,
+            usage: { input: tokens?.input ?? 0, output: tokens?.output ?? 0, costUsd: event.cost ?? null },
+          });
+        }
+        liveTurnByThread.delete(event.threadId);
       }
       if (speaker && group?.busyBotId === speaker.botId) {
         releaseTurnResources(turnResourceOwners.get(event.threadId));

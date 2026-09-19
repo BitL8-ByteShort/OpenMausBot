@@ -1,5 +1,12 @@
 # Phase 0 — foundation: the harness sees what a bot did, and starts measuring
 
+Implementation note (Sep 19): this remains the original design, not a list of
+shipped capabilities. The current foundation covers receipts, observed-work
+digests and bounded Claude hooks. See [verification boundaries](../verification/digests.md)
+for exercised behavior and limitations. Launch budgets, metrics and replay
+changes are separate follow-ups. HTTP providers can expose tools; evidence
+coverage is determined per turn, never from the engine-family table below.
+
 Status: plan (Sep 14, 2026). First phase of the harness-upgrade programme described in
 `../../../harness-gap-analysis.md` (§17, "foundation first, team last"). Composes with
 `agent-harness-upgrades.md` item 7 (portable context, unbuilt) and item 15 (raw inspector, done).
@@ -410,8 +417,8 @@ Follow `docs/verification/README.md`: every claim below is proven against an iso
   logged; (d) a hook that hangs does not delay settle (5 s timer); (e) launching 7 concurrent turns
   parks the 7th with the typed reason and it runs when a slot frees; (f) a schema-bearing turn
   returns a validated object and an invalid one yields `structuredError`.
-- Recipe added to `docs/verification/digests.md` and `docs/verification/hooks.md` with the exact
-  `pnpm control:omb` commands.
+- The current recipe is `docs/verification/digests.md`; its shared-control
+  fixture retains the exact commands and results.
 - Measurement gates before merge of step 9: tokens per task on the bench fixture must not
   increase; cache-hit share must not decrease.
 

@@ -15,6 +15,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, dirname, isAbsolute, normalize } from "node:path";
 
 import { DATA_DIR, stripWorkspaceCredentialEnv } from "../config.ts";
+import { writeFileAtomic } from "../atomic.ts";
 import { augmentedPath } from "../env-path.ts";
 import { brokerSocketPath, describeSpawnFailure, execCli, killCliTree, spawnCli } from "../procs.ts";
 import { classifyResumeFailure, mayReplay, recoveryPromptFor } from "../resume-recovery.ts";
@@ -536,7 +537,12 @@ export function hookTokenFile(threadId: string, botId?: string): string {
  * stdin and applies any hookSpecificOutput it prints. The command string is
  * a shell line, so both paths are quoted (this repo's own path has a space). */
 export function claudeHookSettings(helperPath: string): Record<string, unknown> {
-  const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(helperPath)}`;
+  // JSON quoting is not shell quoting: $(), backticks and $names still
+  // expand inside double quotes on POSIX. Windows paths come through env
+  // variables so their backslashes are not JSON-escaped into the command.
+  const command = process.platform === "win32"
+    ? '"%OMB_HOOK_NODE%" "%OMB_HOOK_HELPER%"'
+    : [process.execPath, helperPath].map(path => `'${path.replace(/'/g, "'\\''")}'`).join(" ");
   const entry = [{ matcher: "", hooks: [{ type: "command", command, timeout: 5 }] }];
   return { PostToolUse: entry, PreCompact: entry, SessionStart: entry, Stop: entry };
 }
@@ -1303,9 +1309,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const hookTokenPath = hooks ? hookTokenFile(threadId, botId) : null;
       if (hooks && hookTokenPath) {
         mkdirSync(dirname(hookTokenPath), { recursive: true, mode: 0o700 });
-        writeFileSync(hookTokenPath, hooks.token, { mode: 0o600 });
+        writeFileAtomic(hookTokenPath, hooks.token, { mode: 0o600 });
         env.OMB_HOOK_URL = hooks.url;
         env.OMB_HOOK_TOKEN_FILE = hookTokenPath;
+        env.OMB_HOOK_NODE = process.execPath;
+        env.OMB_HOOK_HELPER = HOOK_HELPER_PATH;
         // in the packaged app process.execPath is Electron — run the helper as node
         if (process.versions.electron) env.ELECTRON_RUN_AS_NODE = "1";
       }

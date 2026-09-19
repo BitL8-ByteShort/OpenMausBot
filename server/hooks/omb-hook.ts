@@ -17,7 +17,9 @@
 import { readFileSync } from "node:fs";
 
 const CONTEXT_EVENTS = new Set(["SessionStart", "UserPromptSubmit"]);
-const budgetMs = Number(process.env.OMB_HOOK_TIMEOUT_MS) > 0 ? Number(process.env.OMB_HOOK_TIMEOUT_MS) : 4_000;
+const requestedBudget = Number(process.env.OMB_HOOK_TIMEOUT_MS);
+const budgetMs = Number.isFinite(requestedBudget) && requestedBudget > 0 ? Math.min(requestedBudget, 4_000) : 4_000;
+const MAX_INPUT_BYTES = 1024 * 1024;
 const url = process.env.OMB_HOOK_URL ?? "";
 const tokenFile = process.env.OMB_HOOK_TOKEN_FILE ?? "";
 
@@ -32,8 +34,13 @@ fuse.unref();
 function readStdin(): Promise<string> {
   return new Promise((resolve) => {
     let data = "";
+    let bytes = 0;
     process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => (data += chunk));
+    process.stdin.on("data", (chunk: string) => {
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > MAX_INPUT_BYTES) return done();
+      data += chunk;
+    });
     process.stdin.on("end", () => resolve(data));
     process.stdin.on("error", () => resolve(data));
   });
@@ -65,6 +72,7 @@ async function main(): Promise<void> {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
       body: JSON.stringify({ event, payload }),
+      redirect: "error",
       signal: controller.signal,
     });
     if (!response.ok) return done();

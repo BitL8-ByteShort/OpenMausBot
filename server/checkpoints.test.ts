@@ -53,6 +53,14 @@ function userGit(cwd: string, ...args: string[]): string {
 }
 
 describe("snapshot", () => {
+  it("cancels optional digest capture without disabling later checkpoints", async () => {
+    const { bot, cwd } = workspace();
+    writeFileSync(join(cwd, "a.txt"), "one");
+    expect(await snapshot(bot, cwd, "cancelled capture", AbortSignal.abort())).toBeNull();
+    expect(await listCheckpoints(bot, cwd)).toEqual([]);
+    expect(await snapshot(bot, cwd, "next turn")).toMatch(/^[0-9a-f]{40}$/);
+  });
+
   it("creates a checkpoint commit and is idempotent while nothing changes", async () => {
     const { bot, cwd } = workspace();
     writeFileSync(join(cwd, "a.txt"), "one");

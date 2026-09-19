@@ -30,6 +30,8 @@ function run(stdin: string, env: Record<string, string>): Promise<{ code: number
     let stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
     child.stderr.on("data", (c) => (stderr += c));
+    // Oversized input is intentionally rejected before stdin is drained.
+    child.stdin.on("error", () => {});
     child.on("close", (code) => resolve({ code, stdout, stderr, ms: Date.now() - started }));
     child.stdin.end(stdin);
   });
@@ -47,6 +49,25 @@ function listen(handler: Parameters<typeof createServer>[1]): Promise<string> {
 }
 
 describe("omb-hook helper", () => {
+  it("does not forward oversized hook input", async () => {
+    let requests = 0;
+    const url = await listen((_req, res) => { requests++; res.end("{}"); });
+    const result = await run(JSON.stringify({ hook_event_name: "PostToolUse", tool_response: "x".repeat(1024 * 1024) }), { OMB_HOOK_URL: url, OMB_HOOK_TOKEN_FILE: tokenFile });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(requests).toBe(0);
+  });
+
+  it("does not follow redirects with a private hook payload", async () => {
+    let forwarded = 0;
+    const destination = await listen((_req, res) => { forwarded++; res.end("{}"); });
+    const url = await listen((_req, res) => { res.writeHead(307, { location: destination }); res.end(); });
+    const result = await run(JSON.stringify({ hook_event_name: "PostToolUse", tool_response: "private output" }), { OMB_HOOK_URL: url, OMB_HOOK_TOKEN_FILE: tokenFile });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(forwarded).toBe(0);
+  });
+
   it("exits 0 quietly on garbage input and no harness", async () => {
     const r = run("not json at all", { OMB_HOOK_URL: "http://127.0.0.1:1", OMB_HOOK_TOKEN_FILE: tokenFile });
     const result = await r;

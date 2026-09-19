@@ -179,16 +179,24 @@ function db(): DatabaseSync {
   return handle;
 }
 
-/** One transaction, nesting-aware. The outermost caller owns BEGIN/COMMIT/
- * ROLLBACK; an inner call (a command whose `apply` uses appendMessage) just
- * runs inside it, so its rows commit or roll back with the outer work. A
- * throw anywhere rolls the whole thing back once, at the outermost level. */
+/** Nested writes use savepoints: even a caught inner error must not commit
+ * half of an inner command. The outer transaction still owns durability. */
 let transactionDepth = 0;
 function transaction<T>(fn: (database: DatabaseSync) => T): T {
   const database = db();
   if (transactionDepth > 0) {
+    const savepoint = `command_${transactionDepth}`;
+    database.exec(`SAVEPOINT ${savepoint}`);
     transactionDepth += 1;
-    try { return fn(database); } finally { transactionDepth -= 1; }
+    try {
+      const result = fn(database);
+      database.exec(`RELEASE ${savepoint}`);
+      return result;
+    } catch (error) {
+      database.exec(`ROLLBACK TO ${savepoint}`);
+      database.exec(`RELEASE ${savepoint}`);
+      throw error;
+    } finally { transactionDepth -= 1; }
   }
   database.exec("BEGIN IMMEDIATE");
   transactionDepth = 1;
