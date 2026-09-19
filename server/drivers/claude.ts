@@ -365,7 +365,7 @@ export function claudeCliUpdate(version: string | null, cli: string): ProviderSn
   };
 }
 
-const DRIVER_KIND = "claudeAgent";
+export const DRIVER_KIND = "claudeAgent";
 
 export interface ClaudeConfig {
   cli: string;

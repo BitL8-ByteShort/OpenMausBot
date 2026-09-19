@@ -12,7 +12,15 @@ import type { ModelCatalog } from "./contracts.ts";
 import { modelContextWindow } from "./model-context-window.ts";
 
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
-export const DEFAULT_COMPACT_SHARE = 0.6;
+/** Measured, not guessed. A compaction is the most expensive turn in a
+ * thread: it starts a fresh session, so the provider's prompt cache is
+ * thrown away and that turn pays full price for a prefix the turns around
+ * it were reading at a steep discount. On a real Sonnet thread the
+ * compaction turns cost about 3x their neighbours (cache hit 72% against
+ * 99%) and took two to three turns to earn it back. Compacting early is
+ * therefore not free, which is what the original 0.6 assumed — so the
+ * share sits high enough that a thread only pays when it has to. */
+export const DEFAULT_COMPACT_SHARE = 0.8;
 export const COMPACT_FLOOR = 8_000;
 
 export interface ContextWindow {
@@ -37,13 +45,28 @@ export function contextWindowFor(modelId: string | undefined, catalog?: ModelCat
   return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "default" };
 }
 
+/** How far under an engine's own compaction point the harness aims, so the
+ * two can never land on the same turn. */
+export const NATIVE_COMPACT_MARGIN = 0.9;
+
 /** `compactAt` below 1 is a share of the window; at or above 1 it is an
- * absolute token count. Never under the floor. */
-export function compactBudget(compactAt: number | undefined, contextWindow: number): number {
+ * absolute token count. Never under the floor.
+ *
+ * `nativeCompactAt` is where the ENGINE compacts its own session, when it
+ * does (Claude's `--autocompact`, a fixed 200k by default). The share is a
+ * share of the MODEL's window, so on a large-window model it lands well
+ * above that fixed point — the engine then compacts first, the harness never
+ * runs, and no record is written. The thread's history exists only inside
+ * that provider session after that: invisible in the app, and gone when the
+ * thread moves to another model. So the budget is held under it. */
+export function compactBudget(compactAt: number | undefined, contextWindow: number, nativeCompactAt?: number): number {
   const raw = compactAt === undefined ? contextWindow * DEFAULT_COMPACT_SHARE
     : compactAt < 1 ? contextWindow * compactAt
     : compactAt;
-  return Math.max(COMPACT_FLOOR, Math.floor(raw));
+  const bounded = nativeCompactAt && nativeCompactAt > 0
+    ? Math.min(raw, nativeCompactAt * NATIVE_COMPACT_MARGIN)
+    : raw;
+  return Math.max(COMPACT_FLOOR, Math.floor(bounded));
 }
 
 /** ~4 bytes per token: a fallback for engines that report no usage. */

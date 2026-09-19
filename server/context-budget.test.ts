@@ -26,8 +26,21 @@ describe("contextWindowFor", () => {
 });
 
 describe("compactBudget", () => {
+  it("stays below an engine that compacts its own session, so our record is written first", () => {
+    // A Sonnet-class window puts the 0.8 share at 800k — far above the CLI's
+    // own 200k backstop. The CLI would compact first, no harness record would
+    // ever be written, and the thread's history would live only inside that
+    // session: gone the moment it moves to another model.
+    expect(compactBudget(undefined, 1_000_000, 200_000)).toBe(180_000);
+    expect(compactBudget(undefined, 400_000, 200_000)).toBe(180_000);
+    // below the backstop already: the share stands
+    expect(compactBudget(undefined, 200_000, 200_000)).toBe(160_000);
+    // no engine-side compaction: nothing to stay under
+    expect(compactBudget(undefined, 1_000_000)).toBe(800_000);
+  });
+
   it("is a share of the window below 1, an absolute count otherwise, never under the floor", () => {
-    expect(compactBudget(undefined, 200_000)).toBe(120_000);
+    expect(compactBudget(undefined, 200_000)).toBe(160_000);
     expect(compactBudget(0.5, 200_000)).toBe(100_000);
     expect(compactBudget(50_000, 200_000)).toBe(50_000);
     expect(compactBudget(0.6, 10_000)).toBe(8_000);

@@ -43,8 +43,9 @@ import {
 } from "./browser-lifecycle-cleanup.ts";
 import * as checkpoints from "./checkpoints.ts";
 import { runCommand } from "./commands.ts";
-import { selectReplay, type ReplayEntry } from "./context-rebuild.ts";
+import { DEFAULT_REBUILD_MESSAGES, selectReplay, type ReplayEntry } from "./context-rebuild.ts";
 import { compactBudget, contextWindowFor, estimateTokens, shouldCompact } from "./context-budget.ts";
+import { autoCompactWindow, DRIVER_KIND as CLAUDE_DRIVER_KIND } from "./drivers/claude.ts";
 import type { ModelCatalog } from "./contracts.ts";
 import { composeSummary, deterministicSummary, foldPoint, MODEL_SUMMARY_PROMPT } from "./compaction-summary.ts";
 import { promptShape, stableSectionChanges, summarizeMetrics, type PromptShape } from "./metrics.ts";
@@ -3538,11 +3539,23 @@ interface CompactionPlan {
 /** Decide synchronously — the common case is "nothing to do" and must not
  * yield the event loop, because startTurn's ordering up to dispatch is what
  * thread capacity and queued threads rely on. */
-function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; generateText?: (prompt: string, opts?: { cwd?: string }) => Promise<string> }): CompactionPlan | null {
+/** Where the ENGINE compacts its own session, in tokens, when it does and
+ * when the harness can know the number. Claude is handed a fixed
+ * `--autocompact` window; "auto" hands the decision to the CLI (which uses
+ * the model's own window, always above our share) and "off" passes nothing,
+ * so neither constrains us. Every other driver compacts nothing of its own. */
+function nativeCompactAt(driverKind: string | undefined): number | undefined {
+  if (driverKind !== CLAUDE_DRIVER_KIND) return undefined;
+  const window = autoCompactWindow(process.env);
+  const tokens = window && window !== "auto" ? Number(window) : 0;
+  return Number.isFinite(tokens) && tokens > 0 ? tokens : undefined;
+}
+
+function planCompaction(bot: BotRecord, task: TaskRecord, instance: { models: ModelCatalog; driverKind?: string; generateText?: (prompt: string, opts?: { cwd?: string }) => Promise<string> }): CompactionPlan | null {
   if (!contextAutoCompact(cfg)) return null;
   const selection = task.modelSelection ?? bot.modelSelection;
   const { contextWindow } = contextWindowFor(selection.model, instance.models, task.usage?.context?.window);
-  const budget = compactBudget(contextCompactAt(cfg), contextWindow);
+  const budget = compactBudget(contextCompactAt(cfg), contextWindow, nativeCompactAt(instance.driverKind));
   const messages = store.activePath(task.threadId);
   const record = [...messages].reverse().find((m) => m.kind === "compaction" && m.compaction)?.compaction;
   const keptFrom = record ? messages.findIndex((m) => m.id === record.firstKeptId) : -1;
@@ -3570,7 +3583,7 @@ async function performCompaction(plan: CompactionPlan): Promise<void> {
   let model: string | undefined;
   if (plan.generateText) {
     model = await Promise.race([
-      plan.generateText(MODEL_SUMMARY_PROMPT(fold.folded, bot.name), { ...(task.cwd ? { cwd: task.cwd } : {}) }).then((text: string) => text.trim() || undefined),
+      plan.generateText(MODEL_SUMMARY_PROMPT(fold.folded, bot.name), task.cwd ? { cwd: task.cwd } : {}).then((text: string) => text.trim() || undefined),
       new Promise<undefined>((resolve) => { const t = setTimeout(() => resolve(undefined), 20_000); t.unref?.(); }),
     ]).catch(() => undefined);
   }
@@ -5703,6 +5716,7 @@ async function startTurn(
   const compactionRecord = [...activeMessages].reverse().find((m) => m.kind === "compaction" && m.compaction)?.compaction;
   const replay = selectReplay(replayEntries, {
     budgetBytes: contextRebuildBytes(cfg),
+    maxMessages: DEFAULT_REBUILD_MESSAGES,
     ...(compactionRecord ? { compaction: { firstKeptId: compactionRecord.firstKeptId, summary: compactionRecord.summary } } : {}),
   });
   const transcript = [...replay.lead, ...replay.transcript.filter((e) => e.text)].map(({ role, text }) => ({ role, text }));
@@ -7394,6 +7408,7 @@ function serializeRoomContext(
     .map((m) => ({ id: m.id, role: m.role === "user" ? "user" : "assistant", text: m.kind === "compaction" ? "" : renderRoomLine(m) }));
   const selection = selectReplay(entries, {
     budgetBytes: contextRebuildBytes(cfg),
+    maxMessages: DEFAULT_REBUILD_MESSAGES,
     ...(compactionRecord ? { compaction: { firstKeptId: compactionRecord.firstKeptId, summary: compactionRecord.summary } } : {}),
   });
   return [...selection.lead.map((l) => l.text), ...selection.transcript.filter((e) => e.text).map((e) => e.text)].join("\n");

@@ -8,11 +8,23 @@
 - A budget per task: `context.compactAt` in config.json, a share of the
   model's window below 1 (default 0.6) or an absolute token count; the window
   from the catalog, else a pattern over the model id, else 128,000.
+- The budget is held **under the engine's own compaction point** where it has
+  one. Claude is handed a fixed `--autocompact` window (200,000 by default)
+  while our budget is a share of the MODEL's window, so on a large-window
+  model the share lands above it: the CLI would compact first, no record
+  would be written, and the thread's history would survive only inside that
+  provider session — invisible in the app and lost when the thread moves to
+  another model.
 - When the last turn crossed the budget, the next direct turn first writes a
   `compaction` record (summary = each folded turn's digest and each request,
   plus a model summary where the engine can draft one) and starts a fresh
   engine session on a budgeted replay: summary, then the last two exchanges
   verbatim, then the new message. Old tool output is never replayed.
+- The record keeps what a thread cannot afford to lose twice over: the
+  conversation's opening request is pinned (the trim takes from the second
+  line forward, never the first), and an EARLIER compaction's summary is
+  carried into the new one, capped, so a thread that folds a second time does
+  not lose everything before the first fold.
 - The manual route `POST /api/bots/:id/tasks/:threadId/compact` resets the
   session the same way.
 - `context.autoCompact: false` switches the automatic path off.
@@ -52,6 +64,11 @@ turn after the input passes 12,000 tokens, and `/api/metrics` shows
 `compactions: 1` for the bot.
 
 ## Gotchas
+
+- The engine-side clamp only bites above roughly a 333,000-token window
+  (where 0.6 of the window passes Claude's 200,000). The original e2e forces
+  a 100,000 window, so it never exercised that case; the "large-window model"
+  case does, and fails without the clamp.
 
 - Compaction runs between turns only. A turn that is already running keeps
   its context until it settles.

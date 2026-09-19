@@ -36,6 +36,21 @@ describe("foldPoint", () => {
 });
 
 describe("deterministicSummary", () => {
+  it("never discards the conversation's first request when trimming to budget", () => {
+    const goal = "Port the billing module to Postgres and keep the audit log intact.";
+    const folded: Message[] = [
+      user("u0", goal, 0),
+      ...Array.from({ length: 40 }, (_, i) => user(`f${i}`, `follow-up ${i} ${"y".repeat(200)}`, i + 1)),
+    ];
+    const text = deterministicSummary(folded, "Clover", 1_200);
+    // the goal is the oldest line and the first to go on a plain oldest-first
+    // trim — it is also the one thing the summary exists to carry
+    expect(text).toContain(goal);
+    expect(text).toContain("follow-up 39");
+    expect(text).toMatch(/omitted/);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(1_200);
+  });
+
   it("lists requests and digest lines oldest first, with no model call", () => {
     const text = deterministicSummary(foldPoint(thread, 2)!.folded, "Clover");
     const lines = text.split("\n");
@@ -46,13 +61,29 @@ describe("deterministicSummary", () => {
     expect(lines[3]).toMatch(/^\[What Clover did in an earlier turn: .*Bash ×1.*\]$/);
   });
 
-  it("trims oldest first to the byte cap and says how many lines it dropped", () => {
+  it("trims to the byte cap, keeps the opening request, and says how many lines it dropped", () => {
     const text = deterministicSummary(foldPoint(thread, 2)!.folded, "Clover", 120);
-    expect(text.startsWith("[… ")).toBe(true);
+    // the opening request is pinned and the omission marker follows it; the
+    // trim takes from the second line forward
+    expect(text.startsWith("User asked: Create notes.txt")).toBe(true);
+    expect(text.split("\n")[1]!.startsWith("[… ")).toBe(true);
     expect(text).toContain("earlier lines omitted]");
     expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(120 + 40);
   });
 });
+
+  it("carries an earlier compaction's summary forward, so a second fold keeps the start", () => {
+    const record: Message = {
+      id: "c1", role: "bot", kind: "compaction", text: "[compaction] earlier", at: at(0),
+      compaction: { summary: "The user is porting billing to Postgres, audit log must survive.", firstKeptId: "c1", tokensBefore: 120_000, by: "harness" },
+    };
+    const folded: Message[] = [record, user("u9", "Now do the migration script.", 9)];
+    const text = deterministicSummary(folded, "Clover");
+    // a long thread compacts more than once; if the second fold ignores the
+    // first record, everything before it is gone for good
+    expect(text).toContain("porting billing to Postgres");
+    expect(text).toContain("Now do the migration script.");
+  });
 
 describe("composeSummary", () => {
   it("puts a model summary first and the deterministic record after it", () => {

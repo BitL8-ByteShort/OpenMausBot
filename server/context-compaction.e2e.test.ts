@@ -142,3 +142,26 @@ posixOnly("harness-owned compaction stays out of the way", () => {
     expect(((await h.getBot(bot.id)).messages as Msg[]).filter((m) => m.kind === "compaction")).toHaveLength(0);
   }, 60_000);
 });
+
+// The bug this pins: the harness budget is a share of the MODEL's window,
+// while Claude's own --autocompact is a fixed 200k. On a large-window model
+// the share lands above it, so the CLI compacts first and the harness record
+// is never written — the thread's history then lives only inside that
+// provider session, invisible in the app and lost when the thread moves to
+// another model. The budget is held under the engine's own point.
+posixOnly("harness-owned compaction on a large-window model", () => {
+  const h = harness("wide", { OMB_CONTEXT_WINDOW: "400000" });
+
+  it("still writes its record when the engine would have compacted first", async () => {
+    const bot = (await h.api("POST", "/api/bots", { name: "Wide" })).body.bot;
+    expect((await h.api("PATCH", `/api/bots/${bot.id}`, { modelSelection: { instanceId: "claude", model: "fake-model" } })).status).toBe(200);
+    for (const text of ["first: remember the codeword PLUM", "second: remember the codeword PEAR", "third: remember the codeword FIG", "fourth: and now?"]) {
+      await h.turn(bot.id, text);
+    }
+    // 0.6 x 400k = 240k, above the fake's 200k-per-turn reading: unclamped,
+    // nothing would ever compact here while the CLI quietly did it instead.
+    const records = ((await h.getBot(bot.id)).messages as Msg[]).filter((m) => m.kind === "compaction");
+    expect(records).toHaveLength(1);
+    expect(records[0]!.compaction!.summary).toContain("User asked: first: remember the codeword PLUM");
+  }, 90_000);
+});

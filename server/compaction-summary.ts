@@ -27,6 +27,12 @@ export function foldPoint(messages: readonly Message[], keepExchanges = 2): Fold
 
 const REQUEST_CHARS = 300;
 
+/** How much of an EARLIER compaction's summary a later one carries. A long
+ * thread folds more than once, and each fold pins what came before it, so an
+ * uncapped carry would nest summaries forever. Trimmed from the end: the
+ * earlier summary already pins the opening request at its start. */
+const CARRIED_SUMMARY_CHARS = 1_500;
+
 /** Oldest first: what the person asked, and what the bot did. Trimmed
  * newest-first to `maxBytes`, saying how many older lines were dropped. */
 export function deterministicSummary(folded: readonly Message[], botName: string, maxBytes = 6_000): string {
@@ -37,17 +43,33 @@ export function deterministicSummary(folded: readonly Message[], botName: string
       lines.push(`User asked: ${text.length > REQUEST_CHARS ? `${text.slice(0, REQUEST_CHARS)}…` : text}`);
     } else if (m.kind === "digest" && m.digest) {
       lines.push(digestPromptLine(m.digest, botName));
+    } else if (m.kind === "compaction" && m.compaction?.summary?.trim()) {
+      // A thread that is folded twice used to lose everything before the
+      // FIRST fold: this branch did not exist, so the earlier record was
+      // skipped like any other message the summary had no shape for.
+      const prior = m.compaction.summary.replace(/\s+/g, " ").trim();
+      const carried = prior.length > CARRIED_SUMMARY_CHARS ? `${prior.slice(0, CARRIED_SUMMARY_CHARS)}…` : prior;
+      lines.push(`Earlier in this conversation: ${carried}`);
     }
   }
-  let kept = lines;
+  if (lines.length === 0) return "";
+  // The FIRST line is pinned. It is the oldest thing here, so a plain
+  // oldest-first trim discards it first — and it is the conversation's
+  // opening request, the goal every later turn serves. A summary that
+  // drops it has thrown away the one thing it existed to carry.
+  const [first, ...rest] = lines as [string, ...string[]];
+  let kept = rest;
   let dropped = 0;
-  const size = (list: string[], omitted: number) =>
-    Buffer.byteLength([...(omitted ? [`[… ${omitted} earlier lines omitted]`] : []), ...list].join("\n"), "utf8");
-  while (kept.length > 1 && size(kept, dropped) > maxBytes) {
+  const render = () => [
+    first,
+    ...(dropped ? [`[… ${dropped} earlier lines omitted]`] : []),
+    ...kept,
+  ].join("\n");
+  while (kept.length > 0 && Buffer.byteLength(render(), "utf8") > maxBytes) {
     kept = kept.slice(1);
     dropped += 1;
   }
-  return [...(dropped ? [`[… ${dropped} earlier lines omitted]`] : []), ...kept].join("\n");
+  return render();
 }
 
 /** The one-shot prompt for an engine that can draft a summary. Wording
