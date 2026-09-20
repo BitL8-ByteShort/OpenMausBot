@@ -32,7 +32,15 @@ remains unchanged when a guarded send is refused. Ordinary composer sends
 retain their existing behavior; this endpoint does not prohibit a later human
 message from steering or queueing through the ordinary route.
 
-On 2026-09-20, all five cases and the server TypeScript check passed with real
-isolated runtime processes.
+The coordination case gates one real fake-provider teammate after the source
+provider has settled. A no-op Ask settings update proves the source's raw busy
+flag and dispatch reservation have both cleared; the guarded send still gets
+`guarded_busy` because that conversation parks messages behind its teammate.
+The transcript and queue stay unchanged, and releasing the gate completes the
+original request. Its bounded commands and results are retained beside the
+fixture log in a `.log.guarded-coordination.json` receipt.
+
+On 2026-09-20, all six cases and the server TypeScript check passed with real
+isolated runtime processes after rebasing onto public `main` at `c08fc0de`.
 These fixtures do not qualify real providers, Slack delivery, production
 deployment, or a worker connected to a customer workspace.

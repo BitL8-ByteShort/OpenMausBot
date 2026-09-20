@@ -182,3 +182,63 @@ describe("guarded external messages through an isolated runtime", () => {
     await finish(bot);
   }, 30_000);
 });
+
+it("refuses a parked conversation after its own provider settles while its teammate is still working", async () => {
+  const fixture = await launchVerificationServer({}, undefined, undefined, undefined, undefined, { scripted: true });
+  const evidence: unknown[] = [];
+  const api = async (method: string, path: string, body?: unknown) => {
+    const response = await fetch(`${fixture.info.url}${path}`, {
+      method, headers: { "content-type": "application/json", origin: fixture.info.url },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    const result = { status: response.status, body: await response.json() as any };
+    evidence.push({ method, path, body, result }); return result;
+  };
+  const control = async (args: string[]) => {
+    const result = await runControlOmb([...args, "--url", fixture.info.url]) as any;
+    evidence.push({ command: ["control:omb", ...args, "--url", fixture.info.url], result }); return result;
+  };
+  try {
+    const chief = (await control(["new-bot", "--name", "Guarded coordinator", "--section", "Leadership"])).bot;
+    const teammate = (await control(["new-bot", "--name", "Guarded teammate", "--section", "Engineering"])).bot;
+    expect((await api("PATCH", `/api/bots/${chief.id}`, {
+      chiefOfStaff: true, managedSections: ["Engineering"], acknowledgePeerScope: true, parkDirectMessages: true,
+    })).status).toBe(200);
+    const gate = join(fixture.info.dataDir, "guarded-teammate.gate");
+    writeFileSync(join(fixture.info.dataDir, "room-plan.json"), JSON.stringify({
+      [chief.id]: {
+        steps: [{ arguments: { bot_ids: [teammate.id], request_key: "guard-check", message: "Complete the gated fixture check." } }],
+        reply: "The teammate owns the outstanding check.", resumeReply: "The guarded fixture check is complete.",
+      },
+      [teammate.id]: { gateFile: gate, reply: "The gated check passed." },
+    }));
+    await control(["send", "--bot", chief.id, "--task", chief.activeTaskId, "--text", "Coordinate the gated fixture check."]);
+    const nodes = () => JSON.parse(readFileSync(join(fixture.info.dataDir, "room-handoffs.json"), "utf8")) as Array<{ botId: string; status: string }>;
+    await expect.poll(() => { try { return nodes().find(node => node.botId === teammate.id)?.status; } catch { return undefined; } }, { timeout: 15_000 }).toBe("running");
+    // Unlike the public busy flag (which includes coordination), this no-op
+    // permission PATCH only succeeds after the exact task's raw busy flag
+    // AND its synchronous provider dispatch claim have both been released.
+    await expect.poll(async () => (await api("PATCH", `/api/bots/${chief.id}/tasks/${chief.activeTaskId}`, { approvalMode: "ask" })).status,
+      { timeout: 15_000 }).toBe(200);
+    const pagePath = `/api/threads/${chief.activeTaskId}/messages?limit=100`;
+    const baseline = (await api("GET", pagePath)).body as Page;
+    expect(baseline.messages.some(message => message.text === "The teammate owns the outstanding check." && message.turnTerminal)).toBe(true);
+    expect(nodes().find(node => node.botId === teammate.id)?.status).toBe("running");
+    const refusal = await api("POST", `/api/bots/${chief.id}/messages/guarded`, {
+      threadId: chief.activeTaskId, sendId: randomUUID(), text: "THIS_GUARDED_FOLLOWUP_MUST_NOT_RUN", expectedActiveLeafId: baseline.activeLeafId,
+    });
+    expect(refusal).toMatchObject({ status: 409, body: { code: "guarded_busy" } });
+    expect((await api("GET", pagePath)).body).toEqual(baseline);
+    expect((await api("GET", "/api/bots?messages=0")).body.botQueuedMessages?.[chief.activeTaskId] ?? []).toEqual([]);
+    writeFileSync(gate, "finish only the isolated teammate");
+    expect((await control(["wait", "--bot", chief.id, "--task", chief.activeTaskId, "--timeout", "15"])).status).toBe("settled");
+    const final = await control(["messages", "--bot", chief.id, "--task", chief.activeTaskId, "--limit", "20"]);
+    expect(final.messages.some((message: Message) => message.text === "The guarded fixture check is complete.")).toBe(true);
+    expect(final.messages.some((message: Message) => message.text === "THIS_GUARDED_FOLLOWUP_MUST_NOT_RUN")).toBe(false);
+  } finally {
+    const evidencePath = `${fixture.info.logPath}.guarded-coordination.json`;
+    writeFileSync(evidencePath, JSON.stringify({ fixture: fixture.info, evidence, limitation: "Actual runtime and gated fake teammate only; no live accounts, providers, or user data." }, null, 2));
+    console.info(JSON.stringify({ logPath: fixture.info.logPath, evidencePath }));
+    await fixture.close();
+  }
+}, 45_000);
