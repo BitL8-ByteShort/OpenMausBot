@@ -81,7 +81,7 @@ class ChatPreferencesTest {
         val prefs = store("chat-deleted-thread")
         val bot = bot().copy(tasks = listOf(BotTask(threadId = "deleted", title = "Deleted", createdAt = 0.0)))
         prefs.rememberThread(Chat.BotChat(bot.forTask("deleted")!!), "computer")
-        assertEquals(bot.threadId, prefs.restoringThread(Chat.BotChat(bot.copy(tasks = emptyList())), "computer").threadId)
+        assertEquals(bot.threadId, prefs.restoringThread(Chat.BotChat(bot.copy(tasks = listOf(BotTask(threadId = bot.threadId, title = "Default", createdAt = 0.0)))), "computer").threadId)
         val room = Chat.RoomChat(room())
         prefs.rememberThread(room, "computer")
         assertEquals(room, prefs.restoringThread(room, "computer"))

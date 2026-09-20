@@ -18,7 +18,8 @@ final class BotThreadSelectionTests: XCTestCase {
         Bot(id: "bot", threadId: "default", name: "Scout", title: "Researcher",
             description: "", notifications: true, color: "green", unread: false,
             modelSelection: ModelSelection(instanceId: "engine", model: "default"), createdAt: 1,
-            tasks: [BotTask(threadId: "chosen", title: "Chosen", createdAt: 1)])
+            tasks: [BotTask(threadId: "default", title: "Default", createdAt: 1),
+                    BotTask(threadId: "chosen", title: "Chosen", createdAt: 1)])
     }
 
     func testSelectionSurvivesNewStoreAndStaysLocalToComputerAndBot() throws {
@@ -39,7 +40,7 @@ final class BotThreadSelectionTests: XCTestCase {
         let store = BotThreadSelection(defaults: defaults)
         store.rememberThread(.bot(try XCTUnwrap(bot.projected(forThread: "chosen"))), connectionID: "computer")
         var live = bot
-        live.tasks = []
+        live.tasks = [BotTask(threadId: "default", title: "Default", createdAt: 1)]
         XCTAssertEqual(store.restoringThread(.bot(live), connectionID: "computer").threadId, "default")
     }
 
