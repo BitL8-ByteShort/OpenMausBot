@@ -17,10 +17,10 @@ permissions:
   contents: read
 
 concurrency:
-  # A merge-queue group runs under its own ref and must never be cancelled
-  # by a later PR push; PR runs are superseded by the next push as before.
+  # New main/PR pushes supersede older checks on the same ref, including
+  # queued summary jobs. Keep merge-queue runs protected on their own refs.
   group: ci-${{ github.event_name == 'merge_group' && github.event.merge_group.head_ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   # ── The test leg, in pieces ──────────────────────────────────────────────
