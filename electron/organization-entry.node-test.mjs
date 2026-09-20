@@ -61,7 +61,8 @@ test("the actual companion relaunch passes consumed arguments explicitly to Elec
 test("the shipped updater adapter explicitly omits only the fixed action and its reproducible patch fails closed", () => {
   const before = "      relaunch() {\n        this.app.relaunch();\n      }";
   const patched = patchOrganizationUpdater(before);
-  const bundle = readFileSync(new URL("./vendor/electron-updater.cjs", import.meta.url), "utf8");
+  // Git may check the vendored bundle out with CRLF on Windows.
+  const bundle = readFileSync(new URL("./vendor/electron-updater.cjs", import.meta.url), "utf8").replace(/\r\n/g, "\n");
   assert.ok(bundle.includes(patched));
   const calls = [];
   const argv = ["/fixture/OpenMausBot", "--fixture", "openmausbot://organization", "openmausbot://organization?ignored"];
