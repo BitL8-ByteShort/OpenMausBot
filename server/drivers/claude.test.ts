@@ -86,6 +86,11 @@ function answerQueue(conn: ReturnType<typeof connect>) {
   return () => new Promise<any>((resolve) => waiters.push(resolve));
 }
 
+const CONTROL_PLANE_FIXTURE = {
+  OMB_CLOUD_READY_TOKEN: "ready-should-not-leak", OMB_CLOUD_BOOTSTRAP: "bootstrap-should-not-leak",
+  OMB_LICENSE_KEY: "license-should-not-leak", OMB_INSTALLATION_CREDENTIAL: "fleet-should-not-leak",
+};
+
 describe("ClaudeDriver.decodeConfig", () => {
   it("quotes hook paths as shell data rather than JSON strings", () => {
     const settings = claudeHookSettings("/tmp/it's $OMB_HOOK_TEST `literal`/helper.ts") as { PostToolUse: Array<{ hooks: Array<{ command: string }> }> };
@@ -364,6 +369,7 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     delete process.env.BOX_TOKEN;
     delete process.env.OPENCODE_API_KEY;
     delete process.env.OMB_TTS_KEY;
+    for (const name of Object.keys(CONTROL_PLANE_FIXTURE)) delete process.env[name];
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MS;
     delete process.env.OMB_CLAUDE_SESSION_IDLE_MIN_MS;
     recorder?.stop();
@@ -449,6 +455,20 @@ describe("ClaudeDriver turns (fake CLI)", () => {
     await recorder.until((e) => e.type === "turn.completed");
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.env.ANTHROPIC_API_KEY).toBe("sk-ant-workspace-fixture");
+  });
+
+  it("hands a hosted tenant's CLI the hosted model token but none of the operator's control-plane secrets", async () => {
+    // server/hosted-models.ts delivers the model token as the provider key.
+    await create(undefined, { ANTHROPIC_API_KEY: "omb_workspace_fixture", ANTHROPIC_AUTH_TOKEN: "omb_workspace_fixture" });
+    const dump = join(scratch, "dump-hosted.json");
+    process.env.FAKE_CLAUDE_DUMP = dump;
+    Object.assign(process.env, CONTROL_PLANE_FIXTURE);
+    await instance.adapter.sendTurn({ threadId: "t-hosted-env", text: "hello" });
+    await recorder.until((e) => e.type === "turn.completed");
+    const seen = JSON.parse(readFileSync(dump, "utf8"));
+    expect(seen.env.ANTHROPIC_API_KEY).toBe("omb_workspace_fixture");
+    expect(seen.env.ANTHROPIC_AUTH_TOKEN).toBe("omb_workspace_fixture");
+    for (const name of Object.keys(CONTROL_PLANE_FIXTURE)) expect(seen.env[name]).toBeUndefined();
   });
 
   it("keeps user and system prompts off argv and strips identity env vars", async () => {
