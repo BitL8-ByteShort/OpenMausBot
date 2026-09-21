@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { waitForExit } from "../testing/cleanup.ts";
+import { availableTools, catalogProfileFromEnv } from "./agents-catalog.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PROXY_SOURCE = join(HERE, "agents-proxy.ts");
@@ -206,6 +207,25 @@ describe("agents proxy tools/list golden", () => {
         expect(JSON.stringify(tool), `${name}: ${tool.name}`).toBe(full.get(tool.name));
       }
     }
+  });
+
+  it("is what the catalog module computes in-process, so another front end mounts the same tools", () => {
+    for (const [name, profile] of Object.entries(PROFILES)) {
+      const tools = availableTools(catalogProfileFromEnv({ OMB_BOT_ID: "bot-golden", ...profile.env }));
+      expect(JSON.stringify({ tools }), name).toBe(wires[name]);
+    }
+  });
+
+  it("writes the routine fields out identically in both routine tools", () => {
+    // One source constant, serialized in full twice: see the wire-size table
+    // for what that costs, and the next test for why it is not a $ref.
+    type RoutineTool = Tool & { inputSchema: { properties: Record<string, unknown> & { changes: { properties: Record<string, unknown> } } } };
+    const tools = new Map(toolsOf(wires[FULL.direct]!).map((tool) => [tool.name, tool as RoutineTool]));
+    const created = tools.get("propose_routine")!.inputSchema.properties;
+    const changed = tools.get("propose_routine_action")!.inputSchema.properties.changes.properties;
+    expect(Object.keys(changed).length).toBeGreaterThan(0);
+    for (const field of Object.keys(changed)) expect(JSON.stringify(created[field]), field).toBe(JSON.stringify(changed[field]));
+    expect(Object.keys(created).slice(0, Object.keys(changed).length)).toEqual(Object.keys(changed));
   });
 
   it("uses no JSON-Schema keyword a provider conversion is known to drop or mangle", () => {
