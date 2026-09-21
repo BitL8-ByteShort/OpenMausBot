@@ -9,11 +9,11 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { connect, createServer as createNetServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ensureDirs, NATIVE_DIR } from "../config.ts";
+import { DATA_DIR, ensureDirs, NATIVE_DIR } from "../config.ts";
 import type { ProviderInstance } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
 import {
@@ -24,12 +24,14 @@ import {
   claudeHookSettings,
   ClaudeDriver,
   createPermissionBroker,
+  hookTokenFile,
   parseClaudeCliVersion,
   permissionSocketPath,
   readClaudeAuthSettings,
   type ClaudeConfig,
 } from "./claude.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
+import { ephemeralWorkspaceTokenPath } from "../workspace-backup-policy.ts";
 import * as procs from "../procs.ts";
 import * as localInject from "./local-inject.ts";
 
@@ -93,6 +95,12 @@ describe("ClaudeDriver.decodeConfig", () => {
     } else {
       expect(command).toContain("'/tmp/it'\\''s $OMB_HOOK_TEST `literal`/helper.ts'");
     }
+  });
+
+  it("keeps the per-turn hook token where workspace backups never look", () => {
+    const path = relative(DATA_DIR, hookTokenFile("thread", "bot")).replaceAll("\\", "/");
+    expect(ephemeralWorkspaceTokenPath(path)).toBe(true);
+    expect(ephemeralWorkspaceTokenPath(path.split("/")[0]!)).toBe(true);
   });
 
   it("defaults to the claude binary with acceptEdits", () => {
