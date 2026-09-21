@@ -90,7 +90,7 @@ claim those flows tested from the build or Robolectric suite alone.
   application ID were verified with the Android SDK tools.
 - No physical-device installation, real pairing or live-provider test was run.
 
-## Last opened thread regression — 2026-09-21
+## Last opened thread regression — 2026-09-20 UTC (2026-09-21 IST)
 
 The new real Compose regression failed before the fix: returning from the
 chosen second thread to the roster and tapping the bot reopened the first

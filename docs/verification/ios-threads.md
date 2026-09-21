@@ -88,7 +88,7 @@ introduced by the thread UI.
   `/tmp/omb-ios-threads-ipad-clean.xcresult`, including screenshots.
 - No physical-device, live pairing or provider verification was performed.
 
-## Last opened thread regression — 2026-09-21
+## Last opened thread regression — 2026-09-20 UTC (2026-09-21 IST)
 
 Choosing iCloud, returning to the roster, and tapping Pepper used to reopen
 Gmail. The new regression failed against the original implementation, then
