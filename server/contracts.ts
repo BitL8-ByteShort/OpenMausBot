@@ -10,6 +10,7 @@ import type { EffortLevel } from "../shared/wire.ts";
 import type {
   DriverKind, InstanceId, ModelVariantOption, RuntimeEventListener, ThreadId, TurnId,
 } from "../shared/runtime-events.ts";
+import type { ProviderIcon } from "../shared/provider-icon.ts";
 
 // These contract types live in shared/wire.ts now (part of the wire model);
 // re-exported here so existing server-side importers keep working.
@@ -68,6 +69,9 @@ export interface InstanceConfig {
   driver: DriverKind;
   displayName?: string;
   accentColor?: string;
+  /** Presentation override for this instance only. Driver branding stays
+   * unchanged and custom images are admitted as bounded local data URLs. */
+  icon?: ProviderIcon;
   environment?: Record<string, string>;
   enabled?: boolean;
   config?: unknown;
@@ -108,12 +112,20 @@ export interface SendTurnInput {
   effort?: EffortLevel;
   variant?: string;
   resumeCursor?: unknown;
+  /** Start without the previous native context, including any retained idle
+   * process. Takes precedence over resumeCursor. The runtime supplies the
+   * active conversation in text/transcript when rebuilding a session. */
+  sessionReset?: boolean;
   /** The turn with the conversation so far replayed inline, attached only
    * alongside resumeCursor. A cursor-resuming driver sends it once, on a
    * fresh session, when the provider refuses the cursor before reading the
    * prompt (server/resume-recovery.ts) — so a session the provider lost
    * does not brick the thread, and the new session is not blank. */
   recoveryText?: string;
+  /** recoveryText is the replay this turn would have been sent without a
+   * resume cursor (it carries an update from outside the session). A driver
+   * that rebuilds only some lost sessions may also rebuild this one. */
+  recoveryIsReplay?: boolean;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
   transcript?: Array<{ role: "user" | "assistant"; text: string }>;
   /** Bot persona (name/title/description) as a system prompt. */
@@ -159,6 +171,12 @@ export interface SendTurnInput {
       generation?: string;
       scope?: "local-computer";
     };
+    /** Engine lifecycle hooks (Claude Code hooks today): the harness's
+     * loopback URL and a turn-scoped bearer the engine's hook helper presents
+     * on POST /api/internal/hook. A driver that declares `capabilities.hooks`
+     * registers the helper with its engine; the harness only ever observes
+     * and injects context through this channel, never decides state. */
+    hooks?: { url: string; token: string };
     /** Peer-agent comms: an MCP proxy (list_bots / ask_bot) that routes back
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */
@@ -261,6 +279,17 @@ export interface ProviderAdapter {
      * MCP servers from config). Same rule as composioMcp: an entry in the
      * config says the servers exist, not that this engine can reach them. */
     customMcp?: boolean;
+    /** True when a turn given a resumeCursor runs in that exact native
+     * session, or, if the provider refuses the session before accepting the
+     * prompt, fails or starts a new session from recoveryText — never a blank
+     * session that silently lacks the history; session.started says `rebuilt`
+     * for that new session. The harness then keeps such a session across
+     * externally appended messages and sends only those. */
+    strictResume?: boolean;
+    /** True when sendTurn can register the harness's hook helper with the
+     * engine (integrations.hooks). Only Claude Code today; other engines
+     * deliver the same information through their protocols. */
+    hooks?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -429,8 +458,10 @@ export interface ProviderInstance {
   readonly signOut?: () => Promise<void>;
   readonly adapter: ProviderAdapter;
   snapshot(): Promise<ProviderSnapshot>;
-  /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries. */
-  generateText?(prompt: string): Promise<string>;
+  /** Cheap one-shot text call (upstream TextGeneration) — titles, summaries.
+   * The signal is a best-effort cap: drivers that can honor it abort the
+   * underlying provider call; the rest keep their own timeout. */
+  generateText?(prompt: string, options?: { signal?: AbortSignal }): Promise<string>;
   /** Isolated, tool-free permission review on this same provider. Kept
    * separate from generateText so the UI never infers a security capability
    * from a generic helper that may expose prompts in argv or lack approvals. */

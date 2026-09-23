@@ -35,6 +35,7 @@ import {
   clipboardHasImages,
   clipboardImageFiles,
   composeMessage,
+  composerShouldRefocus,
   imageAttachmentFromFile,
   intakeFiles,
   isLongPaste,
@@ -49,6 +50,7 @@ import { goalCoordinatorForComposer, groupComposerHint, roomRespondersForCompose
 import { PendingApprovalActions, PendingApprovalPanel, pendingApprovals } from "./PendingApproval";
 import { useDesktopCapabilities } from "./DesktopCapabilities";
 import { ReplyQuote } from "./ReplyQuote";
+import { useThreadRefs } from "./ThreadRefs";
 import {
   QueuedComposerMessages,
   composerCanSteerQueuedMessages,
@@ -57,6 +59,7 @@ import {
 } from "./ComposerQueuedMessages";
 import { skillAuthoringEnabled } from "@/lib/feature-flags";
 import { mentionChoicesForQuery } from "@/lib/mentions";
+import { serializeThreadRefs, threadTokenFromPaste, threadTokenSpacing } from "@/lib/thread-refs";
 import {
   composerSlashTrigger,
   goalTextFromComposer,
@@ -108,6 +111,7 @@ export function Composer({
   const bot = profile ? currentTaskBot(profile) : undefined;
   const locked = setupLocked || Boolean(bot?.awaitingThreadSnapshot);
   const { state, dispatch } = useStore();
+  const { threads, currentBotId } = useThreadRefs();
   const { capabilities } = useDesktopCapabilities();
   const remoteClient = window.ogb?.remoteClient?.active === true;
   // Unified target: a 1:1 bot thread or a room. In a room the @ picker
@@ -213,6 +217,19 @@ export function Composer({
   const [dismissedAt, setDismissedAt] = useState<number | null>(null); // Esc'd this @
   const [dismissedSlashAt, setDismissedSlashAt] = useState<number | null>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // the latest caret, readable from callbacks without re-creating them
+  const caretRef = useRef(0);
+  caretRef.current = caret;
+  /** Returns keyboard focus to the draft, keeping the caret where it was. */
+  const refocusInput = useCallback(() => {
+    requestAnimationFrame(() => {
+      const input = inputRef.current;
+      if (!input || input.disabled || !composerShouldRefocus(document.activeElement, input)) return;
+      const at = Math.min(caretRef.current, input.value.length);
+      input.focus();
+      input.setSelectionRange(at, at);
+    });
+  }, []);
   const mentionListRef = useRef<HTMLDivElement>(null);
   // what was typed before the mic went on — partials append after it
   const baseText = useRef("");
@@ -462,6 +479,9 @@ export function Composer({
     } finally {
       changeDraftAttachmentPending(draftId, false);
     }
+    // the file dialog leaves focus on the paperclip button; typing should
+    // continue in the draft without another click
+    refocusInput();
   };
   const setApprovalMode = (mode: ApprovalMode) => {
     if (!modeBot || modeBot.busy || mode === approvalModeFor(modeBot)) return;
@@ -518,7 +538,9 @@ export function Composer({
       return;
     }
     // named `body`, not `t` — that name belongs to the catalog lookup now
-    const body = composeMessage(effectiveText, attachments);
+    // resolvable "#Title" runs leave as canonical links, so the thread id
+    // stays machine-readable in the stored send and the model's context
+    const body = composeMessage(serializeThreadRefs(effectiveText, threads, currentBotId), attachments);
     if (!body) return;
     const sentDraft: ComposerDraftSnapshot = {
       draftId,
@@ -607,8 +629,29 @@ export function Composer({
         return;
       }
     }
-    // a wall of text becomes a chip instead of burying the input
     const pasted = e.clipboardData.getData("text/plain");
+    // a pasted thread reference — canonical link, its markdown shape, or a
+    // raw UUID — becomes the token the composer holds when it names a
+    // thread the person can see; anything else stays ordinary text
+    const reference = threadTokenFromPaste(pasted, threads, currentBotId);
+    if (reference) {
+      e.preventDefault();
+      const start = e.currentTarget.selectionStart ?? text.length;
+      const end = e.currentTarget.selectionEnd ?? start;
+      // "#Title" only links at a word boundary, so keep the token clear of
+      // the words it may land between
+      const { lead, trail } = threadTokenSpacing(text, start, end);
+      const token = lead + reference.token + trail;
+      editText(text.slice(0, start) + token + text.slice(end));
+      const at = start + token.length;
+      setCaret(at);
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+        inputRef.current?.setSelectionRange(at, at);
+      });
+      return;
+    }
+    // a wall of text becomes a chip instead of burying the input
     if (!isLongPaste(pasted)) return;
     e.preventDefault();
     // Preserve native paste replacement semantics: if text was
@@ -1000,7 +1043,11 @@ export function Composer({
             }
             if (e.key === "Escape" && recording) setRecording(false);
           }}
-          disabled={Boolean(approval) || locked || attachmentPending}
+          // an upload in flight must not disable the box: a disabled element
+          // drops keyboard focus and never gets it back, so the writer had to
+          // click the input again after every pasted image (#1014). send()
+          // already refuses while an attachment is pending.
+          disabled={Boolean(approval) || locked}
           aria-busy={bot?.awaitingThreadSnapshot || undefined}
           placeholder={
             setupLocked

@@ -31,8 +31,9 @@ struct TaskManagerView: View {
 
     private var tasks: [BotTask] {
         switch current {
-        case let .bot(bot): return bot.threadGroups(includingClosed: true).flatMap(\.tasks)
-        case let .room(room): return room.tasks ?? []
+        case let .bot(bot):
+            return bot.threadGroups(includingClosed: true, queuedThreadIds: session.state.queuedThreadIds).flatMap(\.tasks)
+        case let .room(room): return threadsInListOrder(room.tasks ?? [])
         }
     }
 
@@ -208,13 +209,13 @@ struct TaskManagerView: View {
             let groups = bot.threadGroups(matching: search, includingClosed: true)
             let archived = searching ? [] : bot.threadGroups(includingClosed: true)
                 .flatMap(\.tasks)
-                .filter { $0.isArchived && !$0.demandsAttention && $0.threadId != bot.threadId }
+                .filter { $0.isArchived && $0.pinned != true && !$0.demandsAttention() && $0.threadId != bot.threadId }
             if groups.isEmpty {
                 emptySearch
             } else {
                 ForEach(groups) { group in
                     let rows = searching ? group.tasks : group.tasks.filter {
-                        !$0.isArchived || $0.demandsAttention || $0.threadId == bot.threadId
+                        $0.pinned == true || !$0.isArchived || $0.demandsAttention() || $0.threadId == bot.threadId
                     }
                     if !rows.isEmpty {
                         Section {
@@ -284,7 +285,11 @@ struct TaskManagerView: View {
                 HStack(spacing: 12) {
                     Image(systemName: selected ? "checkmark.circle.fill" : "circle")
                         .foregroundStyle(selected ? Color.accentColor : Color.secondary)
-                    BotThreadRow(task: task, selected: task.threadId == current.threadId)
+                    BotThreadRow(
+                        task: task,
+                        selected: task.threadId == current.threadId,
+                        queued: session.state.pendingQueued[task.threadId]?.isEmpty == false
+                    )
                 }
                 .contentShape(Rectangle())
             }
@@ -295,13 +300,23 @@ struct TaskManagerView: View {
             Button {
                 perform { await switchTo(task) }
             } label: {
-                BotThreadRow(task: task, selected: task.threadId == current.threadId)
+                BotThreadRow(
+                    task: task,
+                    selected: task.threadId == current.threadId,
+                    queued: session.state.pendingQueued[task.threadId]?.isEmpty == false
+                )
             }
             .disabled(isMutating || (!current.isBot && current.busy && task.threadId != current.threadId))
             .accessibilityIdentifier("thread-\(task.threadId)")
             .contextMenu {
                 Button("Rename", systemImage: "pencil") { beginRename(task) }
                     .disabled(isMutating)
+                Button {
+                    togglePin(task)
+                } label: {
+                    Label(task.pinned == true ? "Unpin" : "Pin", systemImage: task.pinned == true ? "pin.slash" : "pin")
+                }
+                .disabled(isMutating)
                 if current.isBot {
                     Button {
                         toggleArchive(task)
@@ -321,6 +336,13 @@ struct TaskManagerView: View {
                     Label("Delete", systemImage: "trash")
                 }
                 .disabled(!canDelete(task))
+                Button {
+                    togglePin(task)
+                } label: {
+                    Label(task.pinned == true ? "Unpin" : "Pin", systemImage: task.pinned == true ? "pin.slash" : "pin")
+                }
+                .tint(.indigo)
+                .disabled(isMutating)
                 if current.isBot {
                     Button {
                         toggleArchive(task)
@@ -341,7 +363,6 @@ struct TaskManagerView: View {
             }
         }
     }
-
     private func canSelectForBulkDelete(_ task: BotTask) -> Bool {
         tasks.count > 1 && task.threadId != current.threadId && !task.isWorking
             && (current.isBot || !current.busy)
@@ -362,6 +383,17 @@ struct TaskManagerView: View {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         perform { await rename(task, title: trimmed) }
+    }
+
+    private func togglePin(_ task: BotTask) {
+        perform { await setPinned(task, pinned: task.pinned != true) }
+    }
+
+    private func setPinned(_ task: BotTask, pinned: Bool) async {
+        guard await session.setTaskPinned(task, pinned: pinned, in: current) else {
+            showError("Couldn't update the thread. Try again.")
+            return
+        }
     }
 
     private func toggleArchive(_ task: BotTask) {

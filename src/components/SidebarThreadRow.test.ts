@@ -1,7 +1,43 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vitest";
-import { orderedSidebarThreads, SidebarThreadRow, threadByline, threadOpenerLabel, visibleSidebarThreads } from "./SidebarThreadRow";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { formatUpdatedAt, orderedSidebarThreads, orderedThreadList, SidebarThreadRow, threadByline, threadOpenerLabel, visibleSidebarThreads } from "./SidebarThreadRow";
+
+// The More menu lives behind component state and a portal, which a static
+// render never reaches. SidebarThreadRow uses exactly useState, useRef and
+// useEffect; stubbing those three (initial values first, state kept across a
+// re-render) lets this suite render the row directly, click the real action
+// button, and see the menu the click opened — the same extract-and-call
+// approach the ThreadRefs tests use for onClick props.
+const rowHooks = vi.hoisted(() => {
+  const slots: unknown[] = [];
+  let cursor = 0;
+  const begin = (fresh: boolean) => {
+    cursor = 0;
+    if (fresh) slots.length = 0;
+  };
+  const useState = (initial: unknown): [unknown, (value: unknown) => void] => {
+    const index = cursor++;
+    if (index >= slots.length) slots[index] = typeof initial === "function" ? (initial as () => unknown)() : initial;
+    const setValue = (value: unknown) => {
+      slots[index] = typeof value === "function" ? (value as (previous: unknown) => unknown)(slots[index]) : value;
+    };
+    return [slots[index], setValue];
+  };
+  return { begin, useState };
+});
+
+vi.mock("react", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("react")>();
+  return {
+    ...actual,
+    useState: rowHooks.useState as unknown as typeof actual.useState,
+    useRef: ((initial: unknown) => ({ current: initial })) as unknown as typeof actual.useRef,
+    useEffect: (() => undefined) as unknown as typeof actual.useEffect,
+  };
+});
+
+beforeEach(() => rowHooks.begin(true));
 
 describe("sidebar thread visibility", () => {
   const tasks = Array.from({ length: 10 }, (_, index) => ({ threadId: String(index), title: `Thread ${index}`, ...(index > 7 ? { projectId: "research" } : {}) }));
@@ -26,6 +62,7 @@ describe("sidebar thread visibility", () => {
   it("shows Queued only for idle threads, preserving Working and Waiting", () => {
     const render = (busy = false, activity?: "waiting-on-you") => renderToStaticMarkup(createElement(SidebarThreadRow, {
       task: { threadId: "queued", title: "Next job", queued: true, busy, activity },
+      ownerId: "scout",
       current: false, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
     }));
     expect(render()).toContain("Next job · Queued");
@@ -39,7 +76,7 @@ describe("sidebar thread visibility", () => {
 describe("threads a bot opened", () => {
   const openedBy = { botId: "scout", name: "Scout", at: 5 };
   const render = (task: Parameters<typeof SidebarThreadRow>[0]["task"]) => renderToStaticMarkup(createElement(SidebarThreadRow, {
-    task, current: false, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
+    task, ownerId: "scout", current: false, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
   }));
   it("says who opened the thread in plain words, and nothing for the person's own", () => {
     expect(threadOpenerLabel({ openedBy })).toBe("opened by Scout");
@@ -70,7 +107,7 @@ describe("threads a bot closed", () => {
   const openedBy = { botId: "pm", name: "Parker", at: 5 };
   const closedBy = { botId: "pm", name: "Parker", at: 9 };
   const render = (task: Parameters<typeof SidebarThreadRow>[0]["task"], current = false) => renderToStaticMarkup(createElement(SidebarThreadRow, {
-    task, current, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
+    task, ownerId: "pm", current, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
   }));
   it("folds closed threads out of the default list without spending the six recent rows on them", () => {
     // newest first: three helper threads the PM opened and closed sit on top of the person's own
@@ -102,6 +139,57 @@ describe("threads a bot closed", () => {
     // a live status outranks the closed note; the selected row is not dimmed
     expect(render({ threadId: "h", title: "Helper 1", closedBy, busy: true })).toContain('title="Helper 1 · Working"');
     expect(render({ threadId: "h", title: "Helper 1", closedBy }, true)).not.toContain("text-ink-secondary/70");
+  });
+});
+
+describe("formatUpdatedAt", () => {
+  it("uses the runtime locale and timezone, and skips a missing stamp", () => {
+    const at = Date.UTC(2026, 0, 15, 0, 30);
+    expect(formatUpdatedAt(at)).toBe(new Date(at).toLocaleString([], { dateStyle: "short", timeStyle: "short" }));
+    expect(formatUpdatedAt(0)).toBe("");
+    expect(formatUpdatedAt(Number.NaN)).toBe("");
+    const markup = renderToStaticMarkup(createElement(SidebarThreadRow, {
+      task: { threadId: "t", title: "Notes", updatedAt: at },
+      ownerId: "b", current: false, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
+    }));
+    expect(markup).toContain(formatUpdatedAt(at));
+    expect(markup).toContain(new Date(at).toISOString());
+  });
+});
+
+describe("orderedThreadList", () => {
+  const task = (threadId: string, over: Record<string, unknown> = {}) => ({
+    threadId,
+    title: threadId,
+    createdAt: 1,
+    ...over,
+  });
+
+  it("pins first, then newest update, and keeps equal stamps in stored order", () => {
+    const ordered = orderedThreadList([
+      task("old", { updatedAt: 10 }),
+      task("pinned-old", { pinned: true, updatedAt: 5 }),
+      task("new", { updatedAt: 30 }),
+      task("pinned-new", { pinned: true, updatedAt: 20 }),
+      task("tie-b", { updatedAt: 10 }),
+    ]);
+    expect(ordered.map((item) => item.threadId)).toEqual(["pinned-new", "pinned-old", "new", "old", "tie-b"]);
+  });
+
+  it("does not let waiting or working outrank a newer idle thread", () => {
+    const ordered = orderedThreadList([
+      task("waiting", { updatedAt: 1, activity: "waiting-on-you" }),
+      task("fresh", { updatedAt: 5 }),
+    ]);
+    expect(ordered.map((item) => item.threadId)).toEqual(["fresh", "waiting"]);
+  });
+
+  it("uses createdAt when the thread has never been updated", () => {
+    const ordered = orderedThreadList([
+      task("created-early", { createdAt: 1 }),
+      task("created-late", { createdAt: 4 }),
+    ]);
+    expect(ordered.map((item) => item.threadId)).toEqual(["created-late", "created-early"]);
   });
 });
 
@@ -154,8 +242,23 @@ describe("orderedSidebarThreads", () => {
 
 describe("archived threads", () => {
   const render = (task: Parameters<typeof SidebarThreadRow>[0]["task"]) => renderToStaticMarkup(createElement(SidebarThreadRow, {
-    task, current: false, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
+    task, ownerId: "scout", current: false, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn(),
   }));
+  it("keeps the six newest open threads, and does not spend those slots on a pin", () => {
+    const rows = [
+      { threadId: "old-open", title: "Old", createdAt: 1, updatedAt: 1 },
+      { threadId: "newer", title: "Newer", createdAt: 2, updatedAt: 50 },
+      { threadId: "mid", title: "Mid", createdAt: 3, updatedAt: 40 },
+      { threadId: "also", title: "Also", createdAt: 4, updatedAt: 30 },
+      { threadId: "fourth", title: "Fourth", createdAt: 5, updatedAt: 20 },
+      { threadId: "fifth", title: "Fifth", createdAt: 6, updatedAt: 15 },
+      { threadId: "sixth", title: "Sixth", createdAt: 7, updatedAt: 12 },
+      { threadId: "pinned-closed", title: "Pinned", createdAt: 8, updatedAt: 2, pinned: true, closedBy: { botId: "b", name: "Scout", at: 2 } },
+    ];
+    expect(visibleSidebarThreads(rows, "none").map((task) => task.threadId)).toEqual([
+      "pinned-closed", "newer", "mid", "also", "fourth", "fifth", "sixth",
+    ]);
+  });
   it("folds archived threads out of the default list, but never when they need the person", () => {
     const rows = [
       { threadId: "0", title: "Current work" },
@@ -184,5 +287,81 @@ describe("archived threads", () => {
     expect(visibleSidebarThreads(rows, "0").map((task) => task.threadId)).toEqual(["0"]);
     expect(threadByline({ archivedAt: 0 })).toBe("Archived");
     expect(render({ threadId: "1", title: "Put away", archivedAt: 0 })).toContain("Archived");
+  });
+});
+
+describe("Copy link", () => {
+  type RowTask = Parameters<typeof SidebarThreadRow>[0]["task"];
+  type RowProps = { children?: unknown; [key: string]: unknown };
+  type RowNode = { $$typeof?: unknown; type?: unknown; props?: RowProps; children?: unknown };
+
+  const renderRow = (task: RowTask, ownerId: string, fresh = true): RowNode => {
+    rowHooks.begin(fresh);
+    return SidebarThreadRow({ task, ownerId, current: false, onSelect: vi.fn(), onRename: vi.fn(), onDelete: vi.fn() }) as RowNode;
+  };
+
+  const walk = (node: unknown, visit: (element: RowNode) => void): void => {
+    if (Array.isArray(node)) {
+      node.forEach((child) => walk(child, visit));
+      return;
+    }
+    if (!node || typeof node !== "object") return;
+    const element = node as RowNode;
+    if (element.$$typeof !== undefined || element.type !== undefined) visit(element);
+    walk(element.props?.children ?? element.children, visit);
+  };
+
+  const textOf = (node: unknown): string => {
+    if (typeof node === "string") return node;
+    if (Array.isArray(node)) return node.map(textOf).join("");
+    if (!node || typeof node !== "object") return "";
+    const element = node as RowNode;
+    return textOf(element.props?.children ?? element.children);
+  };
+
+  const buttonWithLabel = (tree: RowNode, label: string) => {
+    let found: RowNode | undefined;
+    walk(tree, (element) => {
+      if (!found && element.type === "button" && textOf(element).includes(label)) found = element;
+    });
+    return found;
+  };
+
+  const moreMenuButton = (tree: RowNode) => {
+    let found: RowNode | undefined;
+    walk(tree, (element) => {
+      if (!found && element.props && "aria-expanded" in element.props) found = element;
+    });
+    return found;
+  };
+
+  it("writes the exact canonical link for the row's owner to the clipboard", () => {
+    const writeText = vi.fn(() => Promise.resolve());
+    vi.stubGlobal("navigator", { clipboard: { writeText } });
+    vi.stubGlobal("window", { innerWidth: 1024, innerHeight: 768 });
+    vi.stubGlobal("document", { body: { nodeType: 1 } });
+    // a bot-owned row and a room-owned row: the owner id, not anything else,
+    // is what the copied link must carry as ?bot=
+    const rows = [
+      { task: { threadId: "qa-245", title: "QA PR 245" }, ownerId: "scout", link: "openmausbot://thread/qa-245?bot=scout" },
+      { task: { threadId: "monday-1", title: "Monday plan" }, ownerId: "standup", link: "openmausbot://thread/monday-1?bot=standup" },
+    ];
+    for (const { task, ownerId, link } of rows) {
+      const closed = renderRow(task, ownerId);
+      expect(buttonWithLabel(closed, "Copy link")).toBeUndefined();
+      const more = moreMenuButton(closed);
+      expect(more?.props).toBeDefined();
+      const openMenu = more!.props!.onClick as (event: unknown) => void;
+      openMenu({ currentTarget: { getBoundingClientRect: () => ({ left: 100, bottom: 200 }) } });
+      const menu = renderRow(task, ownerId, false);
+      const copy = buttonWithLabel(menu, "Copy link");
+      expect(copy).toBeDefined();
+      expect(textOf(copy)).toContain("Copy link");
+      (copy!.props!.onClick as () => void)();
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(writeText).toHaveBeenCalledWith(link);
+      writeText.mockClear();
+    }
+    vi.unstubAllGlobals();
   });
 });

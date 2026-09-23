@@ -20,8 +20,12 @@ struct BotThreadTree: View {
     var body: some View {
         if let bot = session.state.bot(botID) {
             let isExpanded = searching || expanded
-            let groups = bot.threadGroups(matching: bot.name.localizedCaseInsensitiveContains(query) ? "" : query)
-            let count = bot.threadGroups().reduce(0) { $0 + $1.tasks.count }
+            let queued = session.state.queuedThreadIds
+            let groups = bot.threadGroups(
+                matching: bot.name.localizedCaseInsensitiveContains(query) ? "" : query,
+                queuedThreadIds: queued
+            )
+            let count = bot.threadGroups(queuedThreadIds: queued).reduce(0) { $0 + $1.tasks.count }
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 8) {
                     Button {
@@ -97,12 +101,20 @@ struct BotThreadTree: View {
         ForEach(tasks, id: \.threadId) { task in
             if let projected = bot.projected(forThread: task.threadId) {
                 NavigationLink(value: Chat.bot(projected)) {
-                    BotThreadRow(task: task)
+                    BotThreadRow(task: task, queued: session.state.pendingQueued[task.threadId]?.isEmpty == false)
                         .padding(.vertical, 8)
                         .frame(minHeight: 44)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .contextMenu {
+                    Button {
+                        let pinned = task.pinned != true
+                        Task { await session.setTaskPinned(task, pinned: pinned, in: .bot(bot)) }
+                    } label: {
+                        Label(task.pinned == true ? "Unpin" : "Pin", systemImage: task.pinned == true ? "pin.slash" : "pin")
+                    }
+                }
                 .accessibilityIdentifier("thread.\(task.threadId)")
             }
         }

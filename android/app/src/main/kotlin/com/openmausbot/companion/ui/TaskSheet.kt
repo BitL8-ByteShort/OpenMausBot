@@ -94,9 +94,15 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
     // an archived thread that starts demanding attention is back above.
     val (groups, archived) = when (current) {
         is Chat.BotChat -> {
-            val all = current.bot.threadGroups(includingClosed = true)
+            val all = current.bot.threadGroups(
+                includingClosed = true,
+                queuedThreadIds = state.queuedThreadIds,
+            )
             val folded = all.flatMap { it.tasks }.filter {
-                it.isArchived && !TaskRules.demandsAttention(it) && !TaskRules.isCurrent(it, current)
+                it.pinned != true &&
+                    it.isArchived &&
+                    !TaskRules.demandsAttention(it, queued = it.threadId in state.queuedThreadIds) &&
+                    !TaskRules.isCurrent(it, current)
             }
             val foldedIds = folded.map { it.threadId }.toSet()
             all.mapNotNull { group ->
@@ -105,6 +111,16 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
             } to folded
         }
         is Chat.RoomChat -> listOf(BotThreadGroup(null, TaskRules.tasks(current))) to emptyList()
+    }
+
+    val pinHandler: (BotTask) -> Unit = { task ->
+        saving = true
+        error = null
+        scope.launch {
+            val ok = pinTask(session, task, current, task.pinned != true)
+            saving = false
+            if (!ok) failed()
+        }
     }
 
     val archiveHandler: (BotTask) -> Unit = { task ->
@@ -205,6 +221,7 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
                                 task = task,
                                 chat = current,
                                 enabled = !saving,
+                                queued = task.threadId in state.queuedThreadIds,
                                 onSwitch = {
                                     saving = true
                                     error = null
@@ -224,6 +241,7 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
                                 },
                                 onDelete = { error = null; pendingDelete = task },
                                 onArchive = (current as? Chat.BotChat)?.let { archiveHandler },
+                                onPin = pinHandler,
                             )
                         }
                     }
@@ -242,6 +260,7 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
                                 task = task,
                                 chat = current,
                                 enabled = !saving,
+                                queued = task.threadId in state.queuedThreadIds,
                                 onSwitch = {
                                     saving = true
                                     error = null
@@ -261,6 +280,7 @@ fun TaskSheet(chat: Chat, onDismiss: () -> Unit, onSelectTask: (ChatTarget) -> U
                                 },
                                 onDelete = { error = null; pendingDelete = task },
                                 onArchive = (current as? Chat.BotChat)?.let { archiveHandler },
+                                onPin = pinHandler,
                             )
                         }
                     }
@@ -335,10 +355,12 @@ private fun TaskRow(
     task: BotTask,
     chat: Chat,
     enabled: Boolean,
+    queued: Boolean,
     onSwitch: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
     onArchive: ((BotTask) -> Unit)? = null,
+    onPin: (BotTask) -> Unit,
 ) {
     val current = TaskRules.isCurrent(task, chat)
     val canSwitch = enabled && TaskRules.canSwitch(task, chat)
@@ -353,7 +375,19 @@ private fun TaskRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        BotThreadRow(task, selected = current, modifier = Modifier.weight(1f))
+        BotThreadRow(task, selected = current, modifier = Modifier.weight(1f), queued = queued)
+
+        val pinLabel = if (task.pinned == true) "Unpin" else "Pin"
+        Text(
+            text = pinLabel,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            color = if (enabled) secondaryTint else secondaryTint.copy(alpha = 0.4f),
+            modifier = Modifier
+                .clickable(enabled = enabled) { onPin(task) }
+                .semantics { contentDescription = "$pinLabel ${TaskRules.title(task)}" }
+                .padding(horizontal = 8.dp),
+        )
 
         if (onArchive != null) {
             val label = if (task.isArchived) "Unarchive" else "Archive"
@@ -420,6 +454,9 @@ private suspend fun deleteTask(session: Session, task: BotTask, chat: Chat): Cha
         is Chat.BotChat -> session.deleteTask(task, chat.bot)?.let(Chat::BotChat)
         is Chat.RoomChat -> session.deleteTask(task, chat.room)?.let(Chat::RoomChat)
     }
+
+private suspend fun pinTask(session: Session, task: BotTask, chat: Chat, pinned: Boolean): Boolean =
+    session.pinTask(task, chat, pinned)
 
 private suspend fun archiveTask(session: Session, task: BotTask, chat: Chat, archivedAt: Double?): Boolean =
     when (chat) {

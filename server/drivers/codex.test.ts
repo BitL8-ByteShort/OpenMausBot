@@ -35,6 +35,11 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+const CONTROL_PLANE_FIXTURE = {
+  OMB_CLOUD_READY_TOKEN: "ready-should-not-leak", OMB_CLOUD_BOOTSTRAP: "bootstrap-should-not-leak",
+  OMB_LICENSE_KEY: "license-should-not-leak", OMB_INSTALLATION_CREDENTIAL: "fleet-should-not-leak",
+};
+
 describe("CodexDriver.decodeConfig", () => {
   it("defaults to the codex binary with fullAuto off", () => {
     expect(CodexDriver.decodeConfig({})).toEqual({ cli: "codex", fullAuto: false });
@@ -137,6 +142,7 @@ describe("CodexDriver turns (fake app-server)", () => {
     delete process.env.OPENAI_API_KEY;
     delete process.env.BOX_TOKEN;
     delete process.env.OMB_TTS_KEY;
+    for (const name of Object.keys(CONTROL_PLANE_FIXTURE)) delete process.env[name];
     recorder?.stop();
     await instance?.dispose();
     await removeTempDir(scratch);
@@ -174,6 +180,7 @@ describe("CodexDriver turns (fake app-server)", () => {
     // the desktop shell) must never ride into the CLI child
     process.env.BOX_TOKEN = "box-should-not-leak";
     process.env.OMB_TTS_KEY = "tts-should-not-leak";
+    Object.assign(process.env, CONTROL_PLANE_FIXTURE);
 
     const { turnId } = await instance.adapter.sendTurn({
       threadId: "t-happy",
@@ -229,6 +236,7 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(seen.env.OPENAI_API_KEY).toBeUndefined();
     expect(seen.env.BOX_TOKEN).toBeUndefined();
     expect(seen.env.OMB_TTS_KEY).toBeUndefined();
+    for (const name of Object.keys(CONTROL_PLANE_FIXTURE)) expect(seen.env[name]).toBeUndefined();
     const methods = seen.calls.map((c: { method: string }) => c.method);
     expect(methods).toEqual(["initialize", "initialized", "config/read", "thread/start", "turn/start"]);
     // Standing instructions belong to native thread configuration, not user history.
@@ -643,6 +651,34 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(argv).not.toContain('mcp_servers.notes.default_tools_approval_mode');
   });
 
+  it("mounts a custom server under its own name when the user's config.toml already has one by that name", async () => {
+    const codexHome = join(scratch, "collision-codex-home");
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(join(codexHome, "config.toml"), '[mcp_servers.fibery]\nurl = "https://mcp-eu-svc.fibery.io/mcp"\n');
+    await create({ environment: { CODEX_HOME: codexHome } });
+    const dump = join(scratch, "collision.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({
+      threadId: "t-collision",
+      text: "go",
+      integrations: {
+        custom: {
+          fibery: { command: "uv", args: ["tool", "run", "fibery-mcp-server"], env: {} },
+          notes: { command: "npx", args: ["-y", "@x/notes-mcp"], env: {} },
+        },
+      },
+    });
+    await recorder.until((event) => event.type === "turn.completed");
+    const argv = JSON.parse(readFileSync(dump, "utf8")).argv.join(" ");
+    // the colliding server moves aside; a stdio command over the url entry
+    // would have been "invalid configuration" for the whole app-server
+    expect(argv).toContain("mcp_servers.fibery_openmausbot.command");
+    expect(argv).not.toContain("mcp_servers.fibery.command");
+    // an unrelated name is untouched
+    expect(argv).toContain("mcp_servers.notes.command");
+  });
+
   it("mounts a url server for codex to connect to, header values off argv", async () => {
     await create();
     const dump = join(scratch, "remote-mcp.json");
@@ -925,7 +961,34 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
     expect(seen.argv).toContain('model_provider="openmaus_company"');
     expect(JSON.stringify(seen.argv)).not.toContain("synthetic-company-fixture");
-    expect(recorder.events.filter((event) => event.type === "session.started")).toMatchObject([{ sessionId: "codex-thread-1" }]);
+    expect(recorder.events.filter((event) => event.type === "session.started")).toMatchObject([{ sessionId: "codex-thread-1", rebuilt: true }]);
+  });
+
+  it("rebuilds a missing personal thread only for a turn whose recovery text is the replay it would have had", async () => {
+    await create();
+    const dump = join(scratch, "personal-missing-replay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    const recoveryText = "[This conversation received an update outside your provider session.]\nUser: go";
+    await instance.adapter.sendTurn({ threadId: "t-personal-replay", text: "go", resumeCursor: "gone-thread", recoveryText, recoveryIsReplay: true });
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(calls.find((call: { method: string }) => call.method === "turn/start").params.input).toEqual([{ type: "text", text: recoveryText }]);
+    expect(recorder.events.filter((e) => e.type === "session.started")).toMatchObject([{ rebuilt: true }]);
+  });
+
+  it("does not announce a rebuilt Company thread when the recovery text is the turn itself", async () => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-no-replay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "company-no-replay", text: "Continue", resumeCursor: "gone-company-thread",
+      recoveryText: "Continue", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(recorder.events.filter((event) => event.type === "session.started").at(-1)).not.toMatchObject({ rebuilt: true });
   });
 
   it("keeps successful Company resumes native without replaying the canonical transcript", async () => {
@@ -1474,9 +1537,11 @@ describe("CodexDriver turns (fake app-server)", () => {
     // the drained queue runs as its own turn: fresh child, still no mid-turn kill
     await instance.adapter.sendTurn({ threadId: "t-codex-queue-nokill", text: "queued words" });
     await recorder.until((e) => e.type === "turn.started");
-    // the fresh app-server writes its dump pid only once it serves a message
-    await expect.poll(() => JSON.parse(readFileSync(dump, "utf8")).pid, { timeout: 5_000 }).not.toBe(turnPid);
-    const drainPid = JSON.parse(readFileSync(dump, "utf8")).pid;
+    // the fresh app-server writes its dump pid only once it serves a message.
+    // Take the pid from inside the wait: a second, un-polled read here raced
+    // the fake's next rewrite of the dump and blew up on Windows.
+    let drainPid = turnPid;
+    await expect.poll(() => (drainPid = JSON.parse(readFileSync(dump, "utf8")).pid), { timeout: 5_000 }).not.toBe(turnPid);
     expect(killed(drainPid)).toBe(false);
     expect(processIsAlive(drainPid)).toBe(true);
     expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);

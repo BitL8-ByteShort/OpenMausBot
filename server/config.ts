@@ -10,6 +10,7 @@ import { normalizeImageGenerationUrl, type ImageGenerationConfig } from "../shar
 import { writeFileAtomic } from "./atomic.ts";
 import { EFFORT_LEVELS } from "../shared/wire.ts";
 import { isModelVariant, type InstanceConfigMap, type ModelSelection } from "./contracts.ts";
+import { PROVIDER_ICON_PRESETS, providerIconError } from "../shared/provider-icon.ts";
 import type { McpServerSpec } from "./contracts.ts";
 import { isRemoteMcpServer, parseStoredMcpServer } from "./mcp-registry.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
@@ -22,6 +23,9 @@ const BROWSER_PROFILE_ID = /^[a-z0-9_-]{1,40}$/;
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
+export const DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES = 30;
+export const DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES = 10;
+export const DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES = 240;
 export const DEFAULT_MAX_CONCURRENT_BOT_THREADS = 3;
 export const MAX_CONCURRENT_BOT_THREADS = 10;
 /** Bounds for threads.eventLogMaxBytes: the floor keeps the kept tail large
@@ -36,6 +40,20 @@ export const MAX_LOCAL_VM_MAX_INSTANCES = 4;
 
 export function isValidSshAlias(value: unknown): value is string {
   return typeof value === "string" && SSH_ALIAS.test(value);
+}
+
+const CDP_PORT = /^[0-9]{1,5}$/;
+const CDP_URL = /^(https?|wss?):\/\/\S+$/i;
+
+/** A bare TCP port (agent-browser's `--cdp <port>` shorthand) or an
+ * http(s)/ws(s) URL to a Chrome DevTools Protocol endpoint. */
+export function isValidCdpTarget(value: unknown): value is string {
+  if (typeof value !== "string" || value === "") return false;
+  if (CDP_PORT.test(value)) {
+    const port = Number(value);
+    return port >= 1 && port <= 65535;
+  }
+  return CDP_URL.test(value);
 }
 
 /** Keep the persisted VPS shape deliberately smaller than an SSH connection. */
@@ -57,13 +75,35 @@ const vpsConfigSchema = z.object({
     message: "must be a simple SSH config alias",
   }).optional(),
 });
+/** Attach a bot's browser to a Chrome the operator already has running,
+ * instead of agent-browser spawning its own (#1396). Deliberately a
+ * server-owned config field, not an env-var passthrough: the ambient
+ * process environment must never redirect a bot's browser
+ * (server/browser-live.test.ts pins this guarantee down). */
+const browserEngineConfigSchema = z.object({
+  attachCdpUrl: z.string().trim().max(2048).refine((value) => value === "" || isValidCdpTarget(value), {
+    message: "browserEngine.attachCdpUrl must be a CDP port (1-65535) or an http(s)/ws(s) URL",
+  }).optional(),
+});
 const roomConfigSchema = z.object({
   turnTimeoutMinutes: z
     .number()
     .int()
     .min(MIN_ROOM_TURN_TIMEOUT_MINUTES)
     .max(MAX_ROOM_TURN_TIMEOUT_MINUTES),
-});
+  /** Room handoff tree lifetime. Active execution pauses this clock; the
+   * hard cap is wall-clock and bounds trees that never stop executing. */
+  handoffLifetimeMinutes: z.number().int().min(1).max(MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+  handoffMinRunwayMinutes: z.number().int().min(1).max(MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+  handoffHardCapMinutes: z.number().int().min(1).max(7 * MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+}).refine(
+  (rooms) =>
+    (rooms.handoffMinRunwayMinutes ?? DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES) <=
+      (rooms.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) &&
+    (rooms.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) <=
+      (rooms.handoffHardCapMinutes ?? DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES),
+  { message: "rooms handoff bounds must satisfy handoffMinRunwayMinutes <= handoffLifetimeMinutes <= handoffHardCapMinutes" },
+);
 const localVmConfigSchema = z.object({
   mode: z.enum(["shared", "per-bot"]).optional(),
   maxInstances: z
@@ -243,6 +283,10 @@ const featureConfigSchema = z.object({
    * machine's own Claude Code setup (Plugins → MCP servers switch). Off by
    * default: each extra tool costs tokens on every model call. */
   claudeUserMcp: z.boolean().optional(),
+  /** LLM-generated titles for new bot threads. Off until explicitly
+   * enabled; a one-shot that fails or answers junk leaves the first-message
+   * snippet in place — see llmThreadTitlesEnabled. */
+  llmThreadTitles: z.boolean().optional(),
 });
 /** First-run progress. Kept in the workspace config rather than a browser so
  * it survives cleared site data and is shared by every paired client. Hint
@@ -260,6 +304,11 @@ const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
   accentColor: optionalText,
+  icon: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("preset"), preset: z.enum(PROVIDER_ICON_PRESETS) }).strict(),
+    z.object({ kind: z.literal("custom"), dataUrl: z.string() }).strict()
+      .refine((icon) => providerIconError(icon) === null, { message: "Invalid provider icon" }),
+  ]).optional(),
   environment: z.record(z.string(), z.string()).optional(),
   enabled: z.boolean().optional(),
   config: z.json().optional(),
@@ -272,6 +321,22 @@ const defaultModelSelectionSchema = z.object({
   variant: z.string().refine(isModelVariant, "invalid model variant").optional(),
 }).refine((selection) => selection.variant === undefined || selection.effort === undefined,
   "choose either a model variant or an effort level");
+const threadsConfigSchema = z.object({
+  maxConcurrentPerBot: z.number().int().min(1).max(MAX_CONCURRENT_BOT_THREADS),
+  /** Cap each per-thread events/ and native/ NDJSON log at this many
+   * bytes; absent (the default) keeps today's unbounded growth (#1280). */
+  eventLogMaxBytes: z.number().int().min(MIN_THREAD_EVENT_LOG_BYTES).max(MAX_THREAD_EVENT_LOG_BYTES).optional(),
+  /** Days a closed or archived thread's event logs survive (#1280).
+   * Absent keeps them forever. */
+  eventLogRetentionDays: z.number().int().min(1).max(3650).optional(),
+}).strict();
+/** PATCH threads: every knob is independently patchable, and null clears an
+ * event-log knob back to its absent (off) default. */
+const threadsPatchSchema = threadsConfigSchema.extend({
+  maxConcurrentPerBot: threadsConfigSchema.shape.maxConcurrentPerBot.optional(),
+  eventLogMaxBytes: threadsConfigSchema.shape.eventLogMaxBytes.nullable(),
+  eventLogRetentionDays: threadsConfigSchema.shape.eventLogRetentionDays.nullable(),
+});
 const appConfigSchema = z.object({
   /** Verified by the dedicated domain endpoint, never a generic config patch. */
   customDomain: z.string().optional(),
@@ -330,6 +395,7 @@ const appConfigSchema = z.object({
   /** Voice settings and the selected voice id. `provider` picks the
    * engine: "elevenlabs" (default; needs `key`), "fish" (needs its own
    * `fishKey`), "system" (the Mac's built-in voices, no key), or
+   * "xai" (Grok TTS, reusing `xai.key`), or
    * "chatterbox" (a local OpenAI-compatible Chatterbox server; `baseUrl`
    * and `model` are settings, not secrets). Cloud keys stay separate so
    * switching providers never overwrites or misuses the other key. */
@@ -337,7 +403,7 @@ const appConfigSchema = z.object({
     key: optionalText,
     fishKey: optionalText,
     voice: optionalText,
-    provider: z.enum(["elevenlabs", "fish", "system", "chatterbox"]).optional(),
+    provider: z.enum(["elevenlabs", "fish", "system", "chatterbox", "xai"]).optional(),
     baseUrl: z
       .string()
       .trim()
@@ -369,18 +435,17 @@ const appConfigSchema = z.object({
    * system language. Unknown tags degrade to English in the renderer. */
   language: optionalText,
   rooms: roomConfigSchema.optional(),
-  threads: z.object({
-    maxConcurrentPerBot: z.number().int().min(1).max(MAX_CONCURRENT_BOT_THREADS),
-    /** Cap each per-thread events/ and native/ NDJSON log at this many
-     * bytes; absent (the default) keeps today's unbounded growth (#1280). */
-    eventLogMaxBytes: z.number().int().min(MIN_THREAD_EVENT_LOG_BYTES).max(MAX_THREAD_EVENT_LOG_BYTES).optional(),
-    /** Days a closed or archived thread's event logs survive (#1280).
-     * Absent keeps them forever. */
-    eventLogRetentionDays: z.number().int().min(1).max(3650).optional(),
-  }).strict().optional(),
+  context: z.object({
+    rebuildBytes: z.number().int().min(1_024).max(1_000_000).optional(),
+    compactAt: z.number().positive().max(10_000_000).optional(),
+    autoCompact: z.boolean().optional(),
+  }).optional(),
+  threads: threadsConfigSchema.optional(),
   localVm: localVmConfigSchema.optional(),
   features: featureConfigSchema.optional(),
   onboarding: onboardingConfigSchema.optional(),
+  /** CDP attach target for a bot's browser; see browserEngineConfigSchema. */
+  browserEngine: browserEngineConfigSchema.optional(),
   browserProfiles: browserProfilesSchema.optional(),
   instances: instanceConfigMapSchema.optional(),
   /** User-configured MCP servers, mounted into every capable engine. Kept
@@ -392,7 +457,8 @@ const appConfigSchema = z.object({
 const storedAppConfigSchema = appConfigSchema.extend({
   browserProfiles: storedBrowserProfilesSchema.optional(),
 });
-const appConfigPatchSchema = appConfigSchema.omit({ instances: true, mcpServers: true, cliStartup: true, customDomain: true });
+const appConfigPatchSchema = appConfigSchema.omit({ instances: true, mcpServers: true, cliStartup: true, customDomain: true })
+  .extend({ threads: threadsPatchSchema.optional() });
 const jsonObjectSchema = z.record(z.string(), z.json());
 
 export interface AppConfig {
@@ -417,20 +483,25 @@ export interface AppConfig {
   /** A named host from the user's SSH config. Authentication stays with SSH. */
   vps?: { sshAlias?: string };
   opencodeGo?: { apiKey?: string };
-  tts?: { key?: string; fishKey?: string; voice?: string; provider?: "elevenlabs" | "fish" | "system" | "chatterbox"; baseUrl?: string; model?: string };
+  tts?: { key?: string; fishKey?: string; voice?: string; provider?: "elevenlabs" | "fish" | "system" | "chatterbox" | "xai"; baseUrl?: string; model?: string };
   imageGen?: ImageGenerationConfig;
   profile?: { name?: string; email?: string };
-  rooms?: { turnTimeoutMinutes: number };
+  rooms?: { turnTimeoutMinutes: number; handoffLifetimeMinutes?: number; handoffMinRunwayMinutes?: number; handoffHardCapMinutes?: number };
   threads?: { maxConcurrentPerBot: number; eventLogMaxBytes?: number; eventLogRetentionDays?: number };
+  context?: { rebuildBytes?: number; compactAt?: number; autoCompact?: boolean };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
   /** Opt-in product experiments. Every flag defaults to disabled. */
-  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean };
+  features?: { skillAuthoring?: boolean; showToolCalls?: boolean; browser?: boolean; sharedComputers?: boolean; claudeUserMcp?: boolean; llmThreadTitles?: boolean };
   /** First-run progress; see onboardingConfigSchema. */
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
   /** Named browser sessions any bot can be pointed at. */
   browserProfiles?: BrowserProfile[];
+  /** CDP target of a Chrome the operator already has running (a bare port,
+   * e.g. "9333", or an http(s)/ws(s) URL). When set, a bot's browser
+   * attaches to it instead of agent-browser spawning its own (#1396). */
+  browserEngine?: { attachCdpUrl?: string };
   instances?: InstanceConfigMap;
 }
 export type BrowserProfile = z.output<typeof browserProfileSchema> & {
@@ -542,11 +613,38 @@ export function vpsSshAlias(cfg: AppConfig): string | null {
   return isValidSshAlias(cfg.vps?.sshAlias) ? cfg.vps.sshAlias : null;
 }
 
+/** Read-and-revalidate accessor, same shape as vpsSshAlias above: even
+ * though loadConfig()/parseStoredConfig() already schema-validate this
+ * field, callers that forward it into a child process environment get a
+ * second, cheap guarantee rather than trusting a hand-edited config.json. */
+export function browserEngineAttachCdpUrl(cfg: AppConfig): string | null {
+  return isValidCdpTarget(cfg.browserEngine?.attachCdpUrl) ? cfg.browserEngine.attachCdpUrl : null;
+}
+
 export function roomTurnTimeoutMinutes(cfg: AppConfig): number {
   return cfg.rooms?.turnTimeoutMinutes ?? DEFAULT_ROOM_TURN_TIMEOUT_MINUTES;
 }
 
-export function maxConcurrentBotThreads(cfg: AppConfig): number {
+export interface RoomHandoffLimitsMs {
+  lifetimeMs: number;
+  minRunwayMs: number;
+  hardCapMs: number;
+}
+
+/** Room handoff tree budgets in milliseconds. The tree lifetime pauses
+ * while a node is actively executing; the hard cap is wall-clock and bounds
+ * trees that never stop. Read when the server starts. */
+export function roomHandoffLimits(cfg: AppConfig): RoomHandoffLimitsMs {
+  return {
+    lifetimeMs: (cfg.rooms?.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) * 60_000,
+    minRunwayMs: (cfg.rooms?.handoffMinRunwayMinutes ?? DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES) * 60_000,
+    hardCapMs: (cfg.rooms?.handoffHardCapMinutes ?? DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES) * 60_000,
+  };
+}
+
+/** Accepts a full config or a parsed patch: the concurrency limit may be
+ * read from either, and a patch may legitimately omit it. */
+export function maxConcurrentBotThreads(cfg: { threads?: { maxConcurrentPerBot?: number } }): number {
   return cfg.threads?.maxConcurrentPerBot ?? DEFAULT_MAX_CONCURRENT_BOT_THREADS;
 }
 
@@ -610,6 +708,15 @@ export function claudeUserMcpEnabled(cfg: AppConfig): boolean {
   return cfg.features?.claudeUserMcp === true;
 }
 
+/** Opt-in generated titles for new bot threads: a cheap provider one-shot
+ * names the row instead of the first-message snippet. Off until enabled by
+ * hand in ~/.openmausbot/config.json
+ * (`{"features": {"llmThreadTitles": true}}`); a one-shot that fails or
+ * answers anything unusable leaves the snippet untouched. */
+export function llmThreadTitlesEnabled(cfg: AppConfig): boolean {
+  return cfg.features?.llmThreadTitles === true;
+}
+
 /** Config sections no provider driver reads. A write that touches only
  * these must not rebuild the fleet: rebuilding disposes every engine child
  * and reloads it, seconds of work that would also interrupt in-flight
@@ -623,6 +730,7 @@ export const FLEET_NEUTRAL_KEYS: ReadonlySet<string> = new Set([
   "vps",
   "rooms",
   "threads",
+  "context",
   "localVm",
   "features",
   "browserProfiles",
@@ -738,7 +846,7 @@ export function loadConfig(): AppConfig {
  * user cleared the credential, so the var is dropped and the (now empty)
  * file value is authoritative again. Fields absent from the patch are
  * untouched. */
-export function syncCredentialEnv(patch: Partial<AppConfig>): void {
+export function syncCredentialEnv(patch: Partial<Omit<AppConfig, "threads">>): void {
   const secrets: Array<[value: string | undefined, name: string]> = [
     [patch.xai?.key, "XAI_API_KEY"],
     [patch.anthropic?.key, "OMB_ANTHROPIC_API_KEY"],
@@ -780,6 +888,8 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "XAI_API_KEY",
   "OMB_ANTHROPIC_API_KEY",
   "OMB_ANTHROPIC_API_URL",
+  "OMB_HOSTED_MODEL_TOKEN",
+  "OMB_HOSTED_MODELS",
   "OPENAI_COMPAT_API_KEY",
   "OPENAI_COMPAT_URL",
   "BOX_TOKEN",
@@ -797,9 +907,32 @@ export const WORKSPACE_CREDENTIAL_ENV = [
   "OMB_USER_DATA",
 ] as const;
 
-/** Drop every workspace credential from a child-process env (in place). */
+/** Secrets of whoever operates this server, not of the workspace: the license
+ * key, a fleet container's installation credential, and everything a hosting
+ * control plane injects under `OMB_CLOUD_` (the readiness token, the bootstrap
+ * document and its gateway token). Only this process reads them. The prefix
+ * ends in an underscore on purpose: `OMB_CLOUDFLARED_PATH` is not one of them.
+ * What an engine is meant to receive arrives under another name through its
+ * instance environment (the hosted model token as ANTHROPIC_API_KEY or
+ * OPENMAUSBOT_COMPANY_API_KEY), so nothing here is ever an engine's input. */
+export const CONTROL_PLANE_ENV = ["OMB_LICENSE_KEY", "OMB_INSTALLATION_CREDENTIAL"] as const;
+export const CONTROL_PLANE_ENV_PREFIX = "OMB_CLOUD_";
+
+/** Drop every control-plane secret from a child-process env (in place). No
+ * driver allowlist re-admits these. Names compare case-insensitively because
+ * Windows environments do. */
+export function stripControlPlaneEnv(env: Record<string, string | undefined>): void {
+  for (const key of Object.keys(env)) {
+    const name = key.toUpperCase();
+    if (name.startsWith(CONTROL_PLANE_ENV_PREFIX) || (CONTROL_PLANE_ENV as readonly string[]).includes(name)) delete env[key];
+  }
+}
+
+/** Drop every workspace credential, and every control-plane secret, from a
+ * child-process env (in place). */
 export function stripWorkspaceCredentialEnv(env: Record<string, string | undefined>): void {
   for (const key of WORKSPACE_CREDENTIAL_ENV) delete env[key];
+  stripControlPlaneEnv(env);
 }
 
 /** Env names a provider CLI might read as its own billing identity. A spawned
@@ -823,7 +956,10 @@ export const PROVIDER_CREDENTIAL_ENV = [
 
 /** Merge a partial config into ~/.openmausbot/config.json (secrets never
  * echoed back — callers report configured-or-not booleans only). */
-export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstances?: boolean } = {}): void {
+export function saveConfig(
+  patch: Partial<Omit<AppConfig, "threads">> & { threads?: z.output<typeof threadsPatchSchema> },
+  options: { replaceInstances?: boolean } = {},
+): void {
   const p = join(DATA_DIR, "config.json");
   let disk: JsonObject = {};
   try {
@@ -832,18 +968,27 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
   } catch {
     /* first write */
   }
-  const checkedPatch = appConfigSchema.partial().parse(patch);
+  const checkedPatch = appConfigSchema.partial().extend({ threads: threadsPatchSchema.optional() }).parse(patch);
   // A write is the durable migration point. Preserve every other raw key in
   // config.json, but never write #567's mixed-case or duplicate profile ids
   // back after we have successfully recognized the legacy list.
   const storedProfiles = storedBrowserProfilesSchema.safeParse(disk.browserProfiles);
   if (storedProfiles.success) disk.browserProfiles = storedProfiles.data;
-  for (const key of ["xai", "anthropic", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "localVm", "features", "budgets", "billing", "onboarding"] as const) {
+  for (const key of ["xai", "anthropic", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "context", "localVm", "features", "budgets", "billing", "onboarding", "browserEngine"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
     const merged: JsonObject = current.success ? { ...current.data } : {};
+    // parseStoredConfig requires threads.maxConcurrentPerBot, so creating
+    // the section with only an event-log knob must still persist a valid
+    // concurrency default.
+    if (key === "threads" && !current.success) merged.maxConcurrentPerBot = DEFAULT_MAX_CONCURRENT_BOT_THREADS;
     Object.assign(merged, section);
+    // null is the patch's explicit "remove this key" marker (today only the
+    // threads event-log knobs use it); a key the patch omits keeps its value.
+    for (const [sectionKey, sectionValue] of Object.entries(section as Record<string, unknown>)) {
+      if (sectionValue === null) delete merged[sectionKey];
+    }
     disk[key] = merged;
   }
   if (checkedPatch.vps !== undefined) disk.vps = normalizeVpsConfig(checkedPatch.vps);
@@ -899,6 +1044,25 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
     }
     disk.instances = diskInstances;
   }
+  // Settings edits the workspace connection. Older fleet saves could freeze
+  // its inherited URL in the default instance, sending a replacement key to
+  // the previous endpoint. An explicit URL save reconnects that shared-key
+  // instance; custom connections and explicit instance patches stay intact.
+  if (checkedPatch.openaiCompat?.url !== undefined && checkedPatch.instances?.openaiCompat === undefined) {
+    const instances = jsonObjectSchema.safeParse(disk.instances);
+    const entry = jsonObjectSchema.safeParse(instances.success ? instances.data.openaiCompat : undefined);
+    const config = jsonObjectSchema.safeParse(entry.success ? entry.data.config : undefined);
+    const environment = jsonObjectSchema.safeParse(entry.success ? entry.data.environment : undefined);
+    if (entry.success && entry.data.driver === "openai-compat" && config.success
+      && !config.data.key
+      && (!config.data.apiKeyEnv || config.data.apiKeyEnv === "OPENAI_COMPAT_API_KEY")
+      && !(environment.success && Object.hasOwn(environment.data, "OPENAI_COMPAT_API_KEY"))) {
+      const nextConfig = { ...config.data };
+      delete nextConfig.url;
+      // Preserve raw extension fields elsewhere in this saved instance.
+      (disk.instances as JsonObject).openaiCompat = { ...entry.data, config: nextConfig };
+    }
+  }
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
 }
@@ -940,13 +1104,16 @@ export function withInstanceCli(
   return { ok: true, config: next };
 }
 
-/** Materialize defaults without copying injected workspace secrets to disk. */
+/** Materialize defaults without freezing injected workspace settings or secrets. */
 export function persistableInstanceConfigs(cfg: AppConfig): InstanceConfigMap {
   const map = instanceConfigs(cfg);
   for (const [id, entry] of Object.entries(map)) {
     const environment = cfg.instances?.[id]?.environment;
     if (environment) entry.environment = { ...environment };
     else delete entry.environment;
+    const config = cfg.instances?.[id]?.config;
+    if (config !== undefined) entry.config = structuredClone(config);
+    else delete entry.config;
   }
   return map;
 }
