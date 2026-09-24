@@ -7,14 +7,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach } from "vitest";
 
+import { stripAmbientAppEnv } from "./ambient-env.ts";
 import { removeTempDir } from "./cleanup.ts";
+
+// Test modules may capture these values at import time, and spawned fake
+// processes inherit process.env. Drop ambient app configuration, but keep the
+// explicit test controls used by optional browser and provider e2e runs.
+// Tests can still set the app variables they intentionally exercise after
+// setup. This also prevents OMB_DATA_DIR from pointing outside the throwaway
+// home below.
+stripAmbientAppEnv(process.env);
 
 const home = mkdtempSync(join(tmpdir(), "omb-test-home-"));
 process.env.HOME = home;
 process.env.USERPROFILE = home;
-// OMB_DATA_DIR is an intentional production override, but tests must never
-// let it escape the throwaway home they are about to delete.
-delete process.env.OMB_DATA_DIR;
 // Do not let a developer's Hermes global config path leak into per-test homes.
 delete process.env.HERMES_HOME;
 // The companion keeps its paired devices in its own directory, and resolves
