@@ -216,12 +216,14 @@ import { recoveryCapabilityError } from "./automatic-recovery.ts";
 import { decodeGeneratedImage } from "./generated-image.ts";
 import {
   MAX_MCP_SERVERS,
+  isRemoteMcpServer,
   listMcpServers,
   mcpServerNameError,
   parseMcpServerMutation,
   parseMcpServersImport,
   parseStoredMcpServer,
 } from "./mcp-registry.ts";
+import { McpOAuthError, McpOAuthManager, withMcpSignIn, withoutPendingSignIn } from "./mcp-oauth.ts";
 import { probeMcpServer } from "./mcp-probe.ts";
 import {
   GROUP_GOAL_MAX_TURNS,
@@ -423,7 +425,7 @@ import * as vps from "./vps-computer.ts";
 import { RoutineManager, type RoutineRun, type RoutineRunOn, type RoutineRunTrigger } from "./routines.ts";
 import { CalendarCallManager, type CalendarCall } from "./calendar-calls.ts";
 import { BUILT_IN_BROWSER_SYSTEM_PROMPT } from "./browser-engine.ts";
-import { BrowserRuntime } from "./browser-runtime.ts";
+import { BrowserRuntime, browserRuntimeEnv } from "./browser-runtime.ts";
 import { BrowserLive } from "./browser-live.ts";
 import {
   agentBrowserFrame,
@@ -431,6 +433,7 @@ import {
   browserEngineEncryptionKey,
   prepareBrowserSessionState,
   clearBrowserSessionState,
+  closeBrowserSession,
   ensureChrome,
   installAgentBrowserBinary,
   resolveAgentBrowserBinary,
@@ -2720,7 +2723,15 @@ function canAdmitDirectTurn(botId: string, threadId: string): boolean {
 /** Routine and webhook dispatch shares startTurn's admission preconditions
  * instead of waiting for whole-bot idleness: a free thread slot and no
  * active group turn. A group turn blocks scheduled starts the same way it
- * blocks every other turn kind; it does not consume a capacity slot. */
+ * blocks every other turn kind; it does not consume a capacity slot.
+ *
+ * A fresh dispatch also pins to the bot's own project folder, exactly like
+ * startTurn's cwd resolution: a free thread slot alone can miss a second
+ * task of this bot landing in that one folder (#F-collide). Predicting that
+ * collision here lets it defer through the same busy-target machinery as
+ * capacity and group-turn contention, instead of reaching startTurn's own
+ * workspace claim — which throws deep inside a detached dispatch that no
+ * caller here awaits, so the run would otherwise fail permanently. */
 function unattendedDispatchState(botId: string): "ready" | "busy" | "missing" {
   const bot = store.bot(botId);
   const decision = admit("unattended", {}, {
@@ -2728,7 +2739,16 @@ function unattendedDispatchState(botId: string): "ready" | "busy" | "missing" {
     atCapacity: Boolean(bot) && botAtThreadCapacity(botId),
     groupTurn: Boolean(bot) && Boolean(activeGroupTurnForBot(botId)),
   });
-  return decision.action !== "refuse" ? "ready" : decision.code === "missing" ? "missing" : "busy";
+  if (decision.action === "refuse") return decision.code === "missing" ? "missing" : "busy";
+  if (bot?.cwd) {
+    try {
+      if (turnResources.blocker(workspaceResource(bot.cwd), { threadId: "", generation: "" })) return "busy";
+    } catch {
+      // An unresolvable folder is startTurn's own admission check to
+      // report; this prediction only ever adds a defer, never a refusal.
+    }
+  }
+  return "ready";
 }
 
 function requestedTaskBot(botId: string, rawThreadId: unknown): BotRecord {
@@ -2903,7 +2923,15 @@ function cancelDirectTurnDispatch(botId: string, expectedThreadId?: string): Dir
 /** The bot's browser for this turn: agent-browser, one isolated session per
  * browser profile or per bot (docs/plans/browser-engine.md). Null, with the
  * reason logged once, when the engine is not on this machine. */
-const browserRuntime = new BrowserRuntime();
+const browserRuntime = new BrowserRuntime({
+  // The bot's restart_browser tool. An open Browser panel watched the old
+  // browser; drop its stream the way the panel's own Restart button does.
+  closeBrowser: async (session, spec) => {
+    const closed = await closeBrowserSession(spec.command, browserRuntimeEnv({ ...spec.env, AGENT_BROWSER_SESSION: session }));
+    if (closed) browserLive.closeForSession(session);
+    return closed;
+  },
+});
 const browserLive = new BrowserLive({ runtime: browserRuntime });
 // Temporary profiles last for this server run, but are never saved to disk.
 // The viewer and the agent must address the SAME temporary browser.
@@ -3757,8 +3785,7 @@ function delegatedFullAccess(from: BotRecord, fromThreadId: string, target: BotR
 
 /** Make a delegated thread Full and say so in it once, so the level the
  * chip shows and the level the turns run at agree, and the person can see
- * where the access came from. Idempotent: a pair conversation is reused
- * across delegations and must not collect a chip per request. */
+ * where the access came from. */
 function grantDelegatedFullAccess(from: BotRecord, target: BotRecord, threadId: string): void {
   if (store.taskByThread(target.id, threadId)?.approvalMode === "full") return;
   store.patchTask(target.id, threadId, { approvalMode: "full", autoApprove: false, alwaysAllow: [] });
@@ -4561,6 +4588,10 @@ const roomHandoffs = new RoomHandoffs(join(DATA_DIR, "room-handoffs.json"), {
           : child.status === "completed" ? `${bot?.name ?? "Teammate"} replied${child.groupId ? ` · ${store.group(child.groupId)?.name ?? "Room"}` : ""}`
           : `${bot?.name ?? "Teammate"} — ${child.status}: ${child.result.slice(0, 180)}`,
         ok: child.status === "completed" && !problem,
+        // The chip label stays short; the report itself rides along so a
+        // phone can show what the teammate said without opening its thread.
+        ...(child.status === "completed" && !problem && child.result.trim()
+          ? { output: redactSecretsInText(child.result.trim()).slice(0, 2_000) } : {}),
       },
       ...(child.groupId ? { comm: { groupId: child.groupId, threadId: child.threadId, withBotId: child.botId,
         withName: bot?.name ?? "Teammate", withColor: bot?.color ?? "blue" } }
@@ -4572,14 +4603,9 @@ const roomHandoffs = new RoomHandoffs(join(DATA_DIR, "room-handoffs.json"), {
       const source = store.bot(parent.botId);
       if (source) markTaskContextExternallyUpdated(source, parent.threadId);
     }
-    // A work thread exists only because the pair conversation was busy with
-    // another job. Its result is now in the sender's conversation, so it
-    // closes itself exactly as close_thread would — folded out of the
-    // sidebar, never deleted, and open again the moment anyone speaks
-    // there. A finished job tidies up after itself; a failed or withheld
-    // one stays in the sidebar where the person can see it. The pair
-    // conversation is the standing line between two bots and never
-    // auto-closes.
+    // A successful direct work thread closes after its result is reported:
+    // folded out of the sidebar, never deleted, and reopened if addressed.
+    // Failed or withheld work stays visible.
     const childTask = store.taskByThread(child.botId, child.threadId);
     if (!child.groupId && child.status === "completed" && !problem && !childTask?.closedBy
       && childTask?.openedBy?.kind === "work" && childTask.openedBy.botId === parent.botId) {
@@ -8742,11 +8768,9 @@ async function startTurn(
     const titled = store.titleTaskFromFirstMessage(bot.id, resolvedImages.text, threadId);
     // The snippet is only the fallback name. A cheap one-shot may trade it
     // for a title a person would have typed, but never on a peer-opened
-    // row: adoption recognises those by the exact title their assignment
-    // gave them (openingRequestTitle), and a generated one would break the
-    // comparison it renames under. Everywhere else, the swap happens only
-    // while the row still carries the snippet — a rename by the person or
-    // by adoption has already broken that equality by then.
+    // row: its title belongs to the assigned work. Everywhere else, the
+    // swap happens only while the row still carries the snippet — a rename
+    // by a person has already broken that equality by then.
     const snippet = titled?.title;
     if (titled && snippet && !titled.openedBy?.botId && llmThreadTitlesEnabled(cfg) && instance.generateText) {
       void generateThreadTitle(instance, resolvedImages.text)
@@ -9072,7 +9096,7 @@ async function startTurn(
       // composio — only to a driver that can mount them. Their tools are
       // never pre-allowed, so every call rides the normal permission flow.
       if (instance.adapter.capabilities.customMcp === true) {
-        const custom = engineMcpServers(bot);
+        const custom = await withMcpSignIn(engineMcpServers(bot), mcpOAuth);
         if (Object.keys(custom).length) integrations.custom = custom;
       }
       // CLI engines work inside the bot's own workspace directory rather
@@ -10045,7 +10069,10 @@ function routineRunFallbackText(card: NonNullable<Message["routineRun"]>): strin
                 ? "deferred: target busy"
               : card.status
   );
-  return `Routine “${card.routineName}” ${state}`;
+  // Clients without the card (older phones) draw only this line, so it
+  // carries what the run said, not just that it finished.
+  const detail = card.summary ?? card.error;
+  return `Routine “${card.routineName}” ${state}${detail ? `\n\n${detail}` : ""}`;
 }
 
 /** Upsert one durable lifecycle card per run. Replaying the same transition,
@@ -11110,11 +11137,23 @@ const webhooks = new WebhookManager({
   findRun: (webhookId, deliveryId) => routines!.webhookRunReceipt(webhookId, deliveryId),
   cancelQueued: (webhookId, message) => routines!.cancelQueuedWebhook(webhookId, message),
   pendingRuns: (webhookId) => routines!.activeWebhookRunCount(webhookId),
-  // delivery:"post" webhooks land in the bot's main chat as the bot's own message.
-  post: (botId, text) => {
-    const bot = store.bot(botId);
-    if (!bot) return;
-    store.appendMessage(bot.threadId, { role: "bot", kind: "text", text });
+  // delivery:"post" webhooks land in a dedicated "Updates" task, never
+  // bot.threadId (the bot's currently-selected task) -- see
+  // resolvePostThread below. Fixes
+  // https://github.com/milind-soni/OpenMausBot/issues/2071: a post used to
+  // land wherever the owner (or another automation) had last switched
+  // that bot's selection, including a live conversation.
+  post: (botId, threadId, text) => {
+    if (!store.bot(botId)) return;
+    store.appendMessage(threadId, { role: "bot", kind: "text", text });
+  },
+  // Mirrors resolveResultsThread's routines wiring a few hundred lines up
+  // in this same file: create-on-first-use, never activated (so it never
+  // steals the bot's live selection the way POST /api/bots/:id/tasks
+  // does), reused forever after via trigger.resultsThreadId.
+  resolvePostThread: (trigger, forceNew) => {
+    if (!forceNew && trigger.resultsThreadId) return trigger.resultsThreadId;
+    return store.createTask(trigger.botId, "Updates", false)?.threadId;
   },
 });
 
@@ -11504,7 +11543,7 @@ async function runGroupMemberTurn(
   }
   // user-configured MCP servers: same gating as the 1:1 site above.
   if (instance.adapter.capabilities.customMcp === true) {
-    const custom = engineMcpServers(bot);
+    const custom = await withMcpSignIn(engineMcpServers(bot), mcpOAuth);
     if (Object.keys(custom).length) integrations.custom = custom;
   }
   // Connected-app discovery is intentionally awaited before a provider owns
@@ -14126,7 +14165,10 @@ function mcpServerResponse() {
   // While enrolled with custom servers off, say which servers stay configured
   // but never reach bots, and why. Nothing here is written to config.json.
   const policy = managedPolicy.current();
-  const servers = listMcpServers(cfg.mcpServers).map(server =>
+  const servers = listMcpServers(cfg.mcpServers).map((server) => {
+    const auth = "url" in server ? mcpOAuth.authState(server.name, server.url) : "none";
+    return auth === "none" ? server : { ...server, auth };
+  }).map(server =>
     managedPolicy.mcpAllowed(server.name, "url" in server ? server.url : undefined) ? server : { ...server, managedBy: policy!.organizationName });
   return { servers, ...(policy && !policy.mcp.allowCustom ? { managed: { organizationName: policy.organizationName, allowlist: policy.mcp.allowlist } } : {}) };
 }
@@ -14151,7 +14193,7 @@ function mcpServerBody(body: unknown): Record<string, unknown> {
 /** Configured MCP servers that may reach this bot's engine. While enrolled,
  * the organisation's allow-list filters them; config.json is never changed. */
 function engineMcpServers(bot: BotRecord) {
-  return managedPolicy.filterMcp(customMcpServers(cfg, bot.mcpServers));
+  return withoutPendingSignIn(managedPolicy.filterMcp(customMcpServers(cfg, bot.mcpServers)), mcpOAuth);
 }
 
 function persistMcpServers(next: Record<string, unknown>): void {
@@ -14343,6 +14385,8 @@ async function reloadProviders() {
 let providerConfigBusy = false;
 const providerInstancesChanging = new Set<string>();
 let mcpConfigBusy = false;
+/** OAuth sign-in for URL servers; tokens live in their own owner-only file. */
+const mcpOAuth = new McpOAuthManager({ file: join(DATA_DIR, "mcp-oauth.json") });
 const MAX_CONCURRENT_MCP_PROBES = 2;
 let mcpProbesInFlight = 0;
 // One updater per executable: multiple Claude instances can point at the same
@@ -16388,7 +16432,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           })).filter(g => g.members.length);
           return json(res, 200, { currentRoom: source ? { id: source.id, name: source.name, workingFolder: source.cwd || null } : null,
             bots: reachablePeers(store.bots, internalSender).map(bot => ({ id: bot.id, name: bot.name, title: bot.title, section: bot.section, busy: bot.busy })),
-            rooms, note: "Without group_id: use this room when in a room, otherwise your standing conversation with that teammate — every assignment you send it continues the same thread, so write as if it remembers the last one. Each bot uses its own environment and permissions. Files are not transferred: pass absolute paths only when accessible to the recipient, otherwise pass the content." });
+            rooms, note: "Without group_id: use this room when in a room, otherwise each distinct assignment starts a fresh thread for that teammate. Give a self-contained brief. Each bot uses its own environment and permissions. Files are not transferred: pass absolute paths only when accessible to the recipient, otherwise pass the content." });
         }
         if (method === "POST" && path === "/api/internal/coordinate-bots") {
           const parsed = z.object({
@@ -16461,25 +16505,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             try {
               requireActiveInternalCapability();
               if (!destination) {
-                // One durable conversation per pair of bots, resolved from
-                // the recipient's own threads — never from this turn, the
-                // request key, or the thread the person has selected there.
-                const resolved = store.resolvePairConversation(internalSender, target.botId, {
-                  label: parsed.data.label,
-                  // "Still working" exactly as close_thread reads it: a
-                  // running turn, a queued one, or coordinated work already
-                  // addressed at that thread.
-                  working: threadId => threadBusy(target.botId, threadId)
-                    || queuedThreadPosition(target.botId, threadId) !== null
-                    || roomHandoffs.activeDirect(threadId),
-                });
-                if (!resolved) throw new Error("The recipient no longer exists");
-                target.threadId = resolved.task.threadId;
-                if (resolved.created) createdThread = resolved.task.threadId;
-                // A work thread carries one assignment: it is for the person
-                // this coordination serves. The durable pair conversation is
-                // shared by every assignment between two bots, so it names nobody.
-                if (resolved.created && resolved.task.openedBy?.kind === "work") threadStarters.set(resolved.task.threadId, openerFrom(address.threadId));
+                const task = store.createTask(target.botId,
+                  `@${internalSender.name}${parsed.data.label ? ` · ${parsed.data.label}` : " · work"}`,
+                  false, undefined, { botId: internalSender.id, name: internalSender.name, kind: "work", at: Date.now() });
+                if (!task) throw new Error("The recipient no longer exists");
+                target.threadId = createdThread = task.threadId;
                 if (delegatedFullAccess(internalSender, internalCapability.threadId, store.bot(target.botId)!)) {
                   grantDelegatedFullAccess(internalSender, store.bot(target.botId)!, target.threadId);
                 }
@@ -16487,11 +16517,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
               const { node, duplicate } = roomHandoffs.enqueue(address, internalCapability.generation, internalCapability.roomHandoffId,
                 target, parsed.data.requestKey + ":" + target.botId, parsed.data.message, approvalGranted, parsed.data.rework, [...store.messagesFor(address.threadId)].reverse().find(m => m.role === "user" && m.kind === "text")?.text ?? "",
                 destination ? parsed.data.requestKey : undefined);
-              // A re-dispatched request_key is answered by the request it
-              // already made, so a thread resolved for the retry (the pair
-              // conversation was busy with that very request) goes back
-              // before anyone sees a row that leads nowhere.
-              if (duplicate && createdThread && createdThread !== node.threadId) store.deleteTask(target.botId, createdThread);
+              // A retry keeps its original task; discard the speculative row.
+              if (duplicate && createdThread && createdThread !== node.threadId) {
+                store.deleteTask(target.botId, createdThread);
+              }
+              if (!duplicate && createdThread) threadStarters.set(createdThread, openerFrom(address.threadId));
               createdThread = undefined; // The durable coordinator now owns this task.
               accepted.push({ requestId: node.id, botId: node.botId, duplicate, status: node.status });
               // A duplicate request_key lands on the node enqueue already
@@ -16530,7 +16560,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
                 });
               }
             } catch (error) {
-              if (createdThread) store.deleteTask(target.botId, createdThread);
+              if (createdThread) {
+                store.deleteTask(target.botId, createdThread);
+              }
               const said = error instanceof Error ? error.message : String(error);
               errors.push({ botId: target.botId, error: said });
               receipts.push(peerDeliveryReceipt({
@@ -22154,11 +22186,55 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       res.once("close", disconnect);
       mcpProbesInFlight += 1;
       try {
-        return json(res, 200, await probeMcpServer(parsed.server, undefined, controller.signal));
+        const name = mcpTest[1];
+        let target = parsed.server;
+        if (isRemoteMcpServer(target) && mcpOAuth.authState(name, target.url) === "signed-in") {
+          const signedIn = (await withMcpSignIn({ [name]: target }, mcpOAuth))[name];
+          if (signedIn) target = { ...signedIn, enabled: target.enabled } as typeof target;
+        }
+        const result = await probeMcpServer(target, undefined, controller.signal);
+        if (!result.ok && result.auth === "required" && isRemoteMcpServer(target)) mcpOAuth.markNeedsSignIn(name, target.url);
+        return json(res, 200, result);
       } finally {
         res.off("close", disconnect);
         mcpProbesInFlight -= 1;
       }
+    }
+
+    // OAuth sign-in for a URL server. The browser returns to a listener on
+    // this machine, so it starts only from a client on this machine.
+    const mcpSignIn = /^\/api\/mcp\/servers\/([a-z][a-z0-9_-]{0,31})\/(sign-in|sign-out)(?:\/([0-9a-f-]{36}))?$/.exec(path);
+    if (mcpSignIn) {
+      const [, name, action, flowId] = mcpSignIn;
+      const raw = cfg.mcpServers?.[name!];
+      const parsed = raw === undefined ? null : parseStoredMcpServer(name!, raw);
+      if (!parsed?.ok) return json(res, 404, { error: "MCP server not found." });
+      if (!isRemoteMcpServer(parsed.server)) return json(res, 400, { error: "Only servers reached by URL can be signed in to." });
+      const url = parsed.server.url;
+      if (action === "sign-out" && method === "POST" && !flowId) {
+        await mcpOAuth.signOut(name!, url);
+        return json(res, 200, mcpServerResponse());
+      }
+      if (action === "sign-in" && method === "GET" && flowId) {
+        const auth = mcpOAuth.status(name!, flowId);
+        return auth ? json(res, 200, { auth }) : json(res, 404, { error: "This sign-in is no longer available. Start again." });
+      }
+      if (action === "sign-in" && method === "DELETE" && !flowId) {
+        mcpOAuth.cancel(name!);
+        return json(res, 200, { ok: true });
+      }
+      if (action === "sign-in" && method === "POST" && !flowId) {
+        if (isProxied(req) || !isLoopbackHost(req.socket.remoteAddress)) {
+          return json(res, 409, { error: "Sign in from the computer running this workspace.", code: "remote_workspace" });
+        }
+        try {
+          return json(res, 200, { auth: await mcpOAuth.start(name!, url) });
+        } catch (error) {
+          if (error instanceof McpOAuthError) return json(res, 400, { error: error.message, code: error.code });
+          return json(res, 502, { error: error instanceof Error ? error.message : "Sign-in could not start." });
+        }
+      }
+      return json(res, 405, { error: "method not allowed" });
     }
 
     if (method === "POST" && path === "/api/mcp/servers") {
@@ -22236,6 +22312,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           const next = { ...current };
           delete next[name];
           persistMcpServers(next);
+          mcpOAuth.forget(name);
           return json(res, 200, mcpServerResponse());
         }
 
@@ -22256,6 +22333,12 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const refusal = mcpPolicyRefusal(name, parsed.server);
         if (refusal) return json(res, 403, { error: refusal, code: "managed_policy" });
         persistMcpServers({ ...current, [name]: parsed.server });
+        // a sign-in belongs to one address; a token never follows the entry elsewhere
+        const before = isRemoteMcpServer(existing.server) ? existing.server.url : null;
+        const after = isRemoteMcpServer(parsed.server) ? parsed.server.url : null;
+        // Any other edit (a new header, say) drops a sign-in request that has
+        // no tokens behind it; the next Test asks again if it still applies.
+        if (before !== after || (after && mcpOAuth.authState(name, after) === "needs-sign-in")) mcpOAuth.forget(name);
         return json(res, 200, mcpServerResponse());
       } finally {
         mcpConfigBusy = false;
@@ -23474,6 +23557,7 @@ const gracefulShutdown = createGracefulShutdown({
       code = 1;
     }
     closeMessageDb();
+    mcpOAuth.dispose();
     releaseDataDirLeaseAtExit();
     // A Cloud home's launcher starts the server again on this code only.
     process.exit(cloudHomeRestartRequested && code === 0 ? CLOUD_HOME_RESTART_EXIT_CODE : code);
