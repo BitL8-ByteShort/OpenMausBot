@@ -165,12 +165,21 @@ on Windows without a cleanup warning. The existing ACP suite's temporary-home
 cleanup warning also occurs in the unchanged-production baseline.
 
 [Feature draft #2101](https://github.com/milind-soni/OpenMausBot/pull/2101)
-keeps those prerequisites out of its diff. Maintainer preflight repair #2088 and
-[Windows cleanup draft #2100](https://github.com/milind-soni/OpenMausBot/pull/2100)
-must land before the clean feature branch can have green upstream CI. The
+kept those prerequisites out of its diff. At first submission they were pending;
+the composed green result was not green CI on the clean feature head. The
 cleanup candidate's exact-head full fork CI also passed all 26 checks; its one
-unchanged network-fixture failure and focused rerun are disclosed in that PR.
-The composed green result is not a claim of green CI on the clean feature head.
+unchanged network-fixture failure and focused rerun are disclosed in
+[cleanup PR #2100](https://github.com/milind-soni/OpenMausBot/pull/2100).
+
+On 2026-10-01, the feature was reconciled with upstream main
+`4ed952aa2f0c1408fdfad2d844a559524165ae5b`, which includes preflight repair #2088
+and the same Windows teardown fix in upstream commit `257e33ef`. The server
+conflict preserves both the tool-selection and memory-setting checks after
+async validation; the language conflict preserves both sets of strings.
+Fresh affected checks passed 1362 tests with one existing skip, and the actual
+settings workflow passed. Typecheck, lint, Electron syntax and all ten locale
+catalogs passed. Full-suite and upstream CI results for this follow-up belong
+in the PR's validation record.
 
 The [engine support table](../tool-selection.md#engine-support) distinguishes
 usable native selection from MCP-only support and fail-closed unsupported

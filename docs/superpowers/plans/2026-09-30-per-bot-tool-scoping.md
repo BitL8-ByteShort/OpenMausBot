@@ -162,11 +162,12 @@
 
 Submitted drafts: [tool selection #2101](https://github.com/milind-soni/OpenMausBot/pull/2101)
 and [Windows fixture cleanup #2100](https://github.com/milind-soni/OpenMausBot/pull/2100).
-The feature diff excludes its CI prerequisites, maintainer PR #2088 and the
-separate cleanup PR. The full composed fork run passed all 26 selected checks;
+The feature diff excludes its CI prerequisite patches. Both fixes are now in
+upstream main: maintainer PR #2088 and the same cleanup fix in `257e33ef`.
+The original full composed fork run passed all 26 selected checks;
 the [verification record](../../verification/tool-selection.md#completed-contribution-checks)
 identifies the tested commits and the local suite's limits.
 
-Maintainer agreement on the approach and engine support boundary, prerequisite
-merges, and green upstream CI on the clean feature branch remain required before
+Maintainer agreement on the approach and engine support boundary and green
+upstream CI on the updated feature branch remain required before
 presenting the draft as merge ready. No whole-issue closure or merge is claimed.
