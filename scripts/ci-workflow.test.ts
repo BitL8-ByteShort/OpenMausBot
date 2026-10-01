@@ -122,10 +122,16 @@ describe("CI concurrency", () => {
       step.run === "pnpm exec vitest run scripts/ci-scope.test.ts scripts/ci-workflow.test.ts scripts/testing/verification-docs.test.ts",
     )).toBe(true);
     for (const [name, job] of Object.entries(workflow.jobs) as [string, { needs?: string; if?: string }][]) {
-      if (["static", "gate"].includes(name)) continue;
+      if (["static", "gate", "deploy-composio-broker"].includes(name)) continue;
       expect(job.needs).toBe("static");
       expect(job.if).toBe(`needs.static.outputs.${["ios", "android"].includes(name) ? "mobile" : "runtime"} == 'true'`);
     }
+  });
+
+  it("deploys the broker only after control-plane checks on a main push", () => {
+    const deploy = workflow.jobs["deploy-composio-broker"];
+    expect(deploy.needs).toEqual(["control-plane"]);
+    expect(deploy.if).toBe("github.event_name == 'push' && github.ref == 'refs/heads/main'");
   });
 
   it("keeps the redundant Windows workflow available only for manual debugging", () => {
