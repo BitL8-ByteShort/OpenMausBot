@@ -104,6 +104,7 @@ import { RoomTurnDeadline, RoomTurnStallRegistry, roomTurnTimeoutMessage } from 
 import * as boat from "./boat.ts";
 import { TeamComputers, teamComputerAssignment, teamComputerCreate, teamComputerOwner, type TeamComputerRecord } from "./team-computers.ts";
 import { isEffortLevel, type BotVisibility, type CardAnswerer, type ResolvedSender, type WireBot, type WireGroup, type WireTask } from "../shared/wire.ts";
+import { parseToolScope, toolScopeWidens } from "../shared/tool-scope.ts";
 import type { TeamComputersPayload } from "../shared/team-computer.ts";
 import { boatCreateRecoverySnapshot, retireDeletedBoatCreate } from "./boat-create-idempotency.ts";
 import { boatDeletionSnapshot } from "./boat-delete-journal.ts";
@@ -3605,6 +3606,14 @@ const wireBot = (bot: BotRecord): WireBot => {
     avatarUrl: visible.avatarUrl ?? null, ...(tasks ? { tasks: tasks.map(wireTask) } : {}) };
 };
 
+function toolScopeForTurn(botId: string) {
+  const bot = store.bot(botId);
+  if (!bot) throw Object.assign(new Error("no such bot"), { status: 404 });
+  const parsed = parseToolScope(bot.toolScope);
+  if (!parsed.ok) throw Object.assign(new Error("This bot's tool selection is invalid. Open Access settings and save a valid selection before starting a turn."), { status: 409, code: "tool_scope" });
+  return parsed.scope;
+}
+
 /** The correlated private response carries the requested value so Electron
  * can validate it before sending the confirmation that makes it effective. */
 const wireTrustedApprovalBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
@@ -6615,6 +6624,7 @@ function computerPreviewBot(botId: string, url: URL): BotRecord | null {
   if (!threadId) return store.bot(botId);
   const bot = store.projectBotForTask(botId, threadId);
   if (!bot) throw Object.assign(new Error("no such task"), { status: 404 });
+  toolScopeForTurn(botId);
   return directTurnBots.get(threadId) ?? bot;
 }
 
@@ -9849,6 +9859,7 @@ async function startTurn(
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: approvalModeForTurn(bot, commsDepth > 0, threadId),
+        toolScope: toolScopeForTurn(bot.id),
         ...(guestConfined ? { guestConfined: true, confinedWhy: confinedWhy(threadId) } : {}),
         model,
         effort,
@@ -11622,6 +11633,7 @@ async function runGroupMemberTurn(
   // one bot can never own two provider processes.
   const readyBot = store.bot(bot.id);
   if (!readyBot) return false;
+  toolScopeForTurn(readyBot.id);
   const readyGroup = store.group(group.id);
   const stillOwnsThread = readyGroup?.dm
     ? readyGroup.threadId === threadId
@@ -12117,6 +12129,7 @@ async function runGroupMemberTurn(
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: roomTurnApprovalMode(readyBot, threadId, orchestration),
+        toolScope: toolScopeForTurn(readyBot.id),
         ...(roomGuestConfined ? { guestConfined: true, confinedWhy: confinedWhy(threadId) } : {}),
         system: roomSystem.text,
         systemStable: roomSystem.stable,
@@ -19404,6 +19417,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           avatarUrl: ordinary.avatarUrl || undefined,
           computer: ordinary.computer ?? undefined, cwd: checkedCwd.cwd ?? undefined,
           peers: ordinary.peers ?? undefined, mcpServers: ordinary.mcpServers ?? undefined,
+          toolScope: ordinary.toolScope ?? undefined,
           browserProfile: ordinary.browserProfile || undefined,
           autoApprove: ordinary.approvalMode === "auto",
         });
@@ -19793,6 +19807,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       // Per-bot selection of app-wide MCP servers. Omitted keeps the current
       // selection; null restores all enabled servers; [] explicitly mounts none.
       let requestedMcpServers = existingBot?.mcpServers;
+      if (Object.hasOwn(body, "toolScope")) {
+        const parsed = parseToolScope(body.toolScope === null ? undefined : body.toolScope);
+        if (!parsed.ok) return json(res, 400, { error: parsed.error });
+        patch.toolScope = parsed.scope;
+      }
       if (body.mcpServers !== undefined) {
         if (auth.kind === "session" && !sessions.isLive(auth.session.id)) {
           return json(res, 401, { error: "unauthorized: this session has expired or was revoked" });
@@ -20059,6 +20078,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           (requestedMcpServers === undefined || requestedMcpServers.some((name) => !existingBot.mcpServers!.includes(name)))) {
         loosened.push("mcpServers");
       }
+      if (Object.hasOwn(body, "toolScope") && toolScopeWidens(existingBot?.toolScope, patch.toolScope)) loosened.push("toolScope");
       const browserOrigin = typeof req.headers.origin === "string" && req.headers.origin.trim() !== "";
       if (loosened.length && auth.kind === "loopback" && !DESKTOP_MANAGED && !browserOrigin) {
         if (store.bots.some((candidate) => candidate.busy)) {
@@ -20087,6 +20107,18 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         sectionKey(existingBot?.section) !== sectionKey(section);
       let bot: BotRecord | null;
       const freshBrowserBot = store.bot(m[1]);
+      if (Object.hasOwn(body, "toolScope")) {
+        if (auth.kind === "session" && !sessions.isLive(auth.session.id)) {
+          return json(res, 401, { error: "unauthorized: this session has expired or was revoked" });
+        }
+        if (toolScopeWidens(freshBrowserBot?.toolScope, patch.toolScope) && auth.kind === "loopback" && !DESKTOP_MANAGED && !browserOrigin && store.bots.some((candidate) => candidate.busy)) {
+          return json(res, 409, { error: "A bot is working right now, so this change has to come from the desktop app or a paired device. Try again once every bot is idle." });
+        }
+        if (freshBrowserBot && JSON.stringify(freshBrowserBot.toolScope) !== JSON.stringify(patch.toolScope)
+          && (freshBrowserBot.busy || activeGroupTurnForBot(freshBrowserBot.id))) {
+          return json(res, 409, { error: "Stop this bot's turns before changing its tool selection." });
+        }
+      }
       // Connector validation and runtime revocation can yield after the first
       // memory check. Keep the same idle-only transition at the final commit.
       if (freshBrowserBot && body.memoryEnabled !== undefined &&
