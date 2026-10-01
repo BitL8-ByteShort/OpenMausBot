@@ -5,13 +5,19 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { writeFileAtomic } from "./atomic.ts";
 import { cloudHomePrompt } from "./system-prompt.ts";
 import { freePortBlock } from "./testing/ports.ts";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+let diagnosticStarted = performance.now();
+let diagnosticName = "setup";
+const trace = (stage: string) => console.info(`[vm-stage] ${diagnosticName} ${Math.round(performance.now() - diagnosticStarted)}ms ${stage}`);
+beforeEach((context) => {
+  diagnosticStarted = performance.now(); diagnosticName = context.task.name; trace("begin");
+});
 let child: ChildProcess;
 let startServer: () => Promise<void>;
 let fixtureHome = "";
@@ -30,17 +36,21 @@ const boatCalls: Array<{ method: string; path: string }> = [];
 const boatPrompts: Array<Record<string, unknown>> = [];
 const vmState = (state: Record<string, unknown> = {}) => writeFileAtomic(stateFile, JSON.stringify(state));
 const api = async (method: string, path: string, body?: unknown) => {
+  const start = performance.now();
+  if (method !== "GET") trace(`${method} ${path} begin`);
   const r = await fetch(base + path, { method, headers: { "content-type": "application/json" },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   const result = await r.json() as any;
+  if (method !== "GET" || performance.now() - start > 1000) trace(`${method} ${path} ${r.status} in ${Math.round(performance.now() - start)}ms`);
   expect(r.ok, `${method} ${path}: ${JSON.stringify(result)}`).toBe(true);
   return result;
 };
 async function until<T>(read: () => T | Promise<T>, accept: (value: T) => boolean): Promise<T> {
+  const start = performance.now();
   const end = Date.now() + 15_000;
   for (;;) {
     const value = await read();
-    if (accept(value)) return value;
+    if (accept(value)) { if (performance.now() - start > 500) trace(`condition ready in ${Math.round(performance.now() - start)}ms`); return value; }
     if (Date.now() >= end) throw new Error(`Fixture wait expired: ${JSON.stringify(value)}\n${stderr}`);
     await new Promise(r => setTimeout(r, 40));
   }
@@ -135,11 +145,14 @@ afterAll(async () => {
 });
 const rooms: string[] = [];
 afterEach(async () => {
+  trace("cleanup begin");
   vmState();
   writeFileSync(finishFile, "finish");
   for (const id of rooms.splice(0)) await stop(id);
+  trace("cleanup complete");
 });
 async function room() {
+  trace("room begin");
   vmState(); rmSync(dumpFile, { force: true }); rmSync(finishFile, { force: true });
   const bots = [];
   for (const name of ["VM lead", "VM worker"]) {
@@ -150,7 +163,7 @@ async function room() {
   const { group } = await api("POST", "/api/groups", { name: "Fixture VM room", memberIds: bots.map(b => b.id),
     setup: { bulletin: "", defaultResponder: { kind: "member", botId: bots[0].id } } });
   rooms.push(group.id);
-  return { bots, group };
+  trace("room ready"); return { bots, group };
 }
 const send = (id: string) => api("POST", `/api/groups/${id}/messages`, { text: "Reply once." });
 const stop = (id: string) => api("POST", `/api/groups/${id}/interrupt`, {});

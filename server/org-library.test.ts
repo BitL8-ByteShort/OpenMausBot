@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { canonicalJson, parsePackageDocument } from "../shared/package-format.ts";
 
@@ -20,6 +20,12 @@ const ADMIN = "https://admin.example.com";
 
 let home: string;
 const homes: string[] = [];
+let diagnosticStarted = performance.now();
+let diagnosticName = "setup";
+const trace = (stage: string) => console.info(`[library-stage] ${diagnosticName} ${Math.round(performance.now() - diagnosticStarted)}ms ${stage}`);
+beforeEach((context) => {
+  diagnosticStarted = performance.now(); diagnosticName = context.task.name; trace("begin");
+});
 
 /** The bytes Admin serves: the file parsed as a file, stamped with its
  * publisher, in canonical form (contract §1.6, §4.4 step 5). */
@@ -73,6 +79,7 @@ function snapshot(): string {
 /** A real Store, RoutineManager and skill store in a throwaway home (or in
  * `from`, a snapshot, to start again from what it holds). */
 async function installation(from?: string) {
+  trace("installation begin");
   if (from) {
     (await import("./message-db.ts")).closeMessageDb();
     home = from;
@@ -85,14 +92,17 @@ async function installation(from?: string) {
   vi.stubEnv("USERPROFILE", home);
   vi.stubEnv("OMB_DATA_DIR", join(home, ".openmausbot"));
   const { Store } = await import("./store.ts");
+  trace("store imported");
   const { RoutineManager } = await import("./routines.ts");
   const skills = await import("./skills.ts");
+  trace("skills imported");
   const workspace = await import("./workspace.ts");
   const sections = await import("./section-context.ts");
   const { saveImage } = await import("./attachments.ts");
   const { botAvatarUrlFromStoredPath } = await import("../shared/bot-avatar.ts");
   const { DATA_DIR } = await import("./config.ts");
   const { OrgLibrary, parseOrgLibraryCatalog } = await import("./org-library.ts");
+  trace("library imported");
   const parts = await import("./package-parts.ts");
   // Preset bots (presets.ts), wired as server/index.ts wires them.
   const presetStore = (await import("./presets.ts")).createPresetStore(join(DATA_DIR, "org-library", "presets.json"));
@@ -132,15 +142,18 @@ async function installation(from?: string) {
   };
   const statePath = join(DATA_DIR, "org-library", "state.json");
   const readState = () => JSON.parse(readFileSync(statePath, "utf8"));
+  trace("installation ready");
   return { store, routines, skills, stamps, parts, sections, DATA_DIR, importDeps, mcp, posted, open, writeBlob, statePath, readState, parseOrgLibraryCatalog };
 }
 
 afterEach(async () => {
+  trace("cleanup begin");
   const { closeMessageDb } = await import("./message-db.ts");
   closeMessageDb();
   vi.unstubAllEnvs();
   vi.useRealTimers();
   for (const dir of homes.splice(0)) rmSync(dir, { recursive: true, force: true });
+  trace("cleanup complete");
 });
 
 describe("the catalog", () => {
@@ -163,16 +176,19 @@ describe("the catalog", () => {
     const team = release("full-team.v2.json");
     expect(library.applyRelay(relay(catalog([entry(TEAM_ID, team)])))).toEqual({ ok: true });
     await library.settled();
+    trace('await library.settled');
     expect(library.list().packages.map((candidate) => candidate.packageId)).toEqual([TEAM_ID]);
 
     expect(library.applyRelay(relay({ format: "something-else" })).ok).toBe(false);
     expect(library.applyRelay(relay(catalog([]), { organizationId: OTHER_ORG })).ok).toBe(false);
     expect(library.applyRelay(relay({ ...catalog([]), organization: { id: OTHER_ORG, name: "Other" } }, { organizationId: OTHER_ORG })).ok).toBe(true);
     await library.settled();
+    trace('await library.settled');
     // …but a catalog for the organization the relay names is applied.
     expect(library.list().organization).toEqual({ id: OTHER_ORG, name: "Other" });
     expect(library.applyRelay(relay(catalog([entry(TEAM_ID, team)])))).toEqual({ ok: true });
     await library.settled();
+    trace('await library.settled');
     // The digest must name exactly the relayed bytes.
     expect(library.applyRelay({ ...relay(catalog([])), digest: "0".repeat(64) }).ok).toBe(false);
     // A non-https Admin origin is refused.
@@ -187,6 +203,7 @@ describe("the catalog", () => {
     const newer = entry(TEAM_ID, team, { release: { ...entry(TEAM_ID, team).release, formatVersion: 3 } });
     library.applyRelay(relay(catalog([newer])));
     await library.settled();
+    trace('await library.settled');
     const readBlob = vi.spyOn(library, "readBlob");
     expect(library.list().packages[0]).toMatchObject({ blob: "unsupported", installed: null });
     expect(library.add(TEAM_ID, app.importDeps)).toMatchObject({ ok: false, status: 409, code: "newer_app_required", error: "Update OpenMausBot to add this package." });
@@ -201,6 +218,7 @@ describe("the catalog", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team, { mode: "off" })])));
     await library.settled();
+    trace('await library.settled');
     expect(library.list().packages).toEqual([]);
     expect(library.add(TEAM_ID, app.importDeps)).toMatchObject({ ok: false, status: 404, code: "not_listed" });
   });
@@ -215,6 +233,7 @@ describe("release files", () => {
     app.writeBlob(team.bytes.replace("Sales desk", "Sales dusk"), team.sha256);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     expect(library.readBlob(team.sha256)).toBeNull();
     expect(library.list().packages[0]!.blob).toBe("unavailable");
     expect(library.add(TEAM_ID, app.importDeps)).toMatchObject({ ok: false, status: 503, code: "blob_unavailable" });
@@ -232,6 +251,7 @@ describe("release files", () => {
     app.writeBlob(forged.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, forged)])));
     await library.settled();
+    trace('await library.settled');
     expect(library.add(TEAM_ID, app.importDeps)).toMatchObject({ ok: false, status: 422, code: "invalid_package" });
     expect(app.store.bots).toHaveLength(0);
     expect(app.posted.at(-1).packages[0]).toMatchObject({ state: "failed", reason: "invalid_package" });
@@ -250,6 +270,7 @@ describe("the relay", () => {
     expect(app.posted).toEqual([]);
     expect(existsSync(app.statePath)).toBe(false);
     await library.settled();
+    trace('await library.settled');
     expect(Date.now() - started).toBeLessThan(15_000);
     expect(app.posted).toEqual([{ type: "openmausbot:managed-library-state", digest: sha(JSON.stringify(body)), packages: [] }]);
     expect(app.readState()).toMatchObject({ version: 1, source: { adminOrigin: ADMIN, organizationId: ORG }, appliedDigest: sha(JSON.stringify(body)), installs: {} });
@@ -265,6 +286,7 @@ describe("adding from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     expect(library.list().packages[0]).toMatchObject({ blob: "ready", installed: null });
 
     const outcome = library.add(TEAM_ID, app.importDeps);
@@ -351,6 +373,7 @@ describe("adding from the shelf", () => {
     const body = catalog([entry(TEAM_ID, team)]);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     const first = library.add(TEAM_ID, app.importDeps);
     expect(first).toMatchObject({ ok: true, status: 201 });
     const bots = app.store.bots.length;
@@ -367,6 +390,7 @@ describe("adding from the shelf", () => {
     library = app.open();
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId]).toMatchObject({ packageId: TEAM_ID, status: "installed", section: "Sales desk", presets });
     expect(library.add(TEAM_ID, app.importDeps)).toMatchObject({ ok: true, status: 200, value: { alreadyAdded: true } });
     expect(app.store.bots).toHaveLength(bots);
@@ -379,6 +403,7 @@ describe("adding from the shelf", () => {
     expect(app.store.bots).toHaveLength(bots);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     expect(library.list().packages[0]!.installed).toMatchObject({ installId, status: "installed" });
   });
 
@@ -389,7 +414,9 @@ describe("adding from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     const added = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const added = library.add');
     const scout = added.value.result.bots.find((bot: any) => bot.installedPackage.agentKey === "scout");
     // The person switched a routine on after adding.
     const daily = app.routines.packageStamps().find((routine) => routine.stamp.key === "daily-digest")!;
@@ -398,6 +425,7 @@ describe("adding from the shelf", () => {
     const withdrawn = entry(TEAM_ID, team, { release: null, withdrawnReleases: [{ version: "1.3.0", sha256: team.sha256 }] });
     library.applyRelay(relay(catalog([withdrawn])));
     await library.settled();
+    trace('await library.settled');
     expect(app.skills.listSkills(scout.id).every((skill) => !skill.enabled)).toBe(true);
     expect(app.routines.listRoutines().every((routine) => !routine.enabled)).toBe(true);
     const installId = added.value.result.installId;
@@ -411,10 +439,12 @@ describe("adding from the shelf", () => {
     app.skills.setSkillEnabled(scout.id, "research-brief", true);
     library.applyRelay(relay(catalog([withdrawn], { libraryVersion: 4 })));
     await library.settled();
+    trace('await library.settled');
     expect(app.skills.listSkills(scout.id).find((skill) => skill.name === "research-brief")!.enabled).toBe(true);
     // An entry that disappears changes nothing.
     library.applyRelay(relay(catalog([], { libraryVersion: 5 })));
     await library.settled();
+    trace('await library.settled');
     expect(app.store.bots).toHaveLength(3);
   });
 
@@ -425,16 +455,20 @@ describe("adding from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     const added = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const added = library.add');
     for (const id of app.store.groups.map((group) => group.id)) app.store.deleteGroup(id);
     const [first, ...rest] = added.value.result.bots;
     app.store.deleteBot(first.id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[added.value.result.installId].status).toBe("installed");
     for (const bot of rest) app.store.deleteBot(bot.id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[added.value.result.installId].status).toBe("removed");
     expect(app.posted.at(-1).packages).toEqual([
       { packageId: TEAM_ID, release: "1.3.0", sha256: team.sha256, state: "removed", reason: "removed_locally" },
@@ -451,7 +485,9 @@ describe("adding from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     const added = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const added = library.add');
     const installId = added.value.result.installId;
     // The team's unassigned skill, put on one of the person's own bots.
     expect(library.addOfferedSkill(own.id, installId, "objection-handling")).toMatchObject({ ok: true, status: 201 });
@@ -460,6 +496,7 @@ describe("adding from the shelf", () => {
     for (const bot of added.value.result.bots) app.store.deleteBot(bot.id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId]).toMatchObject({ status: "removed", bots: {}, rooms: {}, routines: {} });
     expect(library.list().packages[0]!.installed).toMatchObject({ status: "removed" });
     expect(app.posted.at(-1).packages).toEqual([
@@ -469,6 +506,7 @@ describe("adding from the shelf", () => {
     expect(app.skills.listSkills(own.id)).toEqual([expect.objectContaining({ name: "objection-handling", enabled: true })]);
     // …and the team can be added again, whole.
     const again = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const again = library.add');
     expect(again).toMatchObject({ ok: true, status: 201 });
     expect(again.value.result.bots).toHaveLength(3);
     expect(app.readState().installs[installId]).toMatchObject({ status: "installed" });
@@ -482,18 +520,22 @@ describe("adding from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     const added = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const added = library.add');
     const installId = added.value.result.installId;
     library.addOfferedSkill(own.id, installId, "objection-handling");
     for (const id of app.store.groups.map((group) => group.id)) app.store.deleteGroup(id);
     for (const bot of added.value.result.bots) app.store.deleteBot(bot.id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId].status).toBe("removed");
 
     const withdrawn = entry(TEAM_ID, team, { release: null, withdrawnReleases: [{ version: "1.3.0", sha256: team.sha256 }] });
     library.applyRelay(relay(catalog([withdrawn])));
     await library.settled();
+    trace('await library.settled');
     expect(app.skills.listSkills(own.id)).toEqual([expect.objectContaining({ name: "objection-handling", enabled: false })]);
     // The team is still the one the person removed.
     expect(app.readState().installs[installId]).toMatchObject({ status: "removed", withdrawnHandled: team.sha256 });
@@ -504,6 +546,7 @@ describe("adding from the shelf", () => {
     app.skills.setSkillEnabled(own.id, "objection-handling", true);
     library.applyRelay(relay(catalog([withdrawn], { libraryVersion: 4 })));
     await library.settled();
+    trace('await library.settled');
     expect(app.skills.listSkills(own.id)[0]!.enabled).toBe(true);
   });
 
@@ -515,6 +558,7 @@ describe("adding from the shelf", () => {
     const body = catalog([entry(TEAM_ID, team)]);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     // The app stops as the first routine is about to be written: the bots
     // (with their skills and notes), the group chat and the brief are on
     // disk, the routines and the leader are not.
@@ -575,6 +619,7 @@ describe("adding from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     // Every bot, group chat and routine is written and stamped; the leader,
     // the importer's last write, is not.
     let crash: string | null = null;
@@ -612,6 +657,7 @@ describe("adding from the shelf", () => {
     const body = catalog([entry(TEAM_ID, team)]);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     // The leader is the importer's last write; the app stops right after it,
     // before the index is saved.
     let crash: string | null = null;
@@ -653,6 +699,7 @@ describe("adding from the shelf", () => {
     app.writeBlob(skills.bytes);
     library.applyRelay(relay(catalog([entry(LIBRARY_ID, skills)])));
     await library.settled();
+    trace('await library.settled');
     const outcome = library.add(LIBRARY_ID, app.importDeps) as any;
     expect(outcome).toMatchObject({ ok: true, status: 201 });
     expect(outcome.value.result.offeredSkills).toEqual(["objection-handling", "follow-up"]);
@@ -678,6 +725,7 @@ describe("adding from the shelf", () => {
     app.store.deleteBot(bot.id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId].status).toBe("installed");
 
     // Withdrawing it switches the offered skill off where it was added.
@@ -685,6 +733,7 @@ describe("adding from the shelf", () => {
     library.addOfferedSkill(other.id, installId, "objection-handling");
     library.applyRelay(relay(catalog([entry(LIBRARY_ID, skills, { release: null, withdrawnReleases: [{ version: "2.0.1", sha256: skills.sha256 }] })])));
     await library.settled();
+    trace('await library.settled');
     expect(app.skills.listSkills(other.id)).toEqual([expect.objectContaining({ name: "objection-handling", enabled: false })]);
     expect(library.offeredSkills(other.id).skills).toEqual([]);
   });
@@ -698,6 +747,7 @@ describe("adding from the shelf", () => {
     const body = catalog([entry(LIBRARY_ID, skills)]);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     const installId = (library.add(LIBRARY_ID, app.importDeps) as any).value.result.installId;
     library.addOfferedSkill(bot.id, installId, "follow-up");
     library.dispose();
@@ -706,11 +756,13 @@ describe("adding from the shelf", () => {
     library = app.open();
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId]).toMatchObject({ kind: "library", status: "installed", bots: {} });
     // Deleting a bot never marks a skills-only package removed.
     app.store.deleteBot(app.store.createBot({ name: "Passing" }).id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId]).toMatchObject({ kind: "library", status: "installed" });
     expect(library.offeredSkills(bot.id).skills.find((skill) => skill.name === "follow-up")).toMatchObject({ added: true });
   });
@@ -728,6 +780,7 @@ describe("parts the person deleted (removedLocally)", () => {
     const body = catalog([entry(TEAM_ID, team)]);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     const installId: string = (library.add(TEAM_ID, app.importDeps) as any).value.result.installId;
     const bot = (key: string) => app.store.bots.find((candidate) => candidate.installedPackage?.agentKey === key)!;
     const install = () => app.readState().installs[installId];
@@ -737,6 +790,7 @@ describe("parts the person deleted (removedLocally)", () => {
   const afterStoreChange = async (library: { settled(): Promise<void> }) => {
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
   };
 
   it("notes a deleted bot and keeps the team added", async () => {
@@ -763,6 +817,7 @@ describe("parts the person deleted (removedLocally)", () => {
     app.routines.remove(app.routines.packageStamps().find((routine) => routine.stamp.key === "weekly-review")!.routineId);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     expect(install()).toMatchObject({ status: "installed", removedLocally: ["room:desk", "routine:weekly-review"] });
     expect(Object.keys(install().routines)).toEqual(["daily-digest"]);
   });
@@ -775,6 +830,7 @@ describe("parts the person deleted (removedLocally)", () => {
     for (const libraryVersion of [4, 5]) {
       library.applyRelay(relay(catalog(body.packages, { libraryVersion })));
       await library.settled();
+    trace('await library.settled');
     }
     expect(library.rebuild()).toBe(false);
     expect(install().removedLocally).toEqual(["agent:writer"]);
@@ -827,6 +883,7 @@ describe("parts the person deleted (removedLocally)", () => {
     app.store.patchBot(restored.id, { installedPackage: stamp });
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     expect(install()).toMatchObject({ status: "installed", removedLocally: [], bots: { writer: restored.id } });
   });
 });
@@ -859,12 +916,15 @@ describe("presets from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     const added = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const added = library.add');
     const installId = added.value.result.installId;
     const [row] = app.importDeps.presets.list();
     // New bot → the team's preset: the bot carries the install id and a presetKey.
     const made = app.store.createBot({ name: "Sky" });
     presets.applyPresetToBot(made.id, app.importDeps.presets.resolve(row!.id)!, app.importDeps);
+    trace('presets.applyPresetToBot');
     expect(app.store.bot(made.id)!.installedPackage).toMatchObject({ source: "org", installId, presetKey: "support" });
     // Its skill carries the install's stamp for automatic updates (contract
     // §3.2): the release's SKILL.md hash and the written one's, as a preset's.
@@ -880,10 +940,12 @@ describe("presets from the shelf", () => {
     for (const bot of added.value.result.bots) app.store.deleteBot(bot.id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId].status).toBe("removed");
 
     // Neither that bot nor the preset row makes Add a no-op.
     const again = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const again = library.add');
     expect(again).toMatchObject({ ok: true, status: 201 });
     expect(again.value.result.bots).toHaveLength(3);
     expect(app.store.bot(made.id)).toBeTruthy();
@@ -903,11 +965,13 @@ describe("presets from the shelf", () => {
     app.writeBlob(skills.bytes);
     library.applyRelay(relay(catalog([entry(LIBRARY_ID, skills)])));
     await library.settled();
+    trace('await library.settled');
     const installId = (library.add(LIBRARY_ID, app.importDeps) as any).value.result.installId;
     const indexed = app.readState().installs[installId];
     const [row] = app.importDeps.presets.list();
     const made = app.store.createBot({ name: "Sky" });
     presets.applyPresetToBot(made.id, app.importDeps.presets.resolve(row!.id)!, app.importDeps);
+    trace('presets.applyPresetToBot');
     expect(app.skills.skillPackageStamps(made.id)).toEqual([expect.objectContaining({ stamp: expect.objectContaining({ installId, release: "2.0.1", via: "preset" }) })]);
 
     // The index is lost while the catalog has moved on to 2.1.0. The preset
@@ -920,6 +984,7 @@ describe("presets from the shelf", () => {
     library = app.open();
     library.applyRelay(relay(catalog([entry(LIBRARY_ID, newer)])));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId]).toEqual({ ...indexed, addedAt: expect.any(Number), updatedAt: expect.any(Number) });
     expect(library.lastReport()!.packages).toEqual([expect.objectContaining({ packageId: LIBRARY_ID, release: "2.0.1", sha256: skills.sha256, state: "installed" })]);
   });
@@ -941,7 +1006,9 @@ describe("presets from the shelf", () => {
     app.writeBlob(team.bytes);
     library.applyRelay(relay(catalog([entry(TEAM_ID, team)])));
     await library.settled();
+    trace('await library.settled');
     const added = library.add(TEAM_ID, app.importDeps) as any;
+    trace('const added = library.add');
     const installId = added.value.result.installId;
     expect(library.installStatuses()).toEqual(new Map([[installId, "installed"]]));
     expect(await offered()).toEqual(["org:support"]);
@@ -954,6 +1021,7 @@ describe("presets from the shelf", () => {
     for (const bot of added.value.result.bots) app.store.deleteBot(bot.id);
     await new Promise((resolve) => setTimeout(resolve, 400));
     await library.settled();
+    trace('await library.settled');
     const removedOnDisk = readFileSync(app.statePath, "utf8");
     writeFileSync(app.statePath, installedOnDisk);
     expect(library.installStatuses()).toEqual(new Map([[installId, "removed"]]));
@@ -982,6 +1050,7 @@ describe("presets from the shelf", () => {
     const body = catalog([entry(LIBRARY_ID, skills)]);
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     const outcome = library.add(LIBRARY_ID, app.importDeps) as any;
     expect(outcome).toMatchObject({ ok: true, status: 201 });
     const installId = outcome.value.result.installId;
@@ -990,6 +1059,7 @@ describe("presets from the shelf", () => {
     expect(indexed.presets).toEqual({ support: { presetId: row!.id, r: app.parts.partHash(skills.document.package.presets[0]) } });
     const made = app.store.createBot({ name: "Sky" });
     presets.applyPresetToBot(made.id, app.importDeps.presets.resolve(row!.id)!, app.importDeps);
+    trace('presets.applyPresetToBot');
     expect(app.skills.listSkills(made.id)).toEqual([expect.objectContaining({ name: "objection-handling", enabled: true, source: "org:acme/sales-skills@2.0.1" })]);
     // A skill of the same name from somewhere else is the person's own.
     const mine = app.store.createBot({ name: "Mine" });
@@ -1005,6 +1075,7 @@ describe("presets from the shelf", () => {
     library = app.open();
     library.applyRelay(relay(body));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId]).toEqual({ ...indexed, addedAt: expect.any(Number), updatedAt: expect.any(Number) });
     expect(library.add(LIBRARY_ID, app.importDeps)).toEqual({ ok: true, status: 200, value: { alreadyAdded: true, installId } });
     expect(app.importDeps.presets.list()).toHaveLength(1);
@@ -1014,6 +1085,7 @@ describe("presets from the shelf", () => {
     // skill switched off, once. The person's own skill is left alone.
     library.applyRelay(relay(catalog([entry(LIBRARY_ID, skills, { release: null, withdrawnReleases: [{ version: "2.0.1", sha256: skills.sha256 }] })])));
     await library.settled();
+    trace('await library.settled');
     expect(app.readState().installs[installId].status).toBe("withdrawn");
     expect(library.installStatuses().get(installId)).toBe("withdrawn");
     expect(presets.listBotPresets(app.importDeps.presets, library.installStatuses())).toEqual([]);
@@ -1022,6 +1094,7 @@ describe("presets from the shelf", () => {
     app.skills.setSkillEnabled(made.id, "objection-handling", true);
     library.applyRelay(relay(catalog([entry(LIBRARY_ID, skills, { release: null, withdrawnReleases: [{ version: "2.0.1", sha256: skills.sha256 }] })], { libraryVersion: 4 })));
     await library.settled();
+    trace('await library.settled');
     expect(app.skills.listSkills(made.id)[0]!.enabled).toBe(true);
   });
 });
